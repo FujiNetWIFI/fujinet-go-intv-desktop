@@ -1,0 +1,130 @@
+fujinet-go-intv-desktop -- implementation status
+=================================================
+
+Full plan: see the "fujinet-go-intv-desktop" implementation plan (jzIntv-based
+FujiNet Go Desktop port; STIC/registers/MOB debugger; clickable keypad
+sub-window; Linux/GNOME+KDE, Windows, macOS).
+
+DONE (verified with a real configure + build + ctest on this machine):
+
+  M1 -- Skeleton, vendoring, headless core
+    [x] cmake/Dependencies.cmake      (intv_provide_dependency, transposed
+                                        from fujinet-go-coco-desktop)
+    [x] jzIntv 20200712 pinned by URL + SHA256 (cmake/Dependencies.cmake)
+    [x] tools/jzintv/jzintv-fujinet.patch -- regenerated fresh from a diff of
+        the pristine 20200712 zip against the local FujiNet-patched checkout
+        (LF-normalized; the original hand-authored patch had drifted slightly
+        -- see the patch file's own header)
+    [x] cmake/StageJzIntv.cmake + tools/jzintv/patch-staged-tree.py
+    [x] core/CMakeLists.txt: jzintv_core static library, $(OBJS) + the
+        upstream "null" backend combination (OBJS_NULL: gfx_null.c,
+        snd_null.c, event_null.c, joy_null.c, plat_null.c, main_null.c --
+        USE_AS_BACKEND to omit main()). jzintv.c (the non-emscripten entry
+        point) needed ZERO source changes -- verified SDL-free at the source
+        level.
+    [x] Two upstream gaps fixed via compile definitions (not source patches):
+        - USE_SYS_IOCTL on non-Windows (plat_lib.c's Linux branch sets
+          CAN_TIOCGWINSZ but not USE_SYS_IOCTL, so <sys/ioctl.h> was never
+          included; macOS/FreeBSD's branches already set it)
+        - src/svn_revision.c was missing from the object list (lives in
+          Makefile.common's OBJS, not any subMakefile)
+    [x] locutus/ is C++14 (not C, unlike the rest of jzIntv) --
+        enable_language(CXX) scoped to core/CMakeLists.txt
+    [x] VERIFIED: `cmake -B build -DFRONTEND=none -DWITH_FUJINET=OFF &&
+        cmake --build build` succeeds; `nm`/`ldd` on the resulting
+        no_sdl_link_test binary show zero SDL symbols/dependencies
+        (core/tests/no_sdl_link_test.c, ctest target no_sdl_link)
+
+  M2 -- ROM embedding + compliance
+    [x] tools/jzintv/roms/{exec.bin,grom.bin} (8192 / 2048 bytes)
+    [x] tools/jzintv/embed-roms.py (transposed from tools/xroar/embed-roms.py
+        -- one ROM class here, not two, since EXEC and GROM are both Mattel
+        copyright)
+    [x] core/src/roms_embedded.h, WITH_INTV_ROMS option wired into
+        core/CMakeLists.txt, core/tests/no_embedded_roms.py
+    [x] COMPLIANCE.md
+    [x] VERIFIED: WITH_INTV_ROMS=OFF produces an empty embedded-ROM table;
+        WITH_INTV_ROMS=ON embeds both images (checked roms_embedded.c
+        directly -- the end-to-end "shipped binary contains no ROM bytes"
+        check needs a binary that actually references the table, which is
+        M3+ scope; the ctest is already wired to run against boot_smoke and
+        every built frontend once they exist)
+
+IN PROGRESS -- M3, session library:
+
+  [x] core/jzintv/intv_frame.{h,c} -- the frame store (XRGB8888, serial-based
+      copy contract, mirrors cocosession_copy_frame). Thread-safe (pthread
+      mutex): emulator thread publishes, any UI thread copies out.
+  [x] core/jzintv/desktop/gfx_desktop.c -- replaces gfx_null.c in the object
+      list (core/CMakeLists.txt). A close copy of gfx_null.c; the only real
+      change is gfx_refresh publishing into intv_frame instead of doing
+      nothing. Confirmed the STIC bakes the border color into gfx->vid itself
+      (stic_push_vid in the staged tree), so there is nothing extra to
+      composite here.
+  [x] core/jzintv/intv_host.{h,c} -- owns cfg_t intv (a process-wide
+      singleton in jzIntv itself, not something intv_host imposes) and runs
+      jzintv_entry_point() on its own pthread. Provisions exec.bin/grom.bin
+      from the embedded table (core/src/roms_embedded.h) into a caller-given
+      ROM directory, skipping any file already there so an imported ROM
+      always wins. Always passes --fujinet=host:port and no ROM argument, so
+      the machine boots the embedded FujiNet config ROM until a frontend
+      loads a cartridge (a later milestone). --fujinet is safe with nothing
+      listening -- fujinet_init()'s only failure mode is a codec self-test,
+      and fn_sock.c's connect is non-blocking -- so this needed no
+      WITH_FUJINET wiring to prove out.
+  [x] core/jzintv/intv_host.{h,c} -- direct pad injection
+      (intv_host_pad_key/intv_host_pad_disc), bypassing jzIntv's own
+      keysym/event layer entirely: writes the exact scan-code-like values
+      src/cfg/mapping.c's PD0L_KP*/PD0L_A_*/PD0L_D_* bindings write into
+      pad_t.l[]/r[] directly. This is the whole mechanism the clickable
+      keypad window (M5) needs -- no event-subsystem plumbing required.
+      12 keypad digits/Clear/Enter, 3 action buttons, all 16 disc positions
+      (including the one non-obvious combo, ESE = E|SE = 0x81).
+  [x] core/include/intvsession.h + core/src/{session,settings,paths}.c --
+      the public, toolkit-agnostic API (settings store, XDG config/data
+      paths, lifecycle, frame copy, pad injection), wrapping intv_host +
+      intv_frame the way cocosession.h wraps coco_host. settings.c is a
+      near-verbatim transposition of the CoCo port's (flat key=value INI,
+      one store shared by every frontend).
+  [x] core/tests/boot_smoke.c -- starts intv_host, polls intv_frame_copy for
+      a non-blank frame, stops cleanly. VERIFIED: boots the real embedded
+      config ROM and produces a non-blank frame in ~20ms.
+  [x] core/tests/pad_test.c -- VERIFIED against the real running machine:
+      exact scan codes for a digit/action button on both controllers (with
+      cross-controller isolation checked), release-clears-to-zero, and two
+      disc positions including the ESE combo.
+  [x] core/tests/session_test.c -- VERIFIED end-to-end through the public API
+      only: settings persist across a close/reopen of the same config dir,
+      paths resolve correctly, and (when ROMs are available) start / frame
+      capture / pad injection / stop all work through intvsession rather than
+      intv_host directly.
+  All four tests pass via ctest in both WITH_INTV_ROMS=ON and =OFF configs,
+  confirmed with full clean-room rebuilds (rm -rf build third_party
+  core/jzintv-generated && reconfigure) in both.
+
+  Still open in M3: audio capture (snd_desktop.c replacing snd_null.c),
+  input injection for real keyboards/gamepads (event_desktop.c replacing
+  event_null.c -- note this is SEPARATE from the pad injection above, which
+  already covers everything the keypad window needs), gamepad backend,
+  FujiNet runtime wiring (cmake/FujiNetRuntime.cmake is still a stub --
+  WITH_FUJINET=OFF only), fujibus_smoke, dasm_test, stic_test.
+
+NOT STARTED:
+
+  cmake/FujiNetRuntime.cmake is a stub (WITH_FUJINET=OFF only; ON is a hard
+  error pointing here). Needs: fujinet-firmware pinned to the branch/commit
+  carrying the Intellivision BoIP work, FUJINET_TARGET=RS232 build, bundling.
+
+  M4 -- Debugger engine: core/include/intvdebug.h, core/debugger/{debugger,
+        cp1600dasm,sticview,symbols}.c -- STIC/registers/MOB views.
+
+  M5 -- GNOME frontend (GTK4 + libadwaita): main window, debugger window,
+        keypad sub-window (both hand controllers, clickable keypad/disc/
+        action buttons -- no precedent in any sibling project, build this
+        one first and port its layout to the other three).
+
+  M6 -- KDE (Qt6 Widgets), macOS (AppKit), Windows (Win32) frontends.
+
+  M7 -- Packaging: icons, flatpak manifests, NSIS installer, CPack DEB/RPM/
+        TGZ, CI workflows (linux/windows/macos/flatpak/release), all release
+        builds with -DWITH_INTV_ROMS=OFF.

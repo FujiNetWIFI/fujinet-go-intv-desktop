@@ -1,0 +1,11 @@
+build*/
+third_party/jzintv/
+third_party/fujinet-firmware/
+core/jzintv-generated/
+compile_commands.json
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+__pycache__/

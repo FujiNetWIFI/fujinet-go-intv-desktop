@@ -332,11 +332,41 @@ symbols still open):
       disengage. All nine tests continue to pass via ctest, clean-room
       rebuild confirmed.
 
-  Still open in M4: core/include/intvstic.h + core/debugger/sticview.c
-  (the STIC register/mode/MOB/backtab view), symbols.c (built-in EXEC/GROM
-  symbol table + loading external .sym files), cp1600dasm.c as a thin
-  standalone wrapper if a frontend wants disassembly without the rest of
-  intvdebug (not required yet -- intvdebug_disassemble already covers it).
+  [x] core/include/intvstic.h + core/debugger/sticview.c -- the STIC
+      register/mode/MOB/GRAM-GROM-card/palette view. Every offset and bit
+      layout was read directly out of the staged tree's src/stic/stic.c by
+      finding where each field is actually consumed (stic_do_mob,
+      stic_draw_mobs, stic_ctrl_wr_internal, the raw[0x28-0x32] reads), not
+      from a datasheet -- see the header's own comment. Deliberately does
+      NOT render the BACKTAB (the background card grid): unlike the MOBs,
+      its two modes (Color Stack vs. Foreground/Background) each need their
+      own per-column color-cycling logic re-derived from stic_draw_cstk/
+      stic_draw_fgbg, real additional scope rather than a quick follow-on --
+      documented as a known gap rather than silently narrowed, matching the
+      MSX port's own precedent for an unfinished VDP mode.
+  [x] core/tests/stic_test.c -- VERIFIED against the real running machine:
+      writes known values directly into intv.stic.raw/gmem, then confirms
+      the snapshot/decode reports exactly those values back out -- mode,
+      GRAM size, full color stack, border color, every MOB field (position,
+      both size dimensions, both flips, color, GRAM/priority/visible flags,
+      collision bits), an untouched MOB correctly decoding to invisible,
+      and a hand-written diagonal bit pattern round-tripping through the
+      card-sheet renderer pixel-for-pixel.
+  [x] CAUGHT A REAL BUG while writing the card-sheet test: assumed GROM was
+      512 cards (matching some other 8-bit VDP-ish chips' convention);
+      stic_test.c's first run failed on the card-rendering assertion, which
+      led to checking stic_init's own GROM-copy loop
+      (`for(i=0;i<2048;i++) stic->gmem[i]=grom_img[i];`) -- GROM is a fixed
+      2048 BYTES, i.e. 256 cards at 8 bytes/card, not 512. Fixed in
+      intvstic_card_count, the GRAM-offset comment in sticview.c, and the
+      test's own offsets; all corrected instances cross-checked against
+      that same init loop rather than guessed twice.
+
+  Still open in M4: symbols.c (built-in EXEC/GROM symbol table + loading
+  external .sym files), cp1600dasm.c as a thin standalone wrapper if a
+  frontend wants disassembly without the rest of intvdebug (not required
+  yet -- intvdebug_disassemble already covers it), and the BACKTAB
+  rendering gap noted above.
 
 NOT STARTED:
 

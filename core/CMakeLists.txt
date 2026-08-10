@@ -164,6 +164,7 @@ list(APPEND JZINTV_CORE_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/jzintv/intv_audio.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/jzintv/intv_host.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/debugger.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/debugger/sticview.c"
 )
 
 add_library(jzintv_core STATIC ${JZINTV_CORE_SOURCES})
@@ -315,6 +316,10 @@ add_executable(debug_test tests/debug_test.c)
 target_link_libraries(debug_test jzintv_core)
 target_include_directories(debug_test PRIVATE src)
 
+add_executable(stic_test tests/stic_test.c)
+target_link_libraries(stic_test jzintv_core)
+target_include_directories(stic_test PRIVATE src)
+
 add_test(NAME no_sdl_link COMMAND no_sdl_link_test)
 add_test(NAME boot_smoke COMMAND boot_smoke)
 add_test(NAME pad_test COMMAND pad_test)
@@ -324,9 +329,10 @@ add_test(NAME audio COMMAND audio_test)
 add_test(NAME gamepad COMMAND gamepad_test)
 add_test(NAME fujibus_smoke COMMAND fujibus_smoke)
 add_test(NAME debug COMMAND debug_test)
+add_test(NAME stic COMMAND stic_test)
 set_tests_properties(fujibus_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
                      RUN_SERIAL ON)
-set_tests_properties(debug PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+set_tests_properties(debug stic PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 set_tests_properties(pad_test boot_smoke audio PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 # Needs WITH_INTV_ROMS=ON to have anything to provision; reported as 77
 # (skipped) rather than a failure otherwise, and it boots a real machine, so

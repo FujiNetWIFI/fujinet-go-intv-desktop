@@ -58,8 +58,10 @@ void intvstic_snapshot_get(intvdebug *d, intvstic_snapshot *out)
     memcpy(out->raw, intv.stic.raw, sizeof(out->raw));
     memcpy(out->gmem, intv.stic.gmem, sizeof(out->gmem));
     memcpy(out->mob_bmp, intv.stic.mob_bmp, sizeof(out->mob_bmp));
+    memcpy(out->btab, intv.stic.btab, sizeof(out->btab));
     out->mode = intv.stic.mode;
     out->gram_size = intv.stic.gram_size;
+    out->gram_mask = intv.stic.gram_mask;
 }
 
 int intvstic_describe_mode(const intvstic_snapshot *s, char *out, int max)
@@ -179,6 +181,98 @@ void intvstic_render_mob(const intvstic_snapshot *s, int index,
             uint8_t *px = &rgba[(y * 16 + x) * 4];
             px[0] = r; px[1] = g; px[2] = b;
             px[3] = set ? 0xFF : 0x00;
+        }
+    }
+}
+
+static void put_px(uint8_t *rgba, int x, int y, int color_idx)
+{
+    uint8_t *px = &rgba[(y * INTVSTIC_BACKTAB_W + x) * 4];
+    px[0] = intv.gfx.palette.color[color_idx][0];
+    px[1] = intv.gfx.palette.color[color_idx][1];
+    px[2] = intv.gfx.palette.color[color_idx][2];
+    px[3] = 0xFF;
+}
+
+/* Fills an 8x8 card cell at (col,row) from `byte`, one bitmap row at a
+ * time, fg where the bit is 1 and bg where it is 0 -- the same rule
+ * stic_draw_cstk/stic_draw_fgbg apply via stic_b2n's bit-to-nibble
+ * expansion, just done per-pixel instead of packed. */
+static void blit_card(const intvstic_snapshot *s, int col, int row,
+                      uint32_t gr_idx, int fg_idx, int bg_idx, uint8_t *rgba)
+{
+    int yy, xx;
+    for (yy = 0; yy < 8; yy++) {
+        const uint8_t byte = s->gmem[gr_idx + (uint32_t)yy];
+        for (xx = 0; xx < 8; xx++) {
+            const int set = (byte >> (7 - xx)) & 1; /* MSB = leftmost,
+                                                      * same convention as
+                                                      * intvstic_render_cards */
+            put_px(rgba, col * 8 + xx, row * 8 + yy, set ? fg_idx : bg_idx);
+        }
+    }
+}
+
+void intvstic_render_backtab(const intvstic_snapshot *s, uint8_t *rgba)
+{
+    /* Color Stack mode's own state, threaded across cards left-to-right,
+     * top-to-bottom -- exactly stic_draw_cstk's cs_idx/bg_msk, just
+     * carrying a color INDEX (0-15) instead of a packed color mask, since
+     * this renders one pixel at a time rather than 8 lanes at once. */
+    int cs_idx = 0;
+    int bg_idx = (int)(s->raw[0x28] & 0xF);
+    int bt, col, row;
+
+    for (bt = 0, col = 0, row = 0; bt < 240; bt++) {
+        const uint32_t card = s->btab[bt];
+
+        if (s->mode == 0 && (card & 0x1800) == 0x1000) {
+            /* Color Stack "colored squares": four 2x2-pixel quadrants,
+             * color 7 in any quadrant means "current color-stack top" --
+             * see stic_draw_cstk's own comment block for the full bit
+             * table this mirrors. */
+            int csq[4];
+            int q, qy, qx;
+            csq[0] = (int)((card >> 0) & 7);
+            csq[1] = (int)((card >> 3) & 7);
+            csq[2] = (int)((card >> 6) & 7);
+            csq[3] = (int)(((card >> 9) & 3) | ((card >> 11) & 4));
+            for (q = 0; q < 4; q++)
+                if (csq[q] == 7)
+                    csq[q] = bg_idx;
+            for (qy = 0; qy < 2; qy++)
+                for (qx = 0; qx < 2; qx++) {
+                    const int quadrant = qy * 2 + qx;
+                    int py, px;
+                    for (py = 0; py < 4; py++)
+                        for (px = 0; px < 4; px++)
+                            put_px(rgba, col * 8 + qx * 4 + px,
+                                  row * 8 + qy * 4 + py, csq[quadrant]);
+                }
+        } else if (s->mode == 0) {
+            /* Color Stack, ordinary card. */
+            uint32_t gr_idx;
+            int fg_idx;
+
+            if (card & 0x2000) {
+                cs_idx = (cs_idx + 1) & 3;
+                bg_idx = (int)(s->raw[0x28 + cs_idx] & 0xF);
+            }
+            gr_idx = (card & 0xFF8u) & ((card & 0x800u) ? s->gram_mask : ~0U);
+            fg_idx = (int)(((card >> 9) & 0x8u) | (card & 7u));
+            blit_card(s, col, row, gr_idx, fg_idx, bg_idx, rgba);
+        } else {
+            /* Foreground/Background mode. */
+            const uint32_t gr_idx = card & 0x9F8u;
+            const int fg_idx = (int)(card & 7u);
+            const int fgbg_bg_idx =
+                (int)(((card >> 9) & 0xBu) | ((card >> 11) & 0x4u));
+            blit_card(s, col, row, gr_idx, fg_idx, fgbg_bg_idx, rgba);
+        }
+
+        if (++col == INTVSTIC_BACKTAB_COLS) {
+            col = 0;
+            row++;
         }
     }
 }

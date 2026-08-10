@@ -189,6 +189,115 @@ int main(void)
         free(pal);
     }
 
+    /* ---- BACKTAB: intvstic_render_backtab is a pure function of the
+     * snapshot, so these run against locally-built snapshots rather than
+     * the live machine -- only intv.gfx.palette (already populated by the
+     * boot above) is read outside the snapshot. ---- */
+    {
+        uint8_t *rgba = calloc(1, (size_t)INTVSTIC_BACKTAB_W *
+                              INTVSTIC_BACKTAB_H * 4);
+        intvstic_snapshot bs;
+        memset(&bs, 0, sizeof(bs));
+        bs.gram_mask = 0xFFFF;
+        /* Diagonal pattern in GROM card 0 (gmem index 0), same convention
+         * as the card-sheet test above: byte i = 1<<(7-i), so pixel
+         * (x,y) is set iff x == y. */
+        for (int i = 0; i < 8; i++)
+            bs.gmem[i] = (uint8_t)(1 << (7 - i));
+
+        /* -- Foreground/Background mode: card 0x0005 -> fg_clr=5 (card&7),
+         * gr_idx=0, bg_clr=((card>>9)&0xB)|((card>>11)&0x4)=0 -- straight
+         * from stic_draw_fgbg's own formula. */
+        bs.mode = 1;
+        bs.btab[0] = 0x0005;
+        intvstic_render_backtab(&bs, rgba);
+        {
+            const uint8_t *fg_px = &rgba[(0 * INTVSTIC_BACKTAB_W + 0) * 4];
+            const uint8_t *bg_px = &rgba[(0 * INTVSTIC_BACKTAB_W + 1) * 4];
+            check("fgbg card fg pixel matches color 5",
+                  fg_px[0] == intv.gfx.palette.color[5][0] &&
+                  fg_px[1] == intv.gfx.palette.color[5][1] &&
+                  fg_px[2] == intv.gfx.palette.color[5][2]);
+            check("fgbg card bg pixel matches color 0",
+                  bg_px[0] == intv.gfx.palette.color[0][0] &&
+                  bg_px[1] == intv.gfx.palette.color[0][1] &&
+                  bg_px[2] == intv.gfx.palette.color[0][2]);
+        }
+
+        /* -- Color Stack mode: two ordinary cards, the second with the
+         * color-stack-advance bit (0x2000) set, both fg_clr=3, gr_idx=0
+         * (card & 0xFF8 == 0) -- straight from stic_draw_cstk's own
+         * formula. Color stack: raw[0x28..0x2B] = 1,2,3,4. */
+        memset(&bs, 0, sizeof(bs));
+        bs.gram_mask = 0xFFFF;
+        for (int i = 0; i < 8; i++)
+            bs.gmem[i] = (uint8_t)(1 << (7 - i));
+        bs.mode = 0;
+        bs.raw[0x28] = 1; bs.raw[0x29] = 2; bs.raw[0x2A] = 3; bs.raw[0x2B] = 4;
+        bs.btab[0] = 0x0003;          /* fg=3, no advance -> bg=cstk[0]=1 */
+        bs.btab[1] = 0x2003;          /* fg=3, advance -> bg=cstk[1]=2 */
+        intvstic_render_backtab(&bs, rgba);
+        {
+            const uint8_t *fg0 = &rgba[(0 * INTVSTIC_BACKTAB_W + 0) * 4];
+            const uint8_t *bg0 = &rgba[(0 * INTVSTIC_BACKTAB_W + 1) * 4];
+            const uint8_t *fg1 = &rgba[(0 * INTVSTIC_BACKTAB_W + 8) * 4];
+            const uint8_t *bg1 = &rgba[(0 * INTVSTIC_BACKTAB_W + 9) * 4];
+            check("cstk card0 fg pixel matches color 3",
+                  fg0[0] == intv.gfx.palette.color[3][0] &&
+                  fg0[1] == intv.gfx.palette.color[3][1] &&
+                  fg0[2] == intv.gfx.palette.color[3][2]);
+            check("cstk card0 bg pixel matches stack color 1 (no advance)",
+                  bg0[0] == intv.gfx.palette.color[1][0] &&
+                  bg0[1] == intv.gfx.palette.color[1][1] &&
+                  bg0[2] == intv.gfx.palette.color[1][2]);
+            check("cstk card1 fg pixel matches color 3",
+                  fg1[0] == intv.gfx.palette.color[3][0] &&
+                  fg1[1] == intv.gfx.palette.color[3][1] &&
+                  fg1[2] == intv.gfx.palette.color[3][2]);
+            check("cstk card1 bg pixel matches stack color 2 (after advance)",
+                  bg1[0] == intv.gfx.palette.color[2][0] &&
+                  bg1[1] == intv.gfx.palette.color[2][1] &&
+                  bg1[2] == intv.gfx.palette.color[2][2]);
+        }
+
+        /* -- Color Stack "colored squares" special case: card&0x1800 ==
+         * 0x1000. Pix0=7 (-> current bg, color 9), Pix1=2, Pix2=4, Pix3=1
+         * (bit 11 must stay 0 for the colored-squares match, so Pix3's
+         * high bit -- (card>>11)&4 -- is always 0, matching
+         * stic_draw_cstk's own csq3 formula) -- placed at BACKTAB column
+         * 2 so its quadrants land at pixel x=16/20, y=0/4. */
+        memset(&bs, 0, sizeof(bs));
+        bs.gram_mask = 0xFFFF;
+        bs.mode = 0;
+        bs.raw[0x28] = 9; /* current color-stack top when this card renders */
+        bs.btab[2] = 0x1000 | 7 | (2 << 3) | (4 << 6) | (1 << 9);
+        intvstic_render_backtab(&bs, rgba);
+        {
+            const uint8_t *q_tl = &rgba[(0 * INTVSTIC_BACKTAB_W + 16) * 4];
+            const uint8_t *q_tr = &rgba[(0 * INTVSTIC_BACKTAB_W + 20) * 4];
+            const uint8_t *q_bl = &rgba[(4 * INTVSTIC_BACKTAB_W + 16) * 4];
+            const uint8_t *q_br = &rgba[(4 * INTVSTIC_BACKTAB_W + 20) * 4];
+            check("colored squares top-left is background (Pix0=7)",
+                  q_tl[0] == intv.gfx.palette.color[9][0] &&
+                  q_tl[1] == intv.gfx.palette.color[9][1] &&
+                  q_tl[2] == intv.gfx.palette.color[9][2]);
+            check("colored squares top-right is color 2",
+                  q_tr[0] == intv.gfx.palette.color[2][0] &&
+                  q_tr[1] == intv.gfx.palette.color[2][1] &&
+                  q_tr[2] == intv.gfx.palette.color[2][2]);
+            check("colored squares bottom-left is color 4",
+                  q_bl[0] == intv.gfx.palette.color[4][0] &&
+                  q_bl[1] == intv.gfx.palette.color[4][1] &&
+                  q_bl[2] == intv.gfx.palette.color[4][2]);
+            check("colored squares bottom-right is color 1",
+                  q_br[0] == intv.gfx.palette.color[1][0] &&
+                  q_br[1] == intv.gfx.palette.color[1][1] &&
+                  q_br[2] == intv.gfx.palette.color[1][2]);
+        }
+
+        free(rgba);
+    }
+
     intvdebug_resume(d);
     intvdebug_set_engaged(d, 0);
     intv_host_stop();

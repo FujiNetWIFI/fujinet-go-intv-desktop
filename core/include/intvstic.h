@@ -13,14 +13,20 @@
  *
  * SCOPE, stated plainly rather than silently narrowed (same practice
  * fujinet-go-msx-desktop's own msxvdp.h documents): this covers registers,
- * mode, and the 8 MOBs (decode and render) in full, plus a GRAM/GROM card
- * sheet and the palette. It does NOT render the BACKTAB (the background
- * card grid) -- unlike the MOBs, the two BACKTAB modes (Color Stack vs.
- * Foreground/Background) each need their own per-column color-cycling
- * logic re-derived from stic_draw_cstk/stic_draw_fgbg, which is real
- * additional scope, not a quick follow-on to what is here. A future pass
- * should add it; until then a debugger UI should omit that pane rather
- * than render a blank or wrong one.
+ * mode, the 8 MOBs (decode and render), a GRAM/GROM card sheet, the
+ * palette, and the BACKTAB (the 20x12-card background grid) in both its
+ * modes. The BACKTAB decode is the one piece re-derived rather than
+ * shared with the MOB code: Color Stack and Foreground/Background mode
+ * each have their own bit layout and color-cycling rule, taken directly
+ * from stic_draw_cstk/stic_draw_fgbg -- including Color Stack mode's
+ * "colored squares" special case (card bits 12-11 == 0b10), which packs
+ * four 2x2-pixel quadrants into one card instead of an 8x8 bitmap. NOT
+ * covered: the STIC's per-frame MOB/BACKTAB collision compositing
+ * (mpl_pri/mpl_vsb) and border-color extension bits -- this renders the
+ * BACKTAB as the STIC would with no MOBs in front of it, which is what a
+ * debugger view of "what does the background actually contain" wants;
+ * compositing MOBs on top is a frontend's blit-order concern, not this
+ * module's.
  *
  * THREADING / lifetime: same rule as intvdebug.h -- only valid while the
  * machine is paused, since it reads the machine's own struct state (via
@@ -64,11 +70,19 @@ typedef struct {
                                                * frame regardless of whether
                                                * anyone is debugging) keeps
                                                * current. */
+    uint16_t btab[240];       /* the 20x12 BACKTAB, row-major (stic->btab --
+                              * the STIC's own view of it, already
+                              * synchronised from system RAM by the time a
+                              * frame is rendered, per stic_tick) */
     int mode;      /* 0 = Color Stack, 1 = Foreground/Background
                     * (stic->mode -- the mode actually in effect; $20/$21
                     * writes go to stic->p_mode and take effect next
                     * frame, see stic_ctrl_wr_internal) */
     int gram_size;  /* 0 = 64 cards, 1 = 128, 2 = 256 (TutorVision) */
+    uint16_t gram_mask; /* stic->gram_mask -- masks GRAM card indices to
+                        * what gram_size actually provides; copied rather
+                        * than recomputed so this can never drift from
+                        * stic_init's own formula. */
 } intvstic_snapshot;
 
 void intvstic_snapshot_get(intvdebug *d, intvstic_snapshot *out);
@@ -117,6 +131,18 @@ void intvstic_mob_get(const intvstic_snapshot *s, int index,
  * x_size/y_stretch is just a blit-time scale, not a re-render. */
 void intvstic_render_mob(const intvstic_snapshot *s, int index,
                          uint8_t *rgba);
+
+/* ---- BACKTAB (the 160x96-pixel background card grid) --------------------
+ * rgba must hold INTVSTIC_BACKTAB_W * INTVSTIC_BACKTAB_H * 4 bytes.
+ * Renders exactly what stic_draw_cstk/stic_draw_fgbg would, including
+ * Color Stack mode's per-card color-stack-advance bit and its "colored
+ * squares" special case -- see this file's header for what is and is not
+ * covered. */
+#define INTVSTIC_BACKTAB_COLS 20
+#define INTVSTIC_BACKTAB_ROWS 12
+#define INTVSTIC_BACKTAB_W (INTVSTIC_BACKTAB_COLS * 8)
+#define INTVSTIC_BACKTAB_H (INTVSTIC_BACKTAB_ROWS * 8)
+void intvstic_render_backtab(const intvstic_snapshot *s, uint8_t *rgba);
 
 /* ---- GRAM/GROM card sheet ------------------------------------------------
  * A flat sheet of every card at native 8x8, in card order (GROM cards

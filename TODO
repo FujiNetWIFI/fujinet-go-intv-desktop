@@ -337,13 +337,20 @@ symbols still open):
       layout was read directly out of the staged tree's src/stic/stic.c by
       finding where each field is actually consumed (stic_do_mob,
       stic_draw_mobs, stic_ctrl_wr_internal, the raw[0x28-0x32] reads), not
-      from a datasheet -- see the header's own comment. Deliberately does
-      NOT render the BACKTAB (the background card grid): unlike the MOBs,
-      its two modes (Color Stack vs. Foreground/Background) each need their
-      own per-column color-cycling logic re-derived from stic_draw_cstk/
-      stic_draw_fgbg, real additional scope rather than a quick follow-on --
-      documented as a known gap rather than silently narrowed, matching the
-      MSX port's own precedent for an unfinished VDP mode.
+      from a datasheet -- see the header's own comment.
+  [x] intvstic_render_backtab -- closes the BACKTAB (background card grid)
+      rendering gap noted above. Both STIC modes implemented straight from
+      stic_draw_cstk/stic_draw_fgbg's own formulas (line-numbers checked
+      against the staged tree, not recalled): Color Stack mode's ordinary
+      cards (gr_idx = (card&0xFF8) & (GRAM-select ? gram_mask : ~0), fg_clr
+      = ((card>>9)&0x8)|(card&7), cs_idx/bg advance on card bit 13) and its
+      "colored squares" special case (card&0x1800==0x1000, four 2x2-pixel
+      quadrants, color 7 in any quadrant meaning "current color-stack top" --
+      and bit 11 being forced to 0 by the detection mask itself means that
+      case can never actually trigger for the fourth quadrant, which the
+      code mirrors rather than "fixes"); Foreground/Background mode's
+      gr_idx = card&0x9F8, fg_clr = card&7, bg_clr =
+      ((card>>9)&0xB)|((card>>11)&0x4).
   [x] core/tests/stic_test.c -- VERIFIED against the real running machine:
       writes known values directly into intv.stic.raw/gmem, then confirms
       the snapshot/decode reports exactly those values back out -- mode,
@@ -352,6 +359,17 @@ symbols still open):
       collision bits), an untouched MOB correctly decoding to invisible,
       and a hand-written diagonal bit pattern round-tripping through the
       card-sheet renderer pixel-for-pixel.
+  [x] BACKTAB rendering coverage added to stic_test.c -- since
+      intvstic_render_backtab is a pure function of the snapshot, these run
+      against locally-built snapshots (only intv.gfx.palette, already
+      populated by the boot above, is read outside the snapshot):
+      Foreground/Background mode's fg/bg pixel colors from a single card;
+      Color Stack mode's two ordinary cards proving the stack-advance bit
+      actually moves bg from stack slot 0 to slot 1; and the "colored
+      squares" special case's four quadrants, including Pix0=7 correctly
+      resolving to the live color-stack top rather than a literal color 7.
+      All eleven ctest cases pass, clean-room rebuild confirmed in both
+      WITH_INTV_ROMS ON and OFF configurations.
   [x] CAUGHT A REAL BUG while writing the card-sheet test: assumed GROM was
       512 cards (matching some other 8-bit VDP-ish chips' convention);
       stic_test.c's first run failed on the card-rendering assertion, which
@@ -386,10 +404,9 @@ symbols still open):
       skip rules) loading correctly, newest-wins tie-breaking on a shared
       address, and clear_user leaving the built-ins alone.
 
-  M4 IS NOW COMPLETE except the documented BACKTAB rendering gap (needs its
-  own color-cycling logic, real additional scope -- see intvstic.h) and
-  cp1600dasm.c as a standalone wrapper (not required yet --
-  intvdebug_disassemble already covers every use so far).
+  M4 IS NOW FULLY COMPLETE, including the BACKTAB rendering gap closed
+  above. cp1600dasm.c as a standalone wrapper is still not written (not
+  required yet -- intvdebug_disassemble already covers every use so far).
 
 NOT STARTED:
 

@@ -190,6 +190,19 @@ typedef struct {
  * function; unit-tested on its own (core/tests/keymap_test.c). */
 intvsession_key_mapping intvsession_key_from_keysym(uint32_t keysym);
 
+/* ---- gamepads (SDL, hotplug; started/stopped with the session) ----------
+ * Left stick drives the disc; SOUTH/EAST/WEST face buttons drive the three
+ * action buttons. No keypad digit mapping (see core/src/gamepad_sdl.c for
+ * why). Automatic side assignment: the first connected pad drives the left
+ * controller, the second the right, until intvsession_gamepad_assign pins
+ * one explicitly (side: 0/INTVSESSION_PAD_LEFT, 1/INTVSESSION_PAD_RIGHT, or
+ * -1 to restore automatic assignment). */
+int  intvsession_gamepad_count(intvsession *s);
+/* Name of connected pad idx into dst; returns the name's length (0 if idx
+ * is out of range). */
+int  intvsession_gamepad_name(intvsession *s, int idx, char *dst, int dstsz);
+void intvsession_gamepad_assign(intvsession *s, int idx, int side);
+
 /* ---- paths ----------------------------------------------------------------
  * Directory paths (valid for the session's lifetime). */
 const char *intvsession_roms_path(const intvsession *s);

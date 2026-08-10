@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "gamepad_sdl.h"
 #include "intv_audio.h"
 #include "intv_frame.h"
 #include "intv_host.h"
@@ -62,12 +63,15 @@ int intvsession_start(intvsession *s)
         session_set_error(s, "failed to start the emulator thread");
         return -1;
     }
+    /* Best-effort: no gamepads attached is not a session-start failure. */
+    intv_gamepad_start();
     return 0;
 }
 
 void intvsession_stop(intvsession *s)
 {
     (void)s;
+    intv_gamepad_stop();
     intv_host_stop();
 }
 

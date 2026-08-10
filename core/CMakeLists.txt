@@ -234,16 +234,39 @@ add_custom_command(
   COMMENT "Embedding the Intellivision ROMs (WITH_INTV_ROMS=${WITH_INTV_ROMS})"
   VERBATIM)
 
-target_sources(jzintv_core PRIVATE
-  "${INTV_ROMS_C}"
+target_sources(jzintv_core PRIVATE "${INTV_ROMS_C}")
+target_include_directories(jzintv_core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+
+# ---- intv_session: the toolkit-agnostic session API (intvsession.h) -------
+# Deliberately a SEPARATE target from jzintv_core, not more files bolted onto
+# it: gamepad_sdl.c needs SDL3 (for gamepad enumeration/input only -- audio
+# and video capture are jzintv_core's own gfx_desktop.c/snd_desktop.c and
+# need no toolkit at all), and jzintv_core's whole point is staying
+# SDL-free -- verified by no_sdl_link_test, which links jzintv_core alone.
+# Were gamepad_sdl.c added directly to jzintv_core, every consumer of that
+# archive would pick up an SDL3 runtime dependency whether or not it uses
+# gamepads, silently widening what "zero SDL" meant. This mirrors
+# fujinet-go-coco-desktop's own split (xroar_core vs. cocosession, the
+# latter linking SDL3 for audio/gamepad).
+find_package(SDL3 CONFIG REQUIRED)
+
+add_library(intv_session STATIC
   src/settings.c
   src/paths.c
   src/session.c
   src/intv_keymap.c
+  src/gamepad_sdl.c
 )
-target_include_directories(jzintv_core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+set_target_properties(intv_session PROPERTIES C_STANDARD 11)
+target_include_directories(intv_session PRIVATE src)
+target_link_libraries(intv_session PUBLIC jzintv_core PRIVATE SDL3::SDL3)
+target_compile_options(intv_session PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
 # ---- tests -----------------------------------------------------------------
+# Link jzintv_core directly (not intv_session) wherever a test only needs
+# intv_host/intv_frame/intv_audio -- keeps them exercising the exact
+# SDL-free archive no_sdl_link_test checks, and is a second, incidental
+# confirmation that gamepad support genuinely stayed opt-in.
 add_executable(no_sdl_link_test tests/no_sdl_link_test.c)
 target_link_libraries(no_sdl_link_test jzintv_core)
 
@@ -257,15 +280,19 @@ target_link_libraries(pad_test jzintv_core)
 target_include_directories(pad_test PRIVATE src)
 
 add_executable(session_test tests/session_test.c)
-target_link_libraries(session_test jzintv_core)
+target_link_libraries(session_test intv_session)
 target_include_directories(session_test PRIVATE src)
 
 add_executable(keymap_test tests/keymap_test.c)
-target_link_libraries(keymap_test jzintv_core)
+target_link_libraries(keymap_test intv_session)
 
 add_executable(audio_test tests/audio_test.c)
 target_link_libraries(audio_test jzintv_core)
 target_include_directories(audio_test PRIVATE src)
+
+add_executable(gamepad_test tests/gamepad_test.c)
+target_link_libraries(gamepad_test intv_session)
+target_include_directories(gamepad_test PRIVATE src)
 
 add_test(NAME no_sdl_link COMMAND no_sdl_link_test)
 add_test(NAME boot_smoke COMMAND boot_smoke)
@@ -273,6 +300,7 @@ add_test(NAME pad_test COMMAND pad_test)
 add_test(NAME session COMMAND session_test)
 add_test(NAME keymap COMMAND keymap_test)
 add_test(NAME audio COMMAND audio_test)
+add_test(NAME gamepad COMMAND gamepad_test)
 set_tests_properties(pad_test boot_smoke audio PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 # Needs WITH_INTV_ROMS=ON to have anything to provision; reported as 77
 # (skipped) rather than a failure otherwise, and it boots a real machine, so

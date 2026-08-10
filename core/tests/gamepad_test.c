@@ -1,0 +1,73 @@
+/*
+ * gamepad_test -- exercises the pure functions (intv_disc_from_stick,
+ * intv_pad_for_port) deterministically, and confirms the SDL gamepad
+ * subsystem starts and stops cleanly with no hardware attached (this
+ * machine has none, which is itself the common case in CI).
+ */
+#include <stdio.h>
+
+#include "gamepad_sdl.h"
+#include "intvsession.h"
+
+static int failed = 0;
+
+static void check(const char *what, int ok)
+{
+    if (!ok) {
+        fprintf(stderr, "gamepad_test: FAILED: %s\n", what);
+        failed = 1;
+    }
+}
+
+int main(void)
+{
+    /* ---- intv_disc_from_stick ---- */
+    check("centered", intv_disc_from_stick(0.0f, 0.0f, 0.35f) == -1);
+    check("within deadzone",
+          intv_disc_from_stick(0.1f, 0.1f, 0.35f) == -1);
+    check("east", intv_disc_from_stick(1.0f, 0.0f, 0.35f) == 0);
+    check("north", intv_disc_from_stick(0.0f, 1.0f, 0.35f) == 4);
+    check("west", intv_disc_from_stick(-1.0f, 0.0f, 0.35f) == 8);
+    check("south", intv_disc_from_stick(0.0f, -1.0f, 0.35f) == 12);
+    check("northeast", intv_disc_from_stick(0.7071f, 0.7071f, 0.35f) == 2);
+    check("southwest", intv_disc_from_stick(-0.7071f, -0.7071f, 0.35f) == 10);
+
+    /* ---- intv_pad_for_port ---- */
+    {
+        /* Two pads, both automatic: first -> left(0), second -> right(1). */
+        int bindings[2] = {-1, -1};
+        check("auto: pad 0 drives left",
+              intv_pad_for_port(bindings, 2, INTVSESSION_PAD_LEFT) == 0);
+        check("auto: pad 1 drives right",
+              intv_pad_for_port(bindings, 2, INTVSESSION_PAD_RIGHT) == 1);
+    }
+    {
+        /* Explicit binding wins even out of connection order. */
+        int bindings[2] = {INTVSESSION_PAD_RIGHT, -1};
+        check("explicit binding: pad 0 drives right",
+              intv_pad_for_port(bindings, 2, INTVSESSION_PAD_RIGHT) == 0);
+        check("remaining pad falls into the one free side",
+              intv_pad_for_port(bindings, 2, INTVSESSION_PAD_LEFT) == 1);
+    }
+    {
+        int bindings[1] = {-1};
+        check("no pad drives an unconnected side",
+              intv_pad_for_port(bindings, 1, INTVSESSION_PAD_RIGHT) == -1);
+    }
+
+    /* ---- SDL subsystem lifecycle, no hardware required ---- */
+    check("gamepad subsystem starts", intv_gamepad_start() == 0);
+    check("no pads on a CI machine with none attached",
+          intvsession_gamepad_count(NULL) == 0);
+    intv_gamepad_stop();
+    /* Starting and stopping again should be equally clean. */
+    check("restart is clean", intv_gamepad_start() == 0);
+    intv_gamepad_stop();
+
+    if (failed) {
+        fprintf(stderr, "gamepad_test: FAILED\n");
+        return 1;
+    }
+    printf("gamepad_test: OK\n");
+    return 0;
+}

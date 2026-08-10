@@ -167,9 +167,40 @@ IN PROGRESS -- M3, session library:
   data flows -- and before trusting that real cartridge audio will be
   audible once a frontend exists to hear it.
 
-  Still open in M3: gamepad backend, FujiNet runtime wiring
-  (cmake/FujiNetRuntime.cmake is still a stub -- WITH_FUJINET=OFF only),
-  fujibus_smoke, dasm_test, stic_test.
+  [x] core/src/gamepad_sdl.{c,h} -- SDL3 gamepad backend, but NOT bolted
+      onto jzintv_core: it lives in a new intv_session static library
+      (core/CMakeLists.txt) that links jzintv_core PUBLIC and SDL3 PRIVATE,
+      keeping jzintv_core itself exactly as SDL-free as the M1 gate
+      originally proved. Every test that only needs intv_host/intv_frame/
+      intv_audio (boot_smoke, pad_test, audio_test, no_sdl_link_test)
+      continues linking jzintv_core directly, unaffected; only
+      session_test/keymap_test/gamepad_test link intv_session now. Left
+      stick -> disc, SOUTH/EAST/WEST face buttons -> the three action
+      buttons (no keypad digit mapping -- nowhere near enough buttons, and
+      the keypad window covers it). Two pure functions, unit-tested without
+      any hardware attached: intv_disc_from_stick (deadzone + 16-position
+      angle quantization) and intv_pad_for_port (explicit-binding-wins,
+      first-two-automatic port assignment, mirrors cocosession's own
+      coco_pad_for_port). intvsession_gamepad_{count,name,assign} added to
+      the public API, backed by intv_gamepad_start/stop
+      (intvsession_start/stop calls these; best-effort, no gamepads
+      attached is not a session-start failure).
+  [x] core/tests/gamepad_test.c -- VERIFIED: both pure functions against a
+      table of known angles/bindings, and that the SDL gamepad subsystem
+      starts, reports zero pads (this machine has none, the common CI
+      case), and stops cleanly -- twice, to catch any start/stop asymmetry.
+  [x] VERIFIED the target split itself: `ldd` on boot_smoke (links
+      jzintv_core only) shows no libSDL3.so; `ldd` on session_test (links
+      intv_session) does.
+  All eight tests (no_sdl_link, boot_smoke, pad_test, session, keymap,
+  audio, gamepad, plus no_embedded_roms_boot_smoke when ROMs are OFF) pass
+  via ctest in both WITH_INTV_ROMS configurations, confirmed with a
+  clean-room rebuild in both.
+
+  Still open in M3: FujiNet runtime wiring (cmake/FujiNetRuntime.cmake is
+  still a stub -- WITH_FUJINET=OFF only; this is the one big remaining
+  piece, a real fujinet-firmware C++ build), fujibus_smoke, dasm_test,
+  stic_test, and the silent-tone gap noted above.
 
 NOT STARTED:
 

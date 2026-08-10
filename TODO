@@ -362,11 +362,34 @@ symbols still open):
       test's own offsets; all corrected instances cross-checked against
       that same init loop rather than guessed twice.
 
-  Still open in M4: symbols.c (built-in EXEC/GROM symbol table + loading
-  external .sym files), cp1600dasm.c as a thin standalone wrapper if a
-  frontend wants disassembly without the rest of intvdebug (not required
-  yet -- intvdebug_disassemble already covers it), and the BACKTAB
-  rendering gap noted above.
+  [x] core/debugger/symbols.{c,h} -- name<->address table, modelled
+      directly on the CoCo port's own cocosymtab. The built-in table is
+      deliberately minimal (just $1000 EXEC_ENTRY and $9C00
+      FUJINET_MAILBOX) rather than the usual small library of documented
+      ROM entry points CoCo/ADAM/MSX ship: this project has no verified
+      primary source in hand for documented Intellivision EXEC subroutine
+      addresses (no ROM disassembly, no vendor manual, nothing locally
+      checkable), and CoCo's own symtab.c states the principle this
+      followed -- "a wrong address in a debugger is worse than a missing
+      one" -- so nothing was transcribed from memory with no way to verify
+      it. Both built-in entries ARE independently confirmed, from the
+      staged jzIntv tree's own source (cp1600_reset's r[7]=0x1000, and
+      FUJINET_WINDOW_SIZE's placement in fujinet.h) cross-checked against
+      intv_host's own boot log. intvsymtab_load speaks as1600's real -s
+      output format, confirmed against jzIntv's own loader for the same
+      files (src/debug/debug.c) rather than assumed -- undefined symbols
+      ("????????") and out-of-range addresses are skipped exactly as that
+      loader does.
+  [x] core/tests/symtab_test.c -- VERIFIED (pure function, no emulator
+      boot needed): both built-ins, add/lookup in both directions, a real
+      as1600-format file (including its undefined-symbol and out-of-range
+      skip rules) loading correctly, newest-wins tie-breaking on a shared
+      address, and clear_user leaving the built-ins alone.
+
+  M4 IS NOW COMPLETE except the documented BACKTAB rendering gap (needs its
+  own color-cycling logic, real additional scope -- see intvstic.h) and
+  cp1600dasm.c as a standalone wrapper (not required yet --
+  intvdebug_disassemble already covers every use so far).
 
 NOT STARTED:
 

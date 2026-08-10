@@ -264,11 +264,81 @@ IN PROGRESS -- M3, session library:
   Still open in M3: the silent-tone gap noted in the audio section above.
   dasm_test and stic_test are M4 scope (the debugger engine), not M3's.
 
-M3 IS NOW COMPLETE (see above for the full FujiNet runtime item that closed
-it out). NOT STARTED:
+M3 IS COMPLETE (see above for the full FujiNet runtime item that closed it
+out).
 
-  M4 -- Debugger engine: core/include/intvdebug.h, core/debugger/{debugger,
-        cp1600dasm,sticview,symbols}.c -- STIC/registers/MOB views.
+IN PROGRESS -- M4, debugger engine (CPU side done; STIC/MOB view and
+symbols still open):
+
+  [x] core/include/intvdebug.h + core/debugger/debugger.c -- built on
+      jzIntv's own hook (cp1600_instr_tick), not a stepped path of our own:
+      cp1600_t already calls a registered callback between instructions
+      whenever steps_remaining reaches 0, and jzIntv's own console debugger
+      (src/debug/debug.c) already registers itself there unconditionally at
+      cfg_init() time -- intvdebug_set_engaged(d,1) simply re-registers our
+      own hook in its place (a single function pointer, not a chain; safe,
+      since the console debugger is never reachable here with no stdin to
+      read commands from). Breakpoints use jzIntv's own native mechanism
+      (cp1600_set_breakpt/cp1600_clr_breakpt, which substitutes the decoded
+      opcode at that address rather than checking a table every
+      instruction) including its existing one-shot flag (CP1600_BKPT_ONCE,
+      self-clearing on hit) for step_over/step_out's temporary breakpoints.
+      Threading matches cocodebug.h's own model exactly: the emulator
+      thread blocks (pthread_cond_wait) right inside the hook while paused
+      -- there is no other place progress could be stopped, and no
+      separate "paused" flag the run loop checks elsewhere.
+  [x] FOUND AND FIXED A REAL HANG while building this: cp1600_run() reaches
+      its do_instr_tick label -- and so calls the registered hook -- once
+      per outer timeslice regardless of step_count (whenever the inner
+      instruction loop simply runs out of cycles to spend, not only when
+      steps_remaining hits 0), so a naive hook that always blocks
+      unconditionally freezes the machine the instant the debugger is
+      engaged, before any pause is ever requested. Fixed by blocking only
+      when there is an actual reason to (a real/one-shot breakpoint just
+      fired, or single-step mode is active) -- verified by debug_test.c
+      hanging before the fix and passing cleanly after.
+  [x] Also fixed a macro-precedence bug while writing this: cp1600.h's
+      CP1600_PK/CP1600_WR substitute their first argument textually into
+      `c->periph.bus`, so passing the expression &intv.cp1600 directly (not
+      a plain identifier) parsed as &(intv.cp1600->periph.bus) --  wrong
+      precedence, a real compile error. Fixed by assigning a local
+      `cp1600_t *const cp = &intv.cp1600;` first, matching how every other
+      call site of these macros in the staged tree already does it.
+  [x] step_over: detects a JSR-family instruction (JSR/JSRE/JSRD/JSRi all
+      share that mnemonic prefix, nothing else in the CP-1610 set does) via
+      intvdebug_disassemble, then sets a one-shot breakpoint just past it
+      and runs free rather than single-stepping through the whole
+      subroutine.
+  [x] step_out: honestly approximate, and documented as such in
+      intvdebug.h -- the CP-1610 has no hardware call stack, so which
+      register holds the return address is not recoverable once already
+      inside a routine. Breaks on whatever R5 currently holds (the
+      convention EXEC and most game software actually use, confirmed
+      empirically in debug_test.c: r5 held a plausible EXEC return address
+      the whole time). A routine entered through a different register
+      falls back to running free rather than stopping somewhere wrong.
+  [x] core/tests/debug_test.c -- VERIFIED against the real running
+      machine: engage/disengage, pause (waits for the actual instruction
+      boundary), register read (PC correctly mirrors r[7], and lands in
+      one of the machine's own mapped ROM ranges -- by the time a pause
+      actually lands a few ms into boot, execution is well past EXEC init
+      and running the embedded config ROM's own code, not stuck in EXEC,
+      which is what an earlier, wrong test assumption had to be corrected
+      for), disassembly (produces real text at the right address with a
+      plausible instruction length), memory read (EXEC ROM is real
+      content, not zero-filled) and write (a scratchpad-RAM poke round-
+      trips), breakpoint toggle/list, single-step (advances the stop
+      serial and re-pauses), resume (leaves the paused state), and a clean
+      disengage. All nine tests continue to pass via ctest, clean-room
+      rebuild confirmed.
+
+  Still open in M4: core/include/intvstic.h + core/debugger/sticview.c
+  (the STIC register/mode/MOB/backtab view), symbols.c (built-in EXEC/GROM
+  symbol table + loading external .sym files), cp1600dasm.c as a thin
+  standalone wrapper if a frontend wants disassembly without the rest of
+  intvdebug (not required yet -- intvdebug_disassemble already covers it).
+
+NOT STARTED:
 
   M5 -- GNOME frontend (GTK4 + libadwaita): main window, debugger window,
         keypad sub-window (both hand controllers, clickable keypad/disc/

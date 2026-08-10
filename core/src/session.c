@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <stdio.h>
+
 #include "gamepad_sdl.h"
 #include "intv_audio.h"
 #include "intv_frame.h"
@@ -54,6 +56,15 @@ int intvsession_start(intvsession *s)
         return -1;
     }
 
+    /* FujiNet listens, jzIntv's --fujinet connects out (see
+     * intvsession.h's own comment on this direction) -- so FujiNet has to
+     * be up, and its listener actually accepting, before the emulator
+     * thread starts. Best-effort: WITH_FUJINET=OFF or a load failure is not
+     * a session-start failure, the machine still boots the embedded config
+     * ROM either way (see intv_host.h). */
+    if (fujinet_start(s) == 0)
+        fujinet_wait_for_boip(s, 3000);
+
     intv_host_opts opts = {
         .rom_dir = s->roms_dir,
         .fujinet_host = "127.0.0.1",
@@ -61,6 +72,7 @@ int intvsession_start(intvsession *s)
     };
     if (intv_host_start(&opts) != 0) {
         session_set_error(s, "failed to start the emulator thread");
+        fujinet_stop(s);
         return -1;
     }
     /* Best-effort: no gamepads attached is not a session-start failure. */
@@ -70,9 +82,9 @@ int intvsession_start(intvsession *s)
 
 void intvsession_stop(intvsession *s)
 {
-    (void)s;
     intv_gamepad_stop();
     intv_host_stop();
+    fujinet_stop(s);
 }
 
 int intvsession_is_running(const intvsession *s)
@@ -95,8 +107,10 @@ int intvsession_copy_frame(intvsession *s, uint32_t *dst,
 
 int intvsession_render_audio(intvsession *s, int16_t *dst, int max_samples)
 {
-    (void)s;
-    return intv_audio_copy(dst, max_samples);
+    int n = intv_audio_copy(dst, max_samples);
+    if (n > 0)
+        fujinet_mix_audio(s, dst, n, INTVSESSION_AUDIO_RATE);
+    return n;
 }
 
 void intvsession_pad_key(intvsession *s, intvsession_pad_side side,

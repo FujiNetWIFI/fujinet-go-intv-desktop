@@ -256,11 +256,24 @@ add_library(intv_session STATIC
   src/session.c
   src/intv_keymap.c
   src/gamepad_sdl.c
+  src/fujinet_runtime.c
 )
 set_target_properties(intv_session PROPERTIES C_STANDARD 11)
 target_include_directories(intv_session PRIVATE src)
 target_link_libraries(intv_session PUBLIC jzintv_core PRIVATE SDL3::SDL3)
-target_compile_options(intv_session PRIVATE -Wall -Wextra -Wno-unused-parameter)
+target_compile_options(intv_session PRIVATE -Wall -Wextra -Wno-unused-parameter
+                       -Wno-format-truncation)
+# fujinet_runtime.c dlopen's libfujinet at run time -- no link-time
+# dependency on it, so intv_session (and everything linking it) builds fine
+# with -DWITH_FUJINET=OFF. These are where paths_provision_fujinet
+# (paths.c) looks for the runtime and its data tree when nothing was found
+# beside the executable or an explicit FUJINET_LIB override.
+target_link_libraries(intv_session PRIVATE ${CMAKE_DL_LIBS})
+target_compile_definitions(intv_session PRIVATE
+  INTV_DEV_FUJINET_OUT="${CMAKE_SOURCE_DIR}/tools/fujinet/work/out"
+  INTV_INSTALL_DATADIR="${CMAKE_INSTALL_FULL_DATADIR}/fujinet-go-intv"
+  INTV_INSTALL_LIBDIR="${CMAKE_INSTALL_FULL_LIBDIR}/fujinet-go-intv"
+)
 
 # ---- tests -----------------------------------------------------------------
 # Link jzintv_core directly (not intv_session) wherever a test only needs
@@ -294,6 +307,9 @@ add_executable(gamepad_test tests/gamepad_test.c)
 target_link_libraries(gamepad_test intv_session)
 target_include_directories(gamepad_test PRIVATE src)
 
+add_executable(fujibus_smoke tests/fujibus_smoke.c)
+target_link_libraries(fujibus_smoke intv_session)
+
 add_test(NAME no_sdl_link COMMAND no_sdl_link_test)
 add_test(NAME boot_smoke COMMAND boot_smoke)
 add_test(NAME pad_test COMMAND pad_test)
@@ -301,6 +317,9 @@ add_test(NAME session COMMAND session_test)
 add_test(NAME keymap COMMAND keymap_test)
 add_test(NAME audio COMMAND audio_test)
 add_test(NAME gamepad COMMAND gamepad_test)
+add_test(NAME fujibus_smoke COMMAND fujibus_smoke)
+set_tests_properties(fujibus_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
+                     RUN_SERIAL ON)
 set_tests_properties(pad_test boot_smoke audio PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 # Needs WITH_INTV_ROMS=ON to have anything to provision; reported as 77
 # (skipped) rather than a failure otherwise, and it boots a real machine, so

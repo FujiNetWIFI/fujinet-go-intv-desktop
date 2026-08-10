@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -20,8 +21,21 @@
 
 #if defined(_WIN32)
 #include <direct.h>
+#include <windows.h>
 #else
 #include <unistd.h>
+#endif
+
+/* Compiled-in development fallbacks (set by CMake to paths in the source /
+ * build trees) so a git checkout runs without an install step. */
+#ifndef INTV_DEV_FUJINET_OUT
+#define INTV_DEV_FUJINET_OUT ""
+#endif
+#ifndef INTV_INSTALL_DATADIR
+#define INTV_INSTALL_DATADIR ""
+#endif
+#ifndef INTV_INSTALL_LIBDIR
+#define INTV_INSTALL_LIBDIR ""
 #endif
 
 static int is_sep(char c)
@@ -64,6 +78,81 @@ static int is_file(const char *path)
 {
     struct stat st;
     return path && *path && stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static int is_dir(const char *path)
+{
+    struct stat st;
+    return path && *path && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static int copy_file(const char *src, const char *dst)
+{
+    FILE *in, *out;
+    char buf[65536];
+    size_t n;
+    int rc = 0;
+
+    in = fopen(src, "rb");
+    if (!in) return -1;
+    out = fopen(dst, "wb");
+    if (!out) { fclose(in); return -1; }
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) { rc = -1; break; }
+    }
+    if (ferror(in)) rc = -1;
+    fclose(in);
+    if (fclose(out) != 0) rc = -1;
+    return rc;
+}
+
+static int copy_tree(const char *src, const char *dst)
+{
+    DIR *d;
+    struct dirent *e;
+    int rc = 0;
+
+    if (mkdir_p(dst) != 0) return -1;
+    d = opendir(src);
+    if (!d) return -1;
+    while ((e = readdir(d)) != NULL) {
+        char from[INTV_PATH_MAX], to[INTV_PATH_MAX];
+        struct stat st;
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        snprintf(from, sizeof(from), "%s/%s", src, e->d_name);
+        snprintf(to, sizeof(to), "%s/%s", dst, e->d_name);
+        if (stat(from, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode))
+            rc |= copy_tree(from, to);
+        else if (S_ISREG(st.st_mode))
+            rc |= copy_file(from, to);
+    }
+    closedir(d);
+    return rc;
+}
+
+/* Directory holding the running executable, or "" when it cannot be
+ * determined -- the first place a Windows install (a folder you copy
+ * around) is checked for the runtime, since the exe and fujinet.dll sit
+ * side by side there. */
+static const char *exe_dir(void)
+{
+    static char dir[INTV_PATH_MAX];
+#if defined(_WIN32)
+    static int resolved;
+    if (!resolved) {
+        resolved = 1;
+        if (GetModuleFileNameA(NULL, dir, (DWORD)sizeof(dir)) == 0) {
+            dir[0] = '\0';
+        } else {
+            dir[sizeof(dir) - 1] = '\0';
+            char *p = strrchr(dir, '\\');
+            if (!p) p = strrchr(dir, '/');
+            if (p) *p = '\0'; else dir[0] = '\0';
+        }
+    }
+#endif
+    return dir;
 }
 
 /* Per-user config/data directory. On Windows this is %APPDATA% (config) or
@@ -152,6 +241,102 @@ int paths_init(struct intvsession *s, const char *config_dir,
 
     intv_host_provision_roms(s->roms_dir);
 
+    /* The FujiNet runtime tree. Pure derivations of data_dir, settled here
+     * (rather than only when the runtime is actually started) so a session
+     * with FujiNet unavailable still reports sensible paths instead of
+     * empty strings -- see cocosession's own paths_init for the same
+     * reasoning. */
+    snprintf(s->fujinet_root, sizeof(s->fujinet_root), "%s/fujinet",
+             s->data_dir);
+    snprintf(s->fujinet_config, sizeof(s->fujinet_config), "%s/fnconfig.ini",
+             s->fujinet_root);
+    snprintf(s->fujinet_sd, sizeof(s->fujinet_sd), "%s/SD", s->fujinet_root);
+    snprintf(s->fujinet_data, sizeof(s->fujinet_data), "%s/data",
+             s->fujinet_root);
+    s->fujinet_lib[0] = '\0'; /* resolved lazily in paths_provision_fujinet */
+
+    snprintf(s->webui_url, sizeof(s->webui_url), "http://127.0.0.1:%d/",
+             INTVSESSION_WEBUI_PORT);
+
+    return 0;
+}
+
+/* Locate libfujinet.{so,dylib}/fujinet.dll and provision the runtime tree
+ * (fnconfig.ini + data/ + SD/) on first run, copied from the newest
+ * available source: the installed share dir or the dev build output.
+ * Modelled closely on fujinet-go-coco-desktop's paths_provision_fujinet. */
+int paths_provision_fujinet(struct intvsession *s)
+{
+    const char *env;
+    char src_root[INTV_PATH_MAX];
+    char probe[INTV_PATH_MAX];
+
+    if (!s->fujinet_lib[0]) {
+        static const char *const names[] = {
+            "libfujinet.so", "libfujinet.dylib", "fujinet.dll"};
+        const char *const dirs[] = {exe_dir(), INTV_INSTALL_LIBDIR,
+                                    INTV_DEV_FUJINET_OUT};
+        const size_t nnames = sizeof(names) / sizeof(names[0]);
+        const size_t ndirs = sizeof(dirs) / sizeof(dirs[0]);
+        size_t di, ni;
+        env = getenv("FUJINET_LIB");
+        if (env && is_file(env)) {
+            snprintf(s->fujinet_lib, sizeof(s->fujinet_lib), "%s", env);
+        } else {
+            for (di = 0; di < ndirs && !s->fujinet_lib[0]; di++)
+                for (ni = 0; ni < nnames && !s->fujinet_lib[0]; ni++) {
+                    if (!dirs[di][0])
+                        continue;
+                    snprintf(probe, sizeof(probe), "%s/%s", dirs[di],
+                             names[ni]);
+                    if (is_file(probe))
+                        snprintf(s->fujinet_lib, sizeof(s->fujinet_lib),
+                                 "%s", probe);
+                }
+        }
+    }
+    if (!s->fujinet_lib[0])
+        return -1; /* no runtime available; session runs without FujiNet */
+
+    if (!is_file(s->fujinet_config)) {
+        src_root[0] = '\0';
+        if (!src_root[0] && exe_dir()[0]) {
+            snprintf(probe, sizeof(probe), "%s/fujinet/fnconfig.ini",
+                     exe_dir());
+            if (is_file(probe))
+                snprintf(src_root, sizeof(src_root), "%s/fujinet", exe_dir());
+        }
+        if (!src_root[0]) {
+            snprintf(probe, sizeof(probe), "%s/fujinet/fnconfig.ini",
+                     INTV_INSTALL_DATADIR);
+            if (is_file(probe))
+                snprintf(src_root, sizeof(src_root), "%s/fujinet",
+                         INTV_INSTALL_DATADIR);
+        }
+        if (!src_root[0]) {
+            snprintf(probe, sizeof(probe), "%s/fnconfig.ini",
+                     INTV_DEV_FUJINET_OUT);
+            if (is_file(probe))
+                snprintf(src_root, sizeof(src_root), "%s",
+                         INTV_DEV_FUJINET_OUT);
+        }
+        if (!src_root[0]) {
+            session_set_error(s, "FujiNet runtime data not found (looked in "
+                              "%s and %s)", INTV_INSTALL_DATADIR,
+                              INTV_DEV_FUJINET_OUT);
+            s->fujinet_lib[0] = '\0';
+            return -1;
+        }
+        mkdir_p(s->fujinet_root);
+        snprintf(probe, sizeof(probe), "%s/fnconfig.ini", src_root);
+        copy_file(probe, s->fujinet_config);
+        snprintf(probe, sizeof(probe), "%s/data", src_root);
+        if (is_dir(probe)) copy_tree(probe, s->fujinet_data);
+        snprintf(probe, sizeof(probe), "%s/SD", src_root);
+        if (is_dir(probe)) copy_tree(probe, s->fujinet_sd);
+    }
+    mkdir_p(s->fujinet_sd);
+    mkdir_p(s->fujinet_data);
     return 0;
 }
 

@@ -197,16 +197,75 @@ IN PROGRESS -- M3, session library:
   via ctest in both WITH_INTV_ROMS configurations, confirmed with a
   clean-room rebuild in both.
 
-  Still open in M3: FujiNet runtime wiring (cmake/FujiNetRuntime.cmake is
-  still a stub -- WITH_FUJINET=OFF only; this is the one big remaining
-  piece, a real fujinet-firmware C++ build), fujibus_smoke, dasm_test,
-  stic_test, and the silent-tone gap noted above.
+  [x] cmake/FujiNetRuntime.cmake -- no longer a stub. Real implementation,
+      built directly from fujinet-go-coco-desktop's own (same staging/patch
+      machinery, entirely target-agnostic).
+  [x] tools/fujinet/build-fujinet-desktop.sh -- adapted from CoCo's own with
+      two real changes: PC_TARGET=RS232 (FUJINET_TARGET=RS232 in
+      fujinet_pc.cmake -- BUILD_RS232, board fujinet-lwm-rs232, bus RS232)
+      and force_boip_config's port changed to 65503
+      (INTVSESSION_BOIP_PORT). Confirmed via the firmware source itself
+      (lib/hardware/BoIPChannel.cpp, lib/bus/rs232/rs232.cpp) that the RS232
+      bus's BoIPChannel defaults to listening=true and rs232.cpp's own
+      BoIPConfig().hostName(...).portNum(...) chain never overrides that --
+      i.e. FujiNet listens and jzIntv's own fn_sock.c connects out as a
+      plain TCP client, the same direction as the CoCo port and the
+      opposite of ADAM/Apple II.
+  [x] tools/fujinet/support/fujinet_desktop_entry.cpp -- copied from CoCo's
+      own essentially verbatim (it is fully target-agnostic already: no
+      CoCo-specific logic anywhere in it), with only the header comment and
+      the default web admin bind port (64003, INTVSESSION_WEBUI_PORT)
+      changed.
+  [x] core/src/{dynlib,compat}.h + core/src/fujinet_runtime.c -- the dlopen
+      wrapper around libfujinet's fujinet_desktop_* entry points, ported
+      from CoCo's own fujinet_runtime.c. fujinet_wait_for_boip polls the
+      port instead of guessing at a sleep, same reasoning as CoCo's
+      fujinet_wait_for_becker. fujinet_mix_audio is actually SIMPLER than
+      CoCo's: jzIntv's own PSG mixer is mono (see intv_audio.h), so unlike
+      the CoCo port there is no stereo-widening step for FujiNet's mono SAM
+      speech output.
+  [x] core/src/{session,session_internal,paths}.c -- intvsession_start now
+      starts FujiNet first and waits (up to 3s) for its BoIP listener
+      before starting the emulator thread, exactly the ordering CoCo's own
+      port needs and for the same reason (a --fujinet connection attempt
+      before the listener is up finds nothing) -- except here it is not
+      fatal the way it is on CoCo's DriveWire boot, since jzIntv's
+      --fujinet peripheral retries non-blockingly on its own. Added
+      intvsession_fujinet_running/webui_url/copy_log to the public API,
+      paths_provision_fujinet (locate the .so, provision fnconfig.ini/data/
+      SD from the newest available source) ported closely from CoCo's own.
+  [x] core/tests/fujibus_smoke.c -- VERIFIED END TO END against the REAL
+      firmware, built from the actual (unpinned, in-flux) local
+      fujinet-firmware checkout via FUJINET_SRC override: the embedded
+      config ROM's own "GET WIFI STATUS" / "READ HOST SLOTS" Fuji-device
+      queries were observed crossing the wire within a fraction of a
+      second of boot, over a real BoIP TCP connection, with no cartridge
+      and no user input. This is the actual "automatically comes up in
+      FujiNet mode" acceptance criterion, proven working, not just wired.
+      Also verified graceful degradation: -DWITH_FUJINET=OFF (or the .so
+      simply missing) makes fujibus_smoke skip (77) rather than fail, and
+      every other test still passes -- intvsession_start's FujiNet step is
+      correctly best-effort.
+  All nine tests (the eight from before plus fujibus_smoke) pass via ctest
+  in both WITH_INTV_ROMS configurations and with WITH_FUJINET both on (the
+  real library present) and off, confirmed with clean-room rebuilds.
 
-NOT STARTED:
+  KNOWN RISK, not yet resolved: cmake/Dependencies.cmake's pinned
+  FUJINET_COMMIT (b939b7fbe15260162837759bc94f14d01b081898, "[intv]
+  vendorize Minty. modify for FujiNet.") is NOT YET on the public
+  FujiNetWIFI/fujinet-firmware GitHub remote -- confirmed by attempting the
+  real submodule/clone path, which fails with "not our ref". All FujiNet
+  verification above used FUJINET_SRC=/home/thomc/Workspace/fujinet-firmware
+  (a local checkout at that exact commit) as an override. Once that commit
+  (or its successor) lands upstream, drop the override and confirm the
+  plain submodule path still resolves it -- and re-pin if the branch has
+  moved by then, per the plan's own risk note.
 
-  cmake/FujiNetRuntime.cmake is a stub (WITH_FUJINET=OFF only; ON is a hard
-  error pointing here). Needs: fujinet-firmware pinned to the branch/commit
-  carrying the Intellivision BoIP work, FUJINET_TARGET=RS232 build, bundling.
+  Still open in M3: the silent-tone gap noted in the audio section above.
+  dasm_test and stic_test are M4 scope (the debugger engine), not M3's.
+
+M3 IS NOW COMPLETE (see above for the full FujiNet runtime item that closed
+it out). NOT STARTED:
 
   M4 -- Debugger engine: core/include/intvdebug.h, core/debugger/{debugger,
         cp1600dasm,sticview,symbols}.c -- STIC/registers/MOB views.

@@ -190,6 +190,26 @@ typedef struct {
  * function; unit-tested on its own (core/tests/keymap_test.c). */
 intvsession_key_mapping intvsession_key_from_keysym(uint32_t keysym);
 
+/* ---- FujiNet ---------------------------------------------------------
+ * The runtime (libfujinet.{so,dylib}/fujinet.dll, built by
+ * cmake/FujiNetRuntime.cmake -DWITH_FUJINET=ON and dlopen'd at run time --
+ * see core/src/fujinet_runtime.c) is a BoIP TCP *server*: jzIntv's own
+ * --fujinet flag (see core/jzintv/intv_host.c) connects out to it on
+ * INTVSESSION_BOIP_PORT, same direction as the CoCo port's Becker link and
+ * the opposite of ADAM/Apple II. intvsession_start() starts FujiNet first
+ * (and waits for its listener to come up) for exactly the reason CoCo's own
+ * fujinet_wait_for_becker documents: starting the emulator before the
+ * listener is live means its first connection attempt finds nothing.
+ * Not fatal if unavailable (-DWITH_FUJINET=OFF, or the runtime failed to
+ * load) -- the machine still boots the embedded config ROM either way,
+ * jzIntv's own --fujinet peripheral simply keeps retrying the connection
+ * non-blockingly (see core/jzintv/intv_host.h's own comment on that). */
+int         intvsession_fujinet_running(const intvsession *s);
+const char *intvsession_fujinet_webui_url(const intvsession *s);
+/* Copies the most recent FujiNet console output (NUL-terminated) into dst;
+ * returns the number of bytes written (excluding the NUL). */
+int         intvsession_fujinet_copy_log(intvsession *s, char *dst, int max);
+
 /* ---- gamepads (SDL, hotplug; started/stopped with the session) ----------
  * Left stick drives the disc; SOUTH/EAST/WEST face buttons drive the three
  * action buttons. No keypad digit mapping (see core/src/gamepad_sdl.c for

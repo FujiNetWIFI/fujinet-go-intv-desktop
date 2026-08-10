@@ -114,6 +114,72 @@ void intvsession_pad_key(intvsession *s, intvsession_pad_side side,
 void intvsession_pad_disc(intvsession *s, intvsession_pad_side side,
                           int direction);
 
+/* ---- keyboard -> pad mapping ----------------------------------------------
+ * A pure function (no session state, no threading) shared by every frontend,
+ * the same way cocosession's coco_key_from_event is: a frontend translates
+ * its toolkit's key event to one of the symbols below, looks up the mapping,
+ * and calls intvsession_pad_key/intvsession_pad_disc with the result. F10,
+ * F11 and F12 are reserved for the frontends (movie/screenshot/debugger in
+ * upstream jzIntv's own default bindings -- see src/cfg/mapping.c's
+ * cfg_key_bind table) and are deliberately NOT in this table.
+ *
+ * Default bindings are copied from that same upstream table (its column 0,
+ * the normal-play action map) wherever it assigns a pad-relevant action --
+ * see intv_keymap.c for the exact source line each entry mirrors. Printable
+ * keys use their ASCII value directly (matching upstream's own key naming,
+ * which is one character for those keys); everything else is one of the
+ * symbols below, a private range starting past any ASCII value.
+ *
+ * KNOWN LIMITATION: unlike upstream's event subsystem (which OR-combines
+ * simultaneously-held direction keys into 16-way half-steps), each disc
+ * mapping here simply overwrites the disc position -- there is no keyboard
+ * equivalent of holding "UP" and "RIGHT" together to get NE. The 8 primary
+ * compass directions are each reachable by a single key (arrows, or the
+ * WASD/IJKM-style diagonal keys upstream also binds), so this only costs
+ * true simultaneous-key diagonals, not any direction outright. */
+typedef enum {
+    INTVSESSION_KEYSYM_NONE = 0,
+    INTVSESSION_KEYSYM_UP = 0x1000,
+    INTVSESSION_KEYSYM_DOWN,
+    INTVSESSION_KEYSYM_LEFT,
+    INTVSESSION_KEYSYM_RIGHT,
+    INTVSESSION_KEYSYM_KP_0, INTVSESSION_KEYSYM_KP_1, INTVSESSION_KEYSYM_KP_2,
+    INTVSESSION_KEYSYM_KP_3, INTVSESSION_KEYSYM_KP_4, INTVSESSION_KEYSYM_KP_5,
+    INTVSESSION_KEYSYM_KP_6, INTVSESSION_KEYSYM_KP_7, INTVSESSION_KEYSYM_KP_8,
+    INTVSESSION_KEYSYM_KP_9,
+    INTVSESSION_KEYSYM_KP_PERIOD,
+    INTVSESSION_KEYSYM_KP_ENTER,
+    INTVSESSION_KEYSYM_LSHIFT,
+    INTVSESSION_KEYSYM_RSHIFT,
+    INTVSESSION_KEYSYM_LCTRL,
+    INTVSESSION_KEYSYM_RCTRL,
+    INTVSESSION_KEYSYM_LALT,
+    INTVSESSION_KEYSYM_RALT,
+} intvsession_keysym;
+
+typedef enum {
+    INTVSESSION_MAP_NONE = 0, /* keysym has no pad mapping */
+    INTVSESSION_MAP_KEY,      /* side/key valid -- call intvsession_pad_key */
+    INTVSESSION_MAP_DISC,     /* side/direction valid -- call
+                              * intvsession_pad_disc (direction is a clock
+                              * position 0-15, never -1: -1 is only ever
+                              * what a frontend sends on release, ANDed with
+                              * its own "is anything else on this disc still
+                              * held" bookkeeping if it wants combos). */
+} intvsession_map_kind;
+
+typedef struct {
+    intvsession_map_kind kind;
+    intvsession_pad_side side;
+    intvsession_key      key;       /* valid iff kind == INTVSESSION_MAP_KEY */
+    int                  direction; /* valid iff kind == INTVSESSION_MAP_DISC */
+} intvsession_key_mapping;
+
+/* keysym: an ASCII value for a printable key, or one of the
+ * INTVSESSION_KEYSYM_* symbols above. Case-insensitive for letters. Pure
+ * function; unit-tested on its own (core/tests/keymap_test.c). */
+intvsession_key_mapping intvsession_key_from_keysym(uint32_t keysym);
+
 /* ---- paths ----------------------------------------------------------------
  * Directory paths (valid for the session's lifetime). */
 const char *intvsession_roms_path(const intvsession *s);

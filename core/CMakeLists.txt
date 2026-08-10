@@ -235,6 +235,7 @@ target_sources(jzintv_core PRIVATE
   src/settings.c
   src/paths.c
   src/session.c
+  src/intv_keymap.c
 )
 target_include_directories(jzintv_core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
@@ -255,10 +256,14 @@ add_executable(session_test tests/session_test.c)
 target_link_libraries(session_test jzintv_core)
 target_include_directories(session_test PRIVATE src)
 
+add_executable(keymap_test tests/keymap_test.c)
+target_link_libraries(keymap_test jzintv_core)
+
 add_test(NAME no_sdl_link COMMAND no_sdl_link_test)
 add_test(NAME boot_smoke COMMAND boot_smoke)
 add_test(NAME pad_test COMMAND pad_test)
 add_test(NAME session COMMAND session_test)
+add_test(NAME keymap COMMAND keymap_test)
 set_tests_properties(pad_test boot_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 # Needs WITH_INTV_ROMS=ON to have anything to provision; reported as 77
 # (skipped) rather than a failure otherwise, and it boots a real machine, so

@@ -102,12 +102,38 @@ IN PROGRESS -- M3, session library:
   confirmed with full clean-room rebuilds (rm -rf build third_party
   core/jzintv-generated && reconfigure) in both.
 
-  Still open in M3: audio capture (snd_desktop.c replacing snd_null.c),
-  input injection for real keyboards/gamepads (event_desktop.c replacing
-  event_null.c -- note this is SEPARATE from the pad injection above, which
-  already covers everything the keypad window needs), gamepad backend,
-  FujiNet runtime wiring (cmake/FujiNetRuntime.cmake is still a stub --
-  WITH_FUJINET=OFF only), fujibus_smoke, dasm_test, stic_test.
+  [x] core/src/intv_keymap.c + core/include/intvsession.h's
+      intvsession_key_from_keysym() -- a pure function (no session state, no
+      threading) mapping a keysym to a pad_key/side or disc position/side,
+      copied entry-by-entry from src/cfg/mapping.c's own default keyboard
+      bindings (cfg_key_bind[], column 0): numpad -> left keypad, number row
+      -> right keypad, RSHIFT/RALT/RCTRL <-> LSHIFT/LALT/LCTRL crossed to
+      left/right action buttons (upstream really does cross them), arrows +
+      IJKM/O/U/N/, -> left disc, DRWEASZXC -> right disc. Known, documented
+      limitation: overwrites the disc position rather than OR-combining
+      simultaneously-held keys the way upstream's event subsystem does, so
+      there's no keyboard equivalent of holding two arrows for a diagonal
+      (the 8 primary directions are all reachable through a single key
+      either way, so nothing is unreachable -- only true two-key diagonals
+      on the arrow-key scheme specifically). F10/F11/F12 deliberately
+      excluded (reserved for frontends), as are upstream's own hotkeys
+      (QUIT/RESET/SHOT/...) and its ECS-keyboard-emulation column, neither
+      of which is a pad action.
+  [x] core/tests/keymap_test.c -- VERIFIED: representative sample across
+      every category above (numpad, number row, crossed action buttons,
+      arrows, both diagonal schemes, case-insensitivity, and confirms
+      non-pad keys like Q/F correctly map to nothing).
+  All five tests (no_sdl_link, boot_smoke, pad_test, session, keymap) pass
+  via ctest in both WITH_INTV_ROMS=ON and =OFF, confirmed with full
+  clean-room rebuilds in both.
+
+  Still open in M3: audio capture (snd_desktop.c replacing snd_null.c --
+  snd_null.c's mixer runs today and does not hang, but nothing ever reclaims
+  its "dirty" buffers back to "clean" without a consumer, so mixing silently
+  stops once the buffer pool is exhausted; fine for the short-lived tests
+  above, not for a real play session), gamepad backend, FujiNet runtime
+  wiring (cmake/FujiNetRuntime.cmake is still a stub -- WITH_FUJINET=OFF
+  only), fujibus_smoke, dasm_test, stic_test.
 
 NOT STARTED:
 
@@ -128,3 +154,5 @@ NOT STARTED:
   M7 -- Packaging: icons, flatpak manifests, NSIS installer, CPack DEB/RPM/
         TGZ, CI workflows (linux/windows/macos/flatpak/release), all release
         builds with -DWITH_INTV_ROMS=OFF.
+        Icon: same icon as the other FujiNet Go Desktop clients, but on a
+        dark green (#1e4912) background (per user note, 2026-08-10).

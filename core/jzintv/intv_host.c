@@ -326,3 +326,17 @@ void intv_host_pad_disc(intv_pad_side side, int direction)
     else
         intv.pad0.r[15] = value;
 }
+
+void intv_host_debug_test_tone(void)
+{
+    /* Register 8 (mixer) is active-LOW, per ay8910_calc_sound's own
+     * bit_a = (snd_a | chn_a) & (noi_a | chn_n): a set disable-bit forces
+     * that term to 1 unconditionally, bypassing (not gating) the actual
+     * tone/noise generator state. 0x3E = disable tone B/C and all three
+     * noise channels (bits 1-5 set), leave tone A's disable bit (bit 0)
+     * clear -- i.e. tone A is the only channel actually enabled. */
+    periph_t *const psg = AS_PERIPH(&intv.psg0);
+    psg->write(psg, NULL,  0, 0x10); /* R0:  tone A period, low byte */
+    psg->write(psg, NULL, 11, 0x0F); /* R11: channel A fixed amplitude, max */
+    psg->write(psg, NULL,  8, 0x3E); /* R8:  mixer -- tone A enabled only */
+}

@@ -8,9 +8,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "intv_audio.h"
 #include "intv_frame.h"
 #include "intv_host.h"
 #include "session_internal.h"
+
+/* Both fixed at 48000 (config.h's DEFAULT_AUDIO_HZ on every desktop
+ * platform); a mismatch would mean the two headers have drifted apart. */
+#if INTVSESSION_AUDIO_RATE != INTV_AUDIO_RATE
+#error "INTVSESSION_AUDIO_RATE and INTV_AUDIO_RATE must match"
+#endif
 
 intvsession *intvsession_new(const intvsession_paths *paths)
 {
@@ -80,6 +87,12 @@ int intvsession_copy_frame(intvsession *s, uint32_t *dst,
 {
     (void)s;
     return intv_frame_copy(dst, serial_inout);
+}
+
+int intvsession_render_audio(intvsession *s, int16_t *dst, int max_samples)
+{
+    (void)s;
+    return intv_audio_copy(dst, max_samples);
 }
 
 void intvsession_pad_key(intvsession *s, intvsession_pad_side side,

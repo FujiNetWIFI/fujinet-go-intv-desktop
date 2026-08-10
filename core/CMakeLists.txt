@@ -143,11 +143,13 @@ set(JZINTV_CORE_SOURCES
   # and friends directly and has no desktop equivalent.
   src/jzintv.c
   # ---- the "null" backend combination (OBJS_NULL in src/*/subMakefile) ----
-  # gfx_null.c is replaced by our own gfx_desktop.c (frame capture into
-  # core/jzintv/intv_frame.h's store); snd/event/joy/plat stay the upstream
-  # null drivers for now (audio capture and input injection land in a later
-  # milestone -- see TODO).
-  src/snd/snd_null.c
+  # gfx_null.c and snd_null.c are replaced by our own gfx_desktop.c (frame
+  # capture into core/jzintv/intv_frame.h's store) and snd_desktop.c (audio
+  # capture into intv_audio.h's ring buffer); event/joy/plat stay the
+  # upstream null drivers for now (real keyboard/gamepad event injection
+  # lands in a later milestone -- see TODO; note this is distinct from the
+  # direct pad injection intv_host.c already exposes, which is what the
+  # keypad window and intvsession_key_from_keysym() both use today).
   src/event/event_null.c
   src/joy/joy_null.c
   src/plat/plat_null.c
@@ -157,7 +159,9 @@ list(TRANSFORM JZINTV_CORE_SOURCES PREPEND "${JZ}/")
 
 list(APPEND JZINTV_CORE_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/jzintv/desktop/gfx_desktop.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/jzintv/desktop/snd_desktop.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/jzintv/intv_frame.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/jzintv/intv_audio.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/jzintv/intv_host.c"
 )
 
@@ -259,12 +263,17 @@ target_include_directories(session_test PRIVATE src)
 add_executable(keymap_test tests/keymap_test.c)
 target_link_libraries(keymap_test jzintv_core)
 
+add_executable(audio_test tests/audio_test.c)
+target_link_libraries(audio_test jzintv_core)
+target_include_directories(audio_test PRIVATE src)
+
 add_test(NAME no_sdl_link COMMAND no_sdl_link_test)
 add_test(NAME boot_smoke COMMAND boot_smoke)
 add_test(NAME pad_test COMMAND pad_test)
 add_test(NAME session COMMAND session_test)
 add_test(NAME keymap COMMAND keymap_test)
-set_tests_properties(pad_test boot_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+add_test(NAME audio COMMAND audio_test)
+set_tests_properties(pad_test boot_smoke audio PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 # Needs WITH_INTV_ROMS=ON to have anything to provision; reported as 77
 # (skipped) rather than a failure otherwise, and it boots a real machine, so
 # it is the one test here that takes real wall-clock time.

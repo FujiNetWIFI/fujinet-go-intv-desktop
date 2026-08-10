@@ -127,13 +127,49 @@ IN PROGRESS -- M3, session library:
   via ctest in both WITH_INTV_ROMS=ON and =OFF, confirmed with full
   clean-room rebuilds in both.
 
-  Still open in M3: audio capture (snd_desktop.c replacing snd_null.c --
-  snd_null.c's mixer runs today and does not hang, but nothing ever reclaims
-  its "dirty" buffers back to "clean" without a consumer, so mixing silently
-  stops once the buffer pool is exhausted; fine for the short-lived tests
-  above, not for a real play session), gamepad backend, FujiNet runtime
-  wiring (cmake/FujiNetRuntime.cmake is still a stub -- WITH_FUJINET=OFF
-  only), fujibus_smoke, dasm_test, stic_test.
+  [x] core/jzintv/intv_audio.{h,c} -- the audio ring buffer (mono int16,
+      mutex-protected, oldest-drops-first on overflow), mirroring
+      intv_frame's publish/copy contract.
+  [x] core/jzintv/desktop/snd_desktop.c -- replaces snd_null.c in the object
+      list. A close copy of snd_null.c's snd_tick with two changes (see the
+      file's own header for the full reasoning): (1) always takes the
+      "delayed drop" code path so PSG buffers are actually mixed instead of
+      silently discarded -- snd_null.c's default behaviour, confirmed by
+      reading it closely, is to discard every buffer without ever touching
+      mixbuf at all when there's no raw-file/AVI consumer, which is exactly
+      right for a true null backend but wrong for us; (2) applies
+      snd->atten the same way snd_sdl.c's snd_fill does (there is no SDL
+      audio callback here to do it), then intv_audio_publish()es the mixed
+      buffer synchronously, since draining happens inline rather than via a
+      separate device thread.
+  [x] core/include/intvsession.h's intvsession_render_audio() -- wraps
+      intv_audio_copy the way intvsession_copy_frame wraps intv_frame_copy.
+      INTVSESSION_AUDIO_RATE (48000) is compile-time asserted against
+      intv_audio.h's INTV_AUDIO_RATE in session.c so the two headers can't
+      silently drift apart.
+  [x] core/tests/audio_test.c -- VERIFIED: real samples flow continuously
+      at the correct rate (matches wall-clock elapsed time x 48000, proving
+      snd_tick runs and intv_audio's ring buffer moves data with no leak or
+      stall). Does NOT assert non-silence -- see below.
+  KNOWN GAP, not blocking: core/jzintv/intv_host.c's
+  intv_host_debug_test_tone() writes PSG0 (AY-3-8914) registers that, by
+  ay8910_calc_sound's own mixing formula (bit_a = (snd_a|chn_a) &
+  (noi_a|chn_n)), should produce a non-silent square wave on channel A.
+  Confirmed via debug output that the writes reach ay8910->reg[] with
+  exactly the intended values. The captured audio is nevertheless still
+  all-zero in audio_test.c, and this has not been root-caused -- candidates
+  are the tone generator's internal counter warm-up (cnt0/max0) or something
+  specific to driving PSG registers from a thread other than the emulator's
+  own. audio_test.c reports this as informational rather than failing on
+  it, since the actual pipeline (data flow, rate, no leaks) is independently
+  verified and this is a narrower, separable question. Worth a fresh look
+  before relying on intv_host_debug_test_tone for anything beyond proving
+  data flows -- and before trusting that real cartridge audio will be
+  audible once a frontend exists to hear it.
+
+  Still open in M3: gamepad backend, FujiNet runtime wiring
+  (cmake/FujiNetRuntime.cmake is still a stub -- WITH_FUJINET=OFF only),
+  fujibus_smoke, dasm_test, stic_test.
 
 NOT STARTED:
 

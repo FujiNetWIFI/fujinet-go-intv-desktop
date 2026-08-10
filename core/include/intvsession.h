@@ -114,6 +114,16 @@ void intvsession_pad_key(intvsession *s, intvsession_pad_side side,
 void intvsession_pad_disc(intvsession *s, intvsession_pad_side side,
                           int direction);
 
+/* ---- audio ------------------------------------------------------------
+ * jzIntv's PSG mixer produces mono int16 samples (see
+ * core/jzintv/intv_audio.h); this is that stream, sample rate
+ * INTVSESSION_AUDIO_RATE, drained on demand rather than pushed -- a
+ * frontend pulls whatever has accumulated since the last call on its own
+ * audio callback/thread. Returns the number of samples actually copied,
+ * which may be less than max_samples (0 if nothing new has played). */
+#define INTVSESSION_AUDIO_RATE 48000
+int intvsession_render_audio(intvsession *s, int16_t *dst, int max_samples);
+
 /* ---- keyboard -> pad mapping ----------------------------------------------
  * A pure function (no session state, no threading) shared by every frontend,
  * the same way cocosession's coco_key_from_event is: a frontend translates

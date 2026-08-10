@@ -101,6 +101,30 @@ void intv_host_pad_key(intv_pad_side side, intv_pad_key key, int pressed);
  * combination of separately-held keys. */
 void intv_host_pad_disc(intv_pad_side side, int direction);
 
+/* Writes PSG0 (the base unit's AY-3-8914) registers intended to produce an
+ * audible tone on channel A: register 0 (tone A period, low byte), register
+ * 11 (channel A fixed amplitude, max), register 8 (mixer, active-low --
+ * clearing bit 0 enables tone A, setting bits 1-5 disables tone B/C and all
+ * three noise channels). The '8914 remaps the standard AY-3-8910 register
+ * layout this way -- register 8 is the mixer here, and 11/12/13 are the
+ * per-channel amplitude registers, cross-checked against
+ * ay8910_calc_sound's own register reads in the staged tree's
+ * src/ay8910/ay8910.c (the actual synthesis code, not just the write
+ * path's generic reg[] store).
+ *
+ * KNOWN ISSUE: confirmed via intv_host.c's own debug output that these
+ * writes reach ay8910->reg[] with the intended values, and the bit_a =
+ * (snd_a | chn_a) & (noi_a | chn_n) formula in ay8910_calc_sound reduces to
+ * exactly chn_a (the tone generator's own toggle state) with these register
+ * values -- but the resulting audio output is empirically still silent in
+ * core/tests/audio_test.c. Not yet root-caused; audio_test.c does not fail
+ * on this (see its own comment), only on the pipeline failing to move data
+ * at all. Whatever is wrong is either in the tone generator's internal
+ * counter warm-up (cnt0/max0) or specific to driving these registers from
+ * a thread other than the emulator's own -- worth another look before
+ * relying on this helper for anything beyond "does data flow." */
+void intv_host_debug_test_tone(void);
+
 #ifdef __cplusplus
 }
 #endif

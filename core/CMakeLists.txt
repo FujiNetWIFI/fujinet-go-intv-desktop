@@ -259,6 +259,7 @@ add_library(intv_session STATIC
   src/session.c
   src/intv_keymap.c
   src/gamepad_sdl.c
+  src/audio_sdl.c
   src/fujinet_runtime.c
 )
 set_target_properties(intv_session PROPERTIES C_STANDARD 11)
@@ -306,6 +307,11 @@ add_executable(audio_test tests/audio_test.c)
 target_link_libraries(audio_test jzintv_core)
 target_include_directories(audio_test PRIVATE src)
 
+# Pure function test (no ROMs, no emulator boot) -- runs regardless of
+# WITH_INTV_ROMS, unlike audio_test above.
+add_executable(audio_ring_test tests/audio_ring_test.c)
+target_link_libraries(audio_ring_test jzintv_core)
+
 add_executable(gamepad_test tests/gamepad_test.c)
 target_link_libraries(gamepad_test intv_session)
 target_include_directories(gamepad_test PRIVATE src)
@@ -331,6 +337,7 @@ add_test(NAME pad_test COMMAND pad_test)
 add_test(NAME session COMMAND session_test)
 add_test(NAME keymap COMMAND keymap_test)
 add_test(NAME audio COMMAND audio_test)
+add_test(NAME audio_ring COMMAND audio_ring_test)
 add_test(NAME gamepad COMMAND gamepad_test)
 add_test(NAME fujibus_smoke COMMAND fujibus_smoke)
 add_test(NAME debug COMMAND debug_test)

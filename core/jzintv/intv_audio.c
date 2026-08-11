@@ -45,6 +45,22 @@ void intv_audio_publish(const int16_t *samples, int count)
 int intv_audio_copy(int16_t *dst, int max_samples)
 {
     pthread_mutex_lock(&s_lock);
+
+    /* Catch up on lag before copying anything: if more than double this
+     * call's worth is backlogged, the consumer has been running a little
+     * behind for a while (not stalled outright -- that overflow case is
+     * handled in intv_audio_publish above). Trim all the way down to
+     * exactly one request's worth (not just under the 2x trigger) so the
+     * copy below returns purely fresh samples -- leaving any cushion
+     * beyond max_samples would still hand back whatever stale samples
+     * happen to be oldest within that cushion. Drop the rest now rather
+     * than eventually playing it -- see this file's header for why this
+     * matters (audio has no other backpressure toward the emulator, so
+     * without this the ring's own capacity becomes a growing latency
+     * budget). */
+    if (max_samples > 0 && s_count > max_samples * 2)
+        s_count = max_samples;
+
     const int n = (max_samples < s_count) ? max_samples : s_count;
     /* Oldest buffered sample is (s_head - s_count), wrapped. */
     int read_pos = ((s_head - s_count) % RING_CAPACITY + RING_CAPACITY)

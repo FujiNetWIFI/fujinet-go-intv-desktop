@@ -46,6 +46,8 @@ struct intvsession {
     char fujinet_lib[INTV_PATH_MAX];   /* resolved lazily; "" until then */
     char webui_url[64];
     int  fujinet_running;
+
+    void *audio;   /* audio_sdl.c state */
 };
 
 void settings_init(struct intvsession *s);
@@ -74,5 +76,9 @@ int  fujinet_copy_log(struct intvsession *s, char *dst, int max);
  * channel widening is needed here. */
 void fujinet_mix_audio(struct intvsession *s, int16_t *buf, int nsamples,
                        int rate);
+
+/* ---- audio_sdl.c ------------------------------------------------------ */
+int  audio_start(struct intvsession *s);
+void audio_stop(struct intvsession *s);
 
 #endif /* INTV_SESSION_INTERNAL_H */

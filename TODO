@@ -598,6 +598,56 @@ M5 -- GNOME frontend (GTK4 + libadwaita):
       intended). All 15 ctest cases pass (no test depended on real-time
       pacing); clean-room rebuild confirmed with WITH_INTV_ROMS=OFF.
 
+  [x] Audio was completely missing -- real gap, not a subtle bug:
+      intvsession_render_audio() (core/src/session.c) has existed since M3
+      as a pull API, but nothing anywhere in the project ever called it.
+      No SDL playback device was ever opened; the GNOME frontend never
+      referenced audio at all. Fixed by adding core/src/audio_sdl.c
+      (modelled directly on the CoCo port's own audio_sdl.c, mono instead
+      of stereo -- see intv_audio.h's own comment on why there is no
+      stereo signal to fake), opening an SDL3 AudioStream whose pull
+      callback drains intvsession_render_audio. Wired into
+      intvsession_start/_stop alongside the gamepad subsystem
+      (core/src/session.c), registered in core/CMakeLists.txt. Verified
+      for real, not just "it compiles": launched the GNOME app, confirmed
+      a live PipeWire sink-input under application.name=
+      "fujinet-go-intv-gnome", and captured it directly with `pw-cat -r`
+      -- 86512 of 96000 captured samples were non-zero, up to amplitude
+      10922 (of a 32767 range), i.e. real audible sound actually reaching
+      the system's audio device, not silence.
+  [x] Follow-up from the same conversation: audio was noticeably behind
+      video. Root-caused to core/jzintv/intv_audio.h's ring buffer
+      (intv_audio.c): sized generously (0.5s) for a UI thread polling
+      once a video frame, but the new SDL audio callback drains it in a
+      completely different pattern, and the ring had no mechanism to
+      correct a consumer that drains even slightly slower than the
+      emulator produces -- every such gap accumulates as backlog, up to
+      the full 0.5s ceiling, before the existing plain-overflow drop ever
+      triggers. Video has no equivalent problem (intv_frame is a single
+      "latest wins" slot, zero possible backlog), so the two drifted
+      apart. Note on what "locked together" can actually mean here: true
+      sample-accurate genlock between two independently-clocked OS
+      subsystems (the display's vsync clock, the audio device's clock)
+      isn't something any consumer OS guarantees; what IS achievable, and
+      now true here, is that neither side buffers stale data -- both
+      track real time as closely as possible and self-correct drift
+      rather than accumulate it. Fixed intv_audio_copy to self-correct on
+      every call: when more than double the requested amount is
+      backlogged, it discards everything except the freshest
+      max_samples-worth before copying (trimming only to the 2x trigger
+      point, rather than all the way to max_samples, was tried first and
+      is WRONG -- it still hands back whatever's oldest within that
+      cushion, i.e. still stale; caught by the new test below before ever
+      reaching a real build). core/tests/audio_ring_test.c added (pure
+      function, no ROMs/emulator boot needed, runs under ctest regardless
+      of WITH_INTV_ROMS): publishes a large "stale" batch then a small
+      "fresh" batch with no draining in between -- standing in for a
+      consumer that fell behind for a while -- and proves a subsequent
+      copy returns purely fresh data with nothing stale left over
+      afterward, plus confirms ordinary (non-backlogged) operation is
+      untouched. All 16 ctest cases pass; clean-room rebuild confirmed
+      with WITH_INTV_ROMS=OFF.
+
 NOT STARTED:
 
   M6 -- KDE (Qt6 Widgets), macOS (AppKit), Windows (Win32) frontends: port

@@ -16,6 +16,21 @@
  * emulator thread or growing without bound -- the same tradeoff a real
  * sound card's DMA ring makes.
  *
+ * LATENCY: intv_audio_copy also self-corrects lag on every call, not just
+ * on overflow. If more than double a call's own request is sitting unread
+ * (the consumer -- an SDL audio callback -- fell a bit behind but hasn't
+ * stopped entirely), it fast-forwards all the way down to exactly that
+ * request's worth before copying -- not just under the trigger threshold,
+ * which would still hand back whatever's oldest within that cushion, i.e.
+ * still stale -- so what comes out is always the freshest possible
+ * samples rather than working through a growing backlog. Without this,
+ * this ring's own generous capacity (half a second, sized for a UI thread
+ * that only polls once a video frame) became a latency budget of its
+ * own: a consumer draining even slightly slower than the emulator
+ * produces would let audio drift further and further behind video, up to
+ * that half-second ceiling, before the plain-overflow drop above ever
+ * kicked in.
+ *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
  */

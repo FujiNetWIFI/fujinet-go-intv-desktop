@@ -75,14 +75,19 @@ int intvsession_start(intvsession *s)
         fujinet_stop(s);
         return -1;
     }
-    /* Best-effort: no gamepads attached is not a session-start failure. */
+    /* Best-effort: no gamepads attached is not a session-start failure, and
+     * neither is no audio device (session_set_error still records why, for
+     * a frontend that wants to surface it, but silence over sound is far
+     * less disruptive than refusing to boot). */
     intv_gamepad_start();
+    audio_start(s);
     return 0;
 }
 
 void intvsession_stop(intvsession *s)
 {
     intv_gamepad_stop();
+    audio_stop(s);
     intv_host_stop();
     fujinet_stop(s);
 }

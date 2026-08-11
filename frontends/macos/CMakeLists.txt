@@ -28,8 +28,24 @@ set_target_properties(fujinet-go-intv-macos PROPERTIES
   MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
   MACOSX_BUNDLE_ICON_FILE "fujinet-go-intv.icns"
 )
+# jzintv_core has one C++ piece (src/locutus/, per its own subMakefile --
+# see core/CMakeLists.txt's enable_language(CXX)), so anything that links it
+# needs libc++ on the link line even though every source file in THIS
+# target is Objective-C (.m). CMake normally infers the CXX/ObjC++ linker
+# (and libc++ with it) automatically for a target with a C++ source among
+# its direct dependencies, but this target's sources are all .m and it only
+# reaches jzintv_core transitively through intv_session's PUBLIC link --
+# one hop too far for that inference in practice. Same fix as the GNOME/
+# Windows frontends' own CMakeLists.txt (see their file comments): name
+# jzintv_core explicitly (ahead of c++ in the list, so it does not land
+# after it on the final link line -- the GNOME flatpak build caught that
+# exact ordering trap under a stricter --as-needed toolchain) and the C++
+# runtime explicitly, rather than fight CMake's language-inference
+# heuristics. Apple's C++ runtime is libc++, linked as -lc++, not -lstdc++.
 target_link_libraries(fujinet-go-intv-macos PRIVATE
   intv_session
+  jzintv_core
+  c++
   "-framework Cocoa"
   "-framework CoreVideo"
   "-framework QuartzCore"

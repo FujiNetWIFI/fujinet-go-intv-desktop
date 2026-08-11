@@ -187,6 +187,7 @@ jobs:
           install: >-
             git
             make
+            patch
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja

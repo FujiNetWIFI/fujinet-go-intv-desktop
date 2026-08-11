@@ -468,6 +468,46 @@ M5 -- GNOME frontend (GTK4 + libadwaita):
       WITH_INTV_ROMS=OFF and the default FRONTEND=all (KDE correctly still
       reports "not implemented yet -- skipping").
 
+  [x] Post-M5 bug fix -- reported symptom: pressing DOWN on the keypad
+      window's disc (or a real gamepad) didn't move one item down in
+      FujiNet's HOST SLOTS menu, while LEFT rapidly scrolled to the
+      bottom. Two real, independent bugs, found by re-deriving the
+      disc_codes numbering from the staged jzIntv tree's own mapping.c
+      (0=E, 4=N, 8=W, 12=S) and checking each math site against it:
+        - frontends/gnome/keypad/keypad_window.c's direction_from_point
+          used atan2(dy,dx) directly on SCREEN coordinates (y increasing
+          DOWNWARD) without negating dy first, so a click straight below
+          the disc's centre computed the same angle a MATH-convention
+          upward click would -- it returned index 4 (NORTH) instead of
+          12 (SOUTH). Every other direction was unaffected by coincidence
+          (E/W sit on the axis dy negation doesn't touch). Fixed with
+          atan2(-dy, dx).
+        - Both the window's disc and intv_disc_from_stick
+          (core/src/gamepad_sdl.c, driving real gamepads) rounded to all
+          16 disc_codes positions, including the 8 "half-step" codes
+          (e.g. SSW, which OR-combines the S and SW bits) that are
+          unreachable from the keyboard by design (intv_keymap.c's DIR_*
+          enum only uses the 8 even indices). An analog stick pushed
+          toward a pure cardinal wobbles a few degrees off-axis from
+          imprecise centering, and a mouse drag toward a cardinal sweeps
+          through several fine angles on the way there -- with a 16-way
+          16-way split (+-11.25 degrees per cardinal) either could land on
+          a half-step, spuriously OR-ing in an adjacent direction's bit
+          (e.g. a south-flavoured half-step while pushing pure "left"),
+          which is what most likely produced the "rapidly scrolls to the
+          bottom" report. Both now round to only the 8 even indices
+          (+-22.5 degrees per cardinal), matching what a keyboard can ever
+          send.
+      core/tests/gamepad_test.c gained assertions for both: a stick 15
+      degrees off-axis toward north or south while pushed west still
+      resolves to pure west, and every angle in a 3-degree sweep of the
+      full circle resolves to an even (non-half-step) code. All 13 ctest
+      cases pass; clean-room rebuild confirmed with WITH_INTV_ROMS=OFF.
+      NOTE: the real-gamepad half of this is a plausible, well-reasoned
+      fix but not physically verified on hardware (none attached in the
+      environment this was fixed in) -- worth confirming with a real
+      controller before considering this fully closed.
+
 NOT STARTED:
 
   M6 -- KDE (Qt6 Widgets), macOS (AppKit), Windows (Win32) frontends: port

@@ -4,6 +4,7 @@
  * subsystem starts and stops cleanly with no hardware attached (this
  * machine has none, which is itself the common case in CI).
  */
+#include <math.h>
 #include <stdio.h>
 
 #include "gamepad_sdl.h"
@@ -31,6 +32,35 @@ int main(void)
     check("south", intv_disc_from_stick(0.0f, -1.0f, 0.35f) == 12);
     check("northeast", intv_disc_from_stick(0.7071f, 0.7071f, 0.35f) == 2);
     check("southwest", intv_disc_from_stick(-0.7071f, -0.7071f, 0.35f) == 10);
+
+    /* A stick pushed toward "west" rarely lands EXACTLY on the x-axis --
+     * real analog sticks wobble a few degrees off-centre. 16-way rounding
+     * used to let a ~15-degree wobble tip this into a half-step (SSW/WSW,
+     * which OR-combine the west AND south bits -- see intv_host.h's
+     * disc_codes), spuriously registering a south-ish reading for a
+     * player who only pushed left. 8-way rounding gives "west" a full
+     * +-22.5 degree catch, so this must still resolve to pure west (8),
+     * not any south-flavoured half-step. */
+    check("west, 15 degrees off-axis toward south still reads pure west",
+          intv_disc_from_stick(-0.9659f, -0.2588f, 0.35f) == 8);
+    check("west, 15 degrees off-axis toward north still reads pure west",
+          intv_disc_from_stick(-0.9659f, 0.2588f, 0.35f) == 8);
+
+    /* No angle can produce an odd (half-step) code at all -- those are
+     * unreachable from the keyboard (intv_keymap.c's DIR_* enum only uses
+     * even indices) and analog/mouse input should never introduce one
+     * either. */
+    {
+        int all_even = 1;
+        for (int deg = 0; deg < 360; deg += 3) {
+            float rad = (float)deg * 3.14159265f / 180.0f;
+            int d = intv_disc_from_stick(cosf(rad), sinf(rad), 0.35f);
+            if (d != -1 && (d % 2) != 0)
+                all_even = 0;
+        }
+        check("every angle resolves to an even (non-half-step) code",
+              all_even);
+    }
 
     /* ---- intv_pad_for_port ---- */
     {

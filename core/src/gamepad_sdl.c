@@ -38,7 +38,20 @@
  * (0 = E, going counter-clockwise numerically -- ENE=1, NE=2, ... -- which
  * is what intv_host.h's own table documents as "clockwise" from the
  * player's perspective looking at the disc face-on; see that file), or -1
- * when the stick is within deadzone of center. */
+ * when the stick is within deadzone of center.
+ *
+ * Snaps to one of the 8 EVEN positions only (E/NE/N/NW/W/SW/S/SE -- the
+ * same 8 intv_keymap.c's own DIR_* enum uses for the keyboard's arrow/IJKM
+ * bindings), never one of the 8 odd "half-step" in-between codes. Those
+ * half-steps are unreachable from a keyboard at all (see intv_host.h's own
+ * comment on why), and an analog stick pushed toward a pure cardinal
+ * inevitably wobbles a few degrees off-axis from imprecise centering --
+ * with 16-way rounding that wobble was enough to land on a half-step
+ * (which OR-combines two adjacent cardinal bits, e.g. SSW=64|32) on some
+ * samples and the pure cardinal on others, so a straight "push left" could
+ * emit a stray south-bit reading and register as an extra menu move. 8-way
+ * rounding gives each cardinal a full +-22.5 degree catch instead of
+ * +-11.25, which comfortably absorbs that wobble. */
 int intv_disc_from_stick(float x, float y, float deadzone)
 {
     const float mag = sqrtf(x * x + y * y);
@@ -49,10 +62,10 @@ int intv_disc_from_stick(float x, float y, float deadzone)
     if (angle < 0)
         angle += 2.0f * (float)M_PI;
 
-    int idx = (int)(angle / ((float)M_PI / 8.0f) + 0.5f) % 16;
+    int idx = (int)(angle / ((float)M_PI / 4.0f) + 0.5f) % 8;
     if (idx < 0)
-        idx += 16;
-    return idx;
+        idx += 8;
+    return idx * 2;
 }
 
 /* bindings[i] is pad i's explicit side (INTVSESSION_PAD_LEFT/_RIGHT), or -1

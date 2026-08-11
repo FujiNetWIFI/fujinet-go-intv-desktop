@@ -42,10 +42,28 @@ static GtkWindow *g_win;
 static intvsession *g_session;
 
 /* ---- disc ----------------------------------------------------------------
- * direction: 0 = East, clockwise -- matches intvsession_pad_disc's own
- * convention. Screen coordinates have y increasing downward, so sweeping
- * from East (dx>0,dy=0) toward South (dx=0,dy>0) is already a clockwise
- * sweep on screen; atan2(dy,dx) needs no sign flip. */
+ * direction: matches intv_host.h's disc_codes numbering (0 = E, 4 = N,
+ * 8 = W, 12 = S -- verified against the staged jzIntv tree's own
+ * mapping.c, where the UP/DOWN/LEFT/RIGHT keys bind to PD0L_D_N/_S/_W/_E
+ * respectively at exactly those indices).
+ *
+ * dy comes in as a screen-space delta (y increasing DOWNWARD), so a click
+ * straight below centre has dy > 0. Standard atan2(dy,dx) treats increasing
+ * y as counter-clockwise-toward-90-degrees in ordinary math convention,
+ * which would place a downward click at the same angle a MATH-convention
+ * upward click gets -- i.e. it comes out as North (index 4) instead of
+ * South (index 12). Negating dy first (atan2(-dy,dx)) corrects for the
+ * screen's flipped y-axis so a downward click actually yields South.
+ *
+ * Only ever returns one of the 8 EVEN positions (E/NE/N/NW/W/SW/S/SE),
+ * matching intv_keymap.c's own DIR_* enum for the keyboard's arrow/IJKM
+ * bindings and intv_disc_from_stick's own reasoning (core/src/
+ * gamepad_sdl.c): the 8 odd half-step codes are unreachable from a
+ * keyboard, and a mouse drag toward a cardinal direction sweeps through
+ * several fine-grained angles on the way there, each of which used to be
+ * written as its own disc position -- snapping to 8-way instead of 16-way
+ * halves how many distinct (and spurious) positions a single drag can
+ * pass through before settling. */
 static int direction_from_point(double dx, double dy, double radius)
 {
     double dist = sqrt(dx * dx + dy * dy);
@@ -55,11 +73,11 @@ static int direction_from_point(double dx, double dy, double radius)
     if (dist < radius * DISC_DEADZONE_FRAC)
         return -1;
 
-    angle_deg = atan2(dy, dx) * 180.0 / M_PI;
+    angle_deg = atan2(-dy, dx) * 180.0 / M_PI;
     if (angle_deg < 0)
         angle_deg += 360.0;
-    dir = (int)floor(angle_deg / 22.5 + 0.5) % 16;
-    return dir;
+    dir = (int)floor(angle_deg / 45.0 + 0.5) % 8;
+    return dir * 2;
 }
 
 static void disc_set_direction(DiscState *d, int dir)

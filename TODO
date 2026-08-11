@@ -674,11 +674,90 @@ M5 -- GNOME frontend (GTK4 + libadwaita):
       WITH_INTV_ROMS=OFF test, since it is purely a live-keyboard-input
       issue).
 
+M6 -- KDE (Qt6 Widgets):
+
+  [x] frontends/kde/{main,MainWindow,DisplayWidget}.cpp -- plain Qt6
+      Widgets, not KDE Frameworks (Breeze arrives through the platform
+      theme). MainWindow: a menu bar (View: Keypad/Debugger; FujiNet:
+      Configuration/Console Log; Help: Quit/About) over DisplayWidget --
+      a plain QWidget (NOT QOpenGLWidget, unlike the CoCo/MSX ports' own
+      DisplayWidgets: intvsession has no notify_vsync to feed, since
+      jzIntv's own paced thread already governs itself independent of any
+      frontend, so a QOpenGLWidget's frameSwapped signal buys nothing
+      here and just adds a Qt component dependency for no benefit) with a
+      QTimer-driven repaint, letterboxed to 4:3 exactly like the GNOME
+      port's display.c.
+  [x] frontends/kde/debugger/DebuggerWindow.cpp -- poll-based stop
+      tracking (a QTimer watching intvdebug_stop_serial, NOT a stop
+      callback: intvdebug.h has no such mechanism at all, unlike the MSX
+      port's msxdebug_set_stop_callback), with a CPU tab (disassembly
+      with click-to-toggle breakpoints, read-only registers -- intvdebug
+      has no register-write call, memory view) and an STIC tab (BACKTAB,
+      all 8 MOBs, GRAM/GROM card sheet with pager, palette, decoded
+      state), matching the GNOME debugger's own content via a QTabWidget
+      instead of GTK notebook pages. Owns its own intvsymtab instance,
+      same reasoning as the GNOME port.
+  [x] frontends/kde/keypad/KeypadWindow.cpp -- both hand controllers side
+      by side. Digit/action buttons use QAbstractButton's own native
+      pressed()/released() signals directly (Qt gives these for free,
+      unlike GTK, which needed the GNOME port's own raw GtkGestureClick
+      plumbing). The disc is a small custom QWidget (DiscWidget, local to
+      this file) snapping to 8 positions, matching the fix already made
+      to the GNOME port's own disc and to intv_disc_from_stick.
+  [x] Two real, previously-unnoticed bugs caught while writing this port
+      (not present in the shipped GNOME build, but subtle enough that
+      porting the same logic surfaced them):
+        - core/debugger/symbols.h was missing the extern "C" guard every
+          other public core header has. Harmless from the GNOME port (a
+          plain-C target), but linking DebuggerWindow.cpp (C++) against
+          it failed with undefined references -- the C++ compiler
+          name-mangled the declarations it saw, which didn't match the
+          unmangled C symbols symbols.c was actually compiled with.
+          Fixed by adding the guard.
+        - This port's own KeypadWindow.h/.cpp initially carried a stray,
+          unused #include "../keysym_map.h" (a copy-paste leftover from
+          the GNOME port) which doesn't exist for KDE at all -- KDE's own
+          key translation lives inline in DisplayWidget.cpp/
+          KeypadWindow.cpp instead, using Qt's own Qt::Key_* enum rather
+          than GDK keyvals. Removed; the file never actually needed it.
+      Also caught (by inspection, before ever reaching a build) an angle
+      math bug of the same kind fixed in the GNOME port earlier: the
+      disc-wedge highlight in DiscWidget::paintEvent converted an
+      already-correct degrees value to radians and back with a spurious
+      negation. Fixed by keeping the whole calculation in degrees, since
+      Qt's own QPainterPath::arcTo already uses the exact same angle
+      convention (0=East, counter-clockwise positive) directionFromPoint
+      produces after its own dy negation -- no conversion was ever
+      needed.
+  [x] VERIFIED against the real running app, same standard as the GNOME
+      port: launched the actual KDE binary under Wayland (grim
+      screenshots), confirmed it boots straight to the FujiNet config
+      ROM's HOST SLOTS screen with correct full-brightness colors and
+      4:3 aspect (both fixes from the earlier GNOME bug reports apply
+      identically here, since they live in shared core code); opened the
+      debugger (INTV_OPEN_DEBUGGER=1) and confirmed the CPU tab populates
+      with real disassembly/registers/memory while paused (the STIC
+      tab's refresh path runs unconditionally on every paused refresh
+      regardless of which tab is visually selected, and the process
+      stayed stable through many refresh cycles with this build, which
+      is the verification available without a Wayland input-injection
+      tool in this environment); opened the keypad window
+      (INTV_OPEN_KEYPAD=1) and confirmed both controllers render
+      correctly including the direction discs.
+  [x] All 19 ctest cases pass (15 from the GNOME port + 4 new: KDE's own
+      no_embedded_roms, desktop-entry-validate, appstream metainfo
+      validate). Clean-room rebuild confirmed with WITH_INTV_ROMS=OFF and
+      the default FRONTEND=all (both GNOME and KDE build together on
+      Linux).
+
 NOT STARTED:
 
-  M6 -- KDE (Qt6 Widgets), macOS (AppKit), Windows (Win32) frontends: port
-        the GNOME layout above (main window, debugger window, keypad
-        window) to each.
+  M6 (cont'd) -- macOS (AppKit) and Windows (Win32) frontends: port the
+        same GNOME/KDE layout to each. NOT STARTED YET and, unlike GNOME/
+        KDE, CANNOT be built or run-verified in this Linux environment --
+        do not treat any future macOS/Windows code here as tested the way
+        GNOME and KDE were until it has actually been built and run on
+        real hardware (or CI) for those platforms.
 
   M7 -- Packaging: icons, flatpak manifests, NSIS installer, CPack DEB/RPM/
         TGZ, CI workflows (linux/windows/macos/flatpak/release), all release

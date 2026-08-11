@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>online.fujinet.go.intv.kde</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>FujiNet Go Intv</name>
+  <summary>Self-contained Mattel Intellivision with built-in FujiNet</summary>
+  <description>
+    <p>
+      A Mattel Intellivision with FujiNet built in: boots straight into
+      FujiNet's config ROM, with a clickable keypad window standing in for
+      both hand controllers so every keypad button and direction disc can be
+      driven with a mouse.
+    </p>
+    <p>
+      Emulation is provided by a FujiNet-patched jzIntv, with FujiNet
+      attached over Bus-Over-IP (BoIP) on loopback TCP. The debugger covers
+      the CP-1610 CPU and the STIC graphics chip -- registers, mode, the
+      BACKTAB background grid, the 8 MOBs (sprites), and the GRAM/GROM card
+      sheet. Plain Qt6 Widgets, not KDE Frameworks -- Breeze arrives through
+      the platform theme.
+    </p>
+  </description>
+  <launchable type="desktop-id">online.fujinet.go.intv.kde.desktop</launchable>
+  <categories>
+    <category>Game</category>
+    <category>Emulator</category>
+  </categories>
+  <url type="homepage">https://fujinet.online/</url>
+  <url type="bugtracker">https://github.com/FujiNetWIFI/fujinet-go-intv-desktop/issues</url>
+  <developer id="online.fujinet">
+    <name>Thomas Cherryhomes</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-08-11">
+      <description>
+        <p>
+          First release of the Intellivision KDE/Qt frontend: the same
+          FujiNet-in-process boot, clickable keypad window, and CP-1610/STIC
+          debugger as the GNOME frontend, built on plain Qt6 Widgets.
+        </p>
+      </description>
+    </release>
+  </releases>
+</component>

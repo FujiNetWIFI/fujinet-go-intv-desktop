@@ -14,6 +14,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct intvsymtab intvsymtab;
 
 /* Seeds the built-in table (see symbols.c for exactly what -- deliberately
@@ -50,5 +54,9 @@ int intvsymtab_lookup_addr(const intvsymtab *t, uint16_t addr, char *dst,
  * case-sensitive). Returns 1 and fills *addr_out on a hit. */
 int intvsymtab_lookup_name(const intvsymtab *t, const char *name,
                            uint16_t *addr_out);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* INTV_SYMTAB_H */

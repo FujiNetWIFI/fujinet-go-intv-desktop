@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=FujiNet Go Intv
+GenericName=Intellivision with FujiNet
+Comment=Self-contained Mattel Intellivision with built-in FujiNet
+Exec=fujinet-go-intv-kde
+Icon=online.fujinet.go.intv.kde
+Terminal=false
+Categories=Game;Emulator;Qt;
+Keywords=intellivision;intv;jzintv;fujinet;emulator;cp1610;stic;
+StartupNotify=true

@@ -72,8 +72,12 @@ static void intv_display_snapshot(GtkWidget *widget, GtkSnapshot *snapshot)
     IntvDisplay *self = INTV_DISPLAY(widget);
     const float w = (float)gtk_widget_get_width(widget);
     const float h = (float)gtk_widget_get_height(widget);
-    const float aspect =
-        (float)INTVSESSION_FB_WIDTH / (float)INTVSESSION_FB_HEIGHT;
+    /* NOT the frame buffer's raw pixel ratio (160/200 = 0.8, portrait) --
+     * the STIC's pixels are not square. Like every other Intellivision
+     * (and jzIntv's own default windowed display), the 160x200 buffer is
+     * meant to fill a standard NTSC 4:3 picture, so that is the shape to
+     * letterbox into regardless of the source bitmap's own aspect. */
+    const float aspect = 4.0f / 3.0f;
     float dw, dh;
     graphene_rect_t dest;
 

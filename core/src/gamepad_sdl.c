@@ -68,6 +68,27 @@ int intv_disc_from_stick(float x, float y, float deadzone)
     return idx * 2;
 }
 
+/* The D-pad: four independent buttons rather than an analog axis, so there
+ * is no wobble/deadzone to reason about -- just resolve up to 8 directions
+ * (a conflicting pair on one axis, e.g. up+down together, cancels that
+ * axis to neutral rather than picking one arbitrarily). Same 8-position
+ * output domain as intv_disc_from_stick (0/2/4/.../14, or -1 centered). */
+int intv_disc_from_dpad(int up, int down, int left, int right)
+{
+    if (up && down) { up = 0; down = 0; }
+    if (left && right) { left = 0; right = 0; }
+
+    if (up && right)   return 2;  /* NE */
+    if (up && left)    return 6;  /* NW */
+    if (down && left)  return 10; /* SW */
+    if (down && right) return 14; /* SE */
+    if (up)    return 4;  /* N */
+    if (down)  return 12; /* S */
+    if (left)  return 8;  /* W */
+    if (right) return 0;  /* E */
+    return -1;
+}
+
 /* bindings[i] is pad i's explicit side (INTVSESSION_PAD_LEFT/_RIGHT), or -1
  * for automatic assignment. Returns the pad index driving `side`, or -1 if
  * none does. An explicit binding wins; among the rest, the first connected
@@ -110,7 +131,19 @@ static int s_pad_count = 0;
 static volatile int s_running = 0;
 static volatile int s_stop_requested = 0;
 
-#define DEADZONE 0.35f
+/* Two thresholds, not one: the stick must cross the wider ENTER radius to
+ * newly count as pushed in some direction, but once pushed, small in/out
+ * wobble near that boundary (an analog stick basically never sits at a
+ * perfectly steady raw value even when the player isn't moving it) is not
+ * enough to drop back to centered until it falls under the narrower EXIT
+ * radius. Without this, a stick held just past ENTER could jitter
+ * centered<->pushed every poll, and each such transition is a fresh "just
+ * pressed" edge to the CONFIG ROM's menu -- exactly what produced the
+ * reported "any small downward nudge rockets the cursor to the bottom"
+ * (each spurious re-press ran the menu's move-one-item action again,
+ * with none of the typematic repeat-delay a single continuous hold gets). */
+#define DEADZONE_ENTER 0.35f
+#define DEADZONE_EXIT  0.15f
 
 static void handle_button(intv_pad_side side, Uint8 button, int pressed)
 {
@@ -185,12 +218,35 @@ static void poll_sticks(void)
             continue;
 
         pad_slot *slot = &s_pads[idx];
-        const float x = SDL_GetGamepadAxis(slot->handle, SDL_GAMEPAD_AXIS_LEFTX)
-                       / 32767.0f;
-        const float y = -SDL_GetGamepadAxis(slot->handle, SDL_GAMEPAD_AXIS_LEFTY)
-                       / 32767.0f; /* SDL: down is positive; disc math wants
-                                   * up positive, see intv_disc_from_stick. */
-        const int dir = intv_disc_from_stick(x, y, DEADZONE);
+
+        /* The D-pad wins when pressed: it is a set of plain digital
+         * buttons, no wobble to reason about, and a player reaching for
+         * it clearly wants precise control. Falls through to the analog
+         * stick when the D-pad is neutral. */
+        int dir = intv_disc_from_dpad(
+            SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_UP),
+            SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_DOWN),
+            SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_LEFT),
+            SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_RIGHT));
+
+        if (dir == -1)
+        {
+            const float x =
+                SDL_GetGamepadAxis(slot->handle, SDL_GAMEPAD_AXIS_LEFTX) /
+                32767.0f;
+            const float y =
+                -SDL_GetGamepadAxis(slot->handle, SDL_GAMEPAD_AXIS_LEFTY) /
+                32767.0f; /* SDL: down is positive; disc math wants up
+                          * positive, see intv_disc_from_stick. */
+            /* See DEADZONE_ENTER/_EXIT's own comment: use the narrower
+             * exit radius while already pushed, the wider entry radius
+             * while centered, so boundary wobble can't rapid-fire
+             * centered/pushed transitions. */
+            const int was_active = slot->last_disc[side] != -1;
+            dir = intv_disc_from_stick(
+                x, y, was_active ? DEADZONE_EXIT : DEADZONE_ENTER);
+        }
+
         if (dir != slot->last_disc[side])
         {
             intv_host_pad_disc((intv_pad_side)side, dir);

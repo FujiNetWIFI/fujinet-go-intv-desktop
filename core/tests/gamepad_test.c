@@ -62,6 +62,21 @@ int main(void)
               all_even);
     }
 
+    /* ---- intv_disc_from_dpad ---- */
+    check("dpad centered", intv_disc_from_dpad(0, 0, 0, 0) == -1);
+    check("dpad up", intv_disc_from_dpad(1, 0, 0, 0) == 4);
+    check("dpad down", intv_disc_from_dpad(0, 1, 0, 0) == 12);
+    check("dpad left", intv_disc_from_dpad(0, 0, 1, 0) == 8);
+    check("dpad right", intv_disc_from_dpad(0, 0, 0, 1) == 0);
+    check("dpad up+right", intv_disc_from_dpad(1, 0, 0, 1) == 2);
+    check("dpad up+left", intv_disc_from_dpad(1, 0, 1, 0) == 6);
+    check("dpad down+left", intv_disc_from_dpad(0, 1, 1, 0) == 10);
+    check("dpad down+right", intv_disc_from_dpad(0, 1, 0, 1) == 14);
+    check("dpad up+down cancels to centered",
+          intv_disc_from_dpad(1, 1, 0, 0) == -1);
+    check("dpad left+right cancels to centered",
+          intv_disc_from_dpad(0, 0, 1, 1) == -1);
+
     /* ---- intv_pad_for_port ---- */
     {
         /* Two pads, both automatic: first -> left(0), second -> right(1). */

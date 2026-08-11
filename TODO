@@ -508,6 +508,63 @@ M5 -- GNOME frontend (GTK4 + libadwaita):
       environment this was fixed in) -- worth confirming with a real
       controller before considering this fully closed.
 
+  [x] Post-M5 follow-up bug fixes, from real user feedback after the above:
+        - The D-pad did nothing on a real gamepad -- core/src/
+          gamepad_sdl.c only ever read the left analog stick
+          (SDL_GetGamepadAxis), never SDL_GetGamepadButton for
+          SDL_GAMEPAD_BUTTON_DPAD_*. Added intv_disc_from_dpad (a pure
+          function resolving up to 8 directions from the 4 button
+          states, cancelling a directly-opposed pair on one axis to
+          neutral), wired into poll_sticks() so the D-pad wins over the
+          stick whenever it's actually pressed.
+        - "Any small downward nudge on the stick rockets the cursor to
+          the bottom of the list" -- traced to the disc math using a
+          single deadzone radius for both entering AND leaving a
+          direction; boundary wobble (no analog stick sits at a
+          perfectly steady raw value) could cross that one radius
+          repeatedly, and each crossing is a fresh "just pressed" edge
+          to the CONFIG ROM's menu, bypassing its normal typematic
+          repeat-delay entirely. Fixed with a two-threshold (enter/exit)
+          hysteresis: DEADZONE_ENTER (0.35) to newly register as pushed,
+          the narrower DEADZONE_EXIT (0.15) to newly register as
+          released again, so boundary wobble while held can't rapid-fire
+          press/release transitions.
+        - Aspect ratio was too tall/narrow next to real jzIntv --
+          frontends/gnome/display.c was letterboxing to the frame
+          buffer's own RAW pixel ratio (160/200 = 0.8, portrait), not
+          accounting for the STIC's non-square pixels. Real Intellivision
+          video (and jzIntv's own default display) fills a standard NTSC
+          4:3 picture; hardcoded that as the letterbox aspect instead
+          (matching CoCo's own COCO_ASPECT_TV_4_3 reasoning), and widened
+          the main window's default size to suit (800x650, was
+          640x820).
+        - Colors were visibly dimmer than real jzIntv -- root-caused to
+          core/jzintv/desktop/gfx_desktop.c (a close copy of the staged
+          tree's gfx_null.c, see that file's own header) never
+          implementing gfx_sdl2.c's two-phase commit for the STIC's
+          video-enable bit: gfx_vid_enable() intentionally sets a
+          PENDING flag on a real state change without touching the bit
+          actually read (intv_frame_publish's vid_enabled arg, which
+          halves RGB when it reads disabled) -- the flip is supposed to
+          land once, at the next real redraw, which is exactly what
+          gfx_sdl2.c's own refresh path does and gfx_null.c never had to
+          (it draws nothing, so nobody was ever hurt by leaving the
+          bit un-committed). We DO read that bit for real, so once the
+          STIC turned the display on for good, gfx_refresh() kept
+          re-arming the pending flag every frame without ever committing
+          it -- a permanent, session-long half-brightness read. Added
+          the same commit step gfx_sdl2.c has, right before reading the
+          bit.
+        - The user also asked whether frame pacing might explain the
+          repeat-delay oddities -- checked: intv_host.c runs jzIntv's own
+          unmodified speed.c throttle (the same real-time regulation
+          upstream's own binary uses), so this was not touched; the
+          deadzone-hysteresis fix above is the far more likely explanation
+          for what was actually observed.
+      core/tests/gamepad_test.c gained coverage for intv_disc_from_dpad
+      (all 8 directions plus both cancelling-pair cases). All 15 ctest
+      cases pass; clean-room rebuild confirmed with WITH_INTV_ROMS=OFF.
+
 NOT STARTED:
 
   M6 -- KDE (Qt6 Widgets), macOS (AppKit), Windows (Win32) frontends: port

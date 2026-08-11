@@ -166,6 +166,27 @@ void gfx_refresh(gfx_t *const gfx)
         gfx->dropped_frames = 0;
     }
 
+    /* gfx_vid_enable() (below) is a two-phase commit: on a real state
+     * change it sets the pending bit (bit 1) but deliberately leaves bit 0
+     * -- the value actually read here -- at its OLD setting, because the
+     * bit-0 flip is meant to happen exactly once, at the next real
+     * redraw. gfx_null.c (this file started as a close copy of it, per
+     * this file's own header) never had to finish that contract because
+     * it never draws anything and never reads vid_enable for real; we DO
+     * read it (intv_frame_publish below halves brightness when it is 0,
+     * mirroring gfx_sdl2.c's own pal_off), so we have to do what
+     * gfx_sdl2.c's own refresh path does -- commit the pending toggle
+     * right here, once, before reading it. Without this, bit 0 never
+     * moves off its startup value of 0 once the STIC turns the display
+     * on: every frame calls gfx_vid_enable(gfx, 1), sees bit 0 still 0,
+     * re-arms the pending bit, and bit 0 is never actually flipped --
+     * a permanent, session-long "blanked" (half brightness) read. */
+    if (gfx->pvt->vid_enable & 2)
+    {
+        gfx->pvt->vid_enable &= 1;
+        gfx->pvt->vid_enable ^= 1;
+    }
+
     intv_frame_publish(gfx->vid, gfx->palette.color, gfx->pvt->vid_enable & 1);
 
     gfx->dirty = 0;

@@ -22,6 +22,7 @@ void intv_gamepad_stop(void);
 /* Pure functions -- see gamepad_sdl.c for the full contract of each;
  * unit-tested in core/tests/gamepad_test.c without any hardware attached. */
 int intv_disc_from_stick(float x, float y, float deadzone);
+int intv_disc_from_dpad(int up, int down, int left, int right);
 int intv_pad_for_port(const int *bindings, int npads, int side);
 
 #ifdef __cplusplus

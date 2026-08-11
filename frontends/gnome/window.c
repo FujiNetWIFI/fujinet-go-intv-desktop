@@ -221,8 +221,15 @@ GtkWidget *intv_window_new(AdwApplication *app, intvsession *session)
     IntvWindow *self = g_object_new(INTV_TYPE_WINDOW,
                                     "application", app,
                                     "title", "FujiNet Go Intv",
-                                    "default-width", 640,
-                                    "default-height", 820,
+                                    /* 4:3 content area plus room for the
+                                     * header bar -- matches the display's
+                                     * own letterbox aspect (display.c)
+                                     * instead of the raw 160x200 frame
+                                     * buffer's portrait shape, so the
+                                     * window doesn't open with big black
+                                     * bars top and bottom. */
+                                    "default-width", 800,
+                                    "default-height", 650,
                                     NULL);
     AdwToolbarView *view;
     AdwHeaderBar *header;

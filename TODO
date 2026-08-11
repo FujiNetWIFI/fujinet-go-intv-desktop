@@ -565,6 +565,39 @@ M5 -- GNOME frontend (GTK4 + libadwaita):
       (all 8 directions plus both cancelling-pair cases). All 15 ctest
       cases pass; clean-room rebuild confirmed with WITH_INTV_ROMS=OFF.
 
+  [x] CORRECTION to the "frame pacing" line just above -- IT WAS WRONG.
+      The user pointed at the actual debug log (jzIntv's own "Rate: [NN%]"
+      line) showing >33000%, not ~100%: the CPU really was running
+      hundreds of times real NTSC speed, unthrottled. My earlier claim
+      that "intv_host.c runs jzIntv's own unmodified speed.c throttle"
+      was true but incomplete -- the throttle was never being ENABLED in
+      the first place. Root cause: src/cfg/cfg.c defaults
+      `cfg->rate_ctl = !plat_is_batch_mode()`, and our plat backend
+      (src/plat/plat_null.c, kept as the upstream null driver per
+      core/CMakeLists.txt) has `plat_is_batch_mode(void) { return true; }`
+      unconditionally -- it has no window to be interactive about, so it
+      always reports batch mode, which defaults rate control OFF. A real
+      windowed jzIntv build gets rate control for free from plat_sdl.c's
+      own (non-batch) plat_is_batch_mode(); we never got the equivalent.
+      Fixed in core/jzintv/intv_host.c by adding "-r1" to the argv jzIntv
+      is started with, forcing real-time throttle on regardless of the
+      batch-mode default -- confirmed via the "Rate:" log line itself
+      (stdout is fully buffered when redirected to a file, not
+      line-buffered like a TTY, so this needed `stdbuf -oL` and a clean
+      SIGTERM shutdown to actually see it rather than losing it to a
+      SIGKILL's discarded buffer): before the fix, no "Rate:" line ever
+      appeared at all in over 30s of capture (i.e. buffer never even
+      filled at that print rate -- consistent with jzp_printf being
+      reached far too rarely relative to real elapsed time, though the
+      exact mechanism of the 0-lines symptom wasn't chased further once
+      -r1 fixed it); after, it settles at 100-117% within a few seconds
+      of boot. This is very likely the real explanation for the
+      "typematic delay feels off" and probably contributed to the
+      deadzone-jitter symptom's severity too (an unthrottled CPU samples
+      and acts on stick/disc state far more often per real second than
+      intended). All 15 ctest cases pass (no test depended on real-time
+      pacing); clean-room rebuild confirmed with WITH_INTV_ROMS=OFF.
+
 NOT STARTED:
 
   M6 -- KDE (Qt6 Widgets), macOS (AppKit), Windows (Win32) frontends: port

@@ -187,7 +187,7 @@ int intv_host_start(const intv_host_opts *opts)
     snprintf(g_arg, sizeof(g_arg), "-g%s", grom_path);
 
     free_argv();
-    s_argc = 4;
+    s_argc = 5;
     s_argv = calloc((size_t)s_argc + 1, sizeof(*s_argv));
     if (!s_argv)
     {
@@ -198,7 +198,19 @@ int intv_host_start(const intv_host_opts *opts)
     s_argv[1] = xstrdup(e_arg);
     s_argv[2] = xstrdup(g_arg);
     s_argv[3] = xstrdup(fujinet_arg);
-    s_argv[4] = NULL;
+    /* cfg.c defaults rate_ctl to "on" UNLESS plat_is_batch_mode() says
+     * otherwise (src/cfg/cfg.c: "cfg->rate_ctl = !batch_mode"), and our
+     * plat backend is src/plat/plat_null.c, whose plat_is_batch_mode()
+     * unconditionally returns true (it has no window to be interactive
+     * about) -- so left alone, rate control defaults OFF and the CPU runs
+     * as fast as the host machine allows, hundreds of times real NTSC
+     * speed. -r1 forces jzIntv's own real-time throttle (speed.c) on
+     * regardless of that batch-mode default; this is not a workaround for
+     * something specific to us, it's the same throttle a real windowed
+     * jzIntv build gets for free from plat_sdl.c's own (non-batch)
+     * plat_is_batch_mode(). */
+    s_argv[4] = xstrdup("-r1");
+    s_argv[5] = NULL;
 
     pthread_mutex_lock(&s_lock);
     s_running = 1;

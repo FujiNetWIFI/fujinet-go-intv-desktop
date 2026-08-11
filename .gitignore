@@ -1,4 +1,10 @@
 build*/
+# ...but build-aux/ is source, not output: it holds the flatpak manifests
+# and the NSIS installer script (the directory name is GNOME Builder's
+# convention). Without this the pattern above swallows new files there
+# silently -- they never show up as untracked, so a manifest can be
+# "added" and still be missing from CI.
+!build-aux/
 third_party/jzintv/
 third_party/fujinet-firmware/
 core/jzintv-generated/
@@ -10,3 +16,8 @@ compile_commands.json
 *.dylib
 *.dll
 __pycache__/
+
+# flatpak-builder's state directory.
+.flatpak-builder/
+build-flatpak*/
+repo/

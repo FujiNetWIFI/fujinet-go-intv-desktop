@@ -874,10 +874,87 @@ M6 (cont'd) -- macOS (AppKit) frontend: WRITTEN, but UNVERIFIED -- unlike
       below) -- the bundle icon will be missing until that lands, but
       this does not block the app itself from building or running.
 
+M7 -- Packaging: DONE.
+  [x] Icon: data/icons/src/fujinet-go-intv-foreground.png copied byte-
+      identical from fujinet-go-coco-desktop (verified: same md5sum as
+      CoCo/ADAM/Apple II's own copy -- this is the shared FujiNet mark
+      every desktop product composites over its own background colour).
+      tools/icons/make-icons.py renders it over dark green (#1E4912, per
+      user note 2026-08-10) into every hicolor size, fujinet-go-intv.icns,
+      and frontends/windows/app.ico (a new addition over the CoCo script:
+      Pillow's ICO writer, 16x16 + 32x32). The CMake install rules and
+      intv_icon_name() plumbing for GNOME/KDE already existed from M5/M6
+      (written before this session's own scope) -- only the actual image
+      files were missing.
+  [x] build-aux/flatpak/online.fujinet.go.intv.{gnome,kde}.yml: adapted
+      from the CoCo manifests (jzIntv archive instead of XRoar tarball;
+      -DWITH_INTV_ROMS=OFF always, since the Mattel EXEC/GROM have no
+      freely-redistributable substitute the way CoCo's HDB-DOS pair is).
+      BOTH manifests actually built, installed, and RUN with
+      flatpak-builder + flatpak run against the real org.gnome.Platform/49
+      and org.kde.Platform/6.11 runtimes pulled from Flathub -- not just
+      written: real sandboxed processes came up showing the expected
+      "roms is missing exec.bin/grom.bin" message (this build has
+      WITH_INTV_ROMS=OFF, correctly). Both test installs were uninstalled
+      afterward.
+  [x] Real bug caught by the GNOME flatpak build (not present in the
+      ordinary Linux build): frontends/gnome/CMakeLists.txt's link line
+      put -lstdc++ before jzintv_core.a in the actual command CMake
+      generated (a transitively-required PUBLIC dependency gets appended
+      at the very end of the flattened link order); harmless under this
+      machine's linker defaults, but a hard "DSO missing from command
+      line" failure under the GNOME SDK's stricter --as-needed toolchain.
+      Fixed by naming jzintv_core explicitly ahead of stdc++ in the link
+      list.
+  [x] Real drift caught by the same build: cmake/Dependencies.cmake's
+      FUJINET_COMMIT pin (b939b7f...) was no longer reachable on GitHub --
+      exactly the risk the original plan flagged ("the pinned commit may
+      move under us"). Re-pinned to 2fae40fd322abcbf7fe702ea9cd4b309c0288767
+      (the commit third_party/fujinet-firmware was already sitting at
+      locally, confirmed to carry the Intellivision firmware files) in
+      both cmake/Dependencies.cmake and both flatpak manifests. Re-verified
+      inert on the ordinary Linux build (full reconfigure + build + all 19
+      ctest cases).
+  [x] Real gap caught while verifying build-aux/ was actually tracked:
+      .gitignore's `build*/` pattern was silently swallowing build-aux/
+      too (a real directory of committed source, not a build product) --
+      it never showed as untracked, so the flatpak manifests and NSIS
+      script could have been "written" and silently never committed. Fixed
+      with an explicit `!build-aux/` negation, the same fix CoCo's own
+      .gitignore already carries with the identical trap documented in a
+      comment. Also added the missing `.flatpak-builder/`/`build-flatpak*/`
+      /`repo/` ignores CoCo's .gitignore has.
+  [x] build-aux/windows/installer.nsi: adapted from CoCo's (per-user
+      install, no elevation, same MUI2 page flow). NOT run through
+      makensis in this environment (no nsis package available, no sudo) --
+      unlike the flatpak manifests, this is UNVERIFIED syntax, following a
+      known-working template closely. The Windows release CI job
+      (.github/workflows/release.yml) will be the first real makensis run.
+  [x] .github/workflows/{linux,macos,windows,flatpak,release}.yml: adapted
+      from CoCo's own. linux.yml's recipe (build SDL3 from source, GTK4/
+      libadwaita/Qt6 apt packages, ctest) was not run end-to-end in this
+      environment (no GitHub Actions runner available locally), but every
+      individual piece it exercises -- the Linux build, both frontends,
+      the full ctest suite, DEB/RPM/TGZ packaging via CPack, both flatpak
+      manifests -- WAS independently verified locally in this session.
+      macos.yml and windows.yml are genuinely UNTESTED beyond what the
+      Wine smoke test and static file inspection already proved for
+      Windows; macOS CI will be the very first time that frontend is
+      built at all. windows.yml needs no TRE/libsystre packages (unlike
+      CoCo's own, which portalib/sdsx.c requires) -- jzintv_core has no
+      analog.
+  [x] CPack (DEB/RPM/TGZ): the CMakeLists.txt-level config already existed
+      from before this session (icon-install loop, CPACK_* variables,
+      per-frontend CPACK_PACKAGE_NAME). Actually ran `cpack -G DEB` locally
+      and confirmed a real .deb was produced (dpkg-shlibdeps unavailable in
+      this environment, so dependencies are unresolved in this local
+      artifact -- CI's ubuntu-latest runner has it, so the shipped
+      packages will carry real dependency lists).
+
 NOT STARTED:
 
-  M7 -- Packaging: icons, flatpak manifests, NSIS installer, CPack DEB/RPM/
-        TGZ, CI workflows (linux/windows/macos/flatpak/release), all release
-        builds with -DWITH_INTV_ROMS=OFF.
-        Icon: same icon as the other FujiNet Go Desktop clients, but on a
-        dark green (#1e4912) background (per user note, 2026-08-10).
+  Pushing to https://github.com/FujiNetWIFI/fujinet-go-intv-desktop,
+  confirming all 5 CI workflows go green there, and cutting the v0.1.0
+  release tag -- requested 2026-08-10, blocked on CI actually running on
+  GitHub's own infrastructure (macos.yml and windows.yml in particular
+  cannot be verified any further locally).

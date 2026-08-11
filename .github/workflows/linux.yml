@@ -1,0 +1,69 @@
+name: Linux
+
+# Builds both frontends (GNOME + KDE) and runs the full test suite.
+#
+# WITH_INTV_ROMS=OFF throughout: the Mattel EXEC/GROM are not freely
+# redistributable (see COMPLIANCE.md), so CI never has them, the same as
+# every artifact this repository publishes. That means boot_smoke,
+# pad_test, audio, fujibus_smoke, debug and stic report ctest's skip code
+# (77) rather than actually running -- expected here, not a gap in this
+# workflow.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    # SDL3 installs to a non-standard prefix (see below), so every step that
+    # runs a linked binary -- configure-time checks as well as ctest --
+    # needs the loader to find it there.
+    env:
+      LD_LIBRARY_PATH: /tmp/sdl3-install/lib
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools and frontend toolkits
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build python3 pkg-config git \
+            libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev \
+            qt6-base-dev libqt6opengl6-dev qt6-webengine-dev \
+            desktop-file-utils appstream \
+            libx11-dev libxext-dev libxrandr-dev libxi-dev libxss-dev \
+            libxcursor-dev libxkbcommon-dev libwayland-dev libdrm-dev \
+            libgbm-dev libgl1-mesa-dev libpulse-dev libasound2-dev \
+            libxtst-dev
+
+      # SDL3 is too new to assume an apt package exists on every runner
+      # image; built from source and pinned to the exact release this
+      # project is developed and tested against, the same "pin what
+      # matters" policy as jzIntv (SHA256 archive) and the FujiNet firmware
+      # (pinned commit) elsewhere in this build.
+      - name: Build and install SDL3 (release-3.4.12, pinned)
+        run: |
+          git clone --depth 1 --branch release-3.4.12 \
+            https://github.com/libsdl-org/SDL.git /tmp/sdl3-src
+          cmake -S /tmp/sdl3-src -B /tmp/sdl3-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/tmp/sdl3-install \
+            -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST_LIBRARY=OFF
+          cmake --build /tmp/sdl3-build
+          cmake --install /tmp/sdl3-build
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_PREFIX_PATH=/tmp/sdl3-install \
+            -DWITH_INTV_ROMS=OFF
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure

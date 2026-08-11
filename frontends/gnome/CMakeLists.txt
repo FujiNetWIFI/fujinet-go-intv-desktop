@@ -34,8 +34,20 @@ add_executable(fujinet-go-intv-gnome ${GNOME_SOURCES})
 # intv_session's PUBLIC link, which is one hop too far for that inference
 # in practice. Simplest fix: name the C++ runtime explicitly rather than
 # fight CMake's language-inference heuristics.
-target_link_libraries(fujinet-go-intv-gnome PRIVATE intv_session PkgConfig::ADW
-                      stdc++)
+#
+# jzintv_core is ALSO named explicitly here (redundant with intv_session's
+# own PUBLIC link to it) so it lands ahead of -lstdc++ on the final link
+# line rather than after it: CMake appends a target's transitively-required
+# libraries at the very end of the flattened link order, so without this,
+# jzintv_core.a lands AFTER -lstdc++ -- fine for a lenient linker default,
+# but a hard link failure ("DSO missing from command line") under a
+# strict-by-default toolchain (a GNOME flatpak SDK build caught this one;
+# --as-needed there means ld resolves left-to-right in one pass, so
+# -lstdc++ appearing before the .o that actually needs std::locale's
+# destructor is too late). Naming jzintv_core here moves it ahead of
+# stdc++ in the explicit list, which is what fixes the order.
+target_link_libraries(fujinet-go-intv-gnome PRIVATE intv_session jzintv_core
+                      PkgConfig::ADW stdc++)
 # debugger/dbg_window.c and keypad/keypad_window.c include their own headers
 # by that path.
 target_include_directories(fujinet-go-intv-gnome PRIVATE

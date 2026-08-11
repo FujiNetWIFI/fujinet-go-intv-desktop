@@ -1,0 +1,85 @@
+name: Windows
+
+# Native MSYS2/UCRT64, not the mingw-w64 cross-compile documented in
+# cmake/toolchains/mingw-w64.cmake -- that recipe exists because the
+# maintainer has no Windows machine to build on directly (only Wine, used to
+# smoke-test the cross-compiled .exe -- see TODO), but this workflow *is*
+# the Windows build once it lands in CI/CD, so it should be the real thing:
+# a native windows-latest runner driving the native UCRT64 toolchain,
+# exactly the way tools/fujinet/build-fujinet-desktop.sh already expects to
+# be run (see its own MSYS2/cygpath handling).
+#
+# Builds the native Win32 frontend (frontends/windows) alongside core + the
+# FujiNet runtime + the test suite. Unlike the sibling CoCo/MSX ports, this
+# core needs no TRE/regex package (jzintv_core has no analog to CoCo's
+# portalib/sdsx.c), so the install list is shorter; it does still need
+# ws2_32 (jzIntv's own fn_sock.c is a winsock client), already wired into
+# frontends/windows/CMakeLists.txt.
+#
+# This is push/PR CI, not the release build: it links the packaged
+# (dynamic) SDL3 for speed, unlike release.yml's windows-package job, which
+# builds SDL3 statically and produces the actual shipped installer/zip.
+#
+# WITH_INTV_ROMS=OFF for the same reason as linux.yml/macos.yml: the Mattel
+# EXEC/GROM are not freely redistributable (see COMPLIANCE.md), so CI never
+# has them, and boot_smoke/pad_test/audio/fujibus_smoke/debug/stic report
+# ctest's skip code (77) rather than actually running.
+#
+# WITH_FUJINET is left at its default (ON) for the same reason as
+# macos.yml: proving the platform-specific runtime build actually works
+# here, not skipping it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # autocrlf would rewrite every staged/patched jzIntv source file's
+          # line endings on checkout, which is exactly the kind of diff-
+          # shaped noise cmake/StageJzIntv.cmake's re-stage detection
+          # (content hashing) is not expecting.
+          fetch-depth: 1
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-sdl3
+
+      # MSYS2's UCRT64 repo packages its own current SDL3, not the exact
+      # release this project is pinned to for its actual shipped builds
+      # (release.yml builds 3.4.12 from source instead) -- unlike
+      # linux.yml/macos.yml this job does not build SDL3 from source, so
+      # this only guards against MSYS2 packaging something outside the
+      # 3.4.x line entirely (an ABI/API break this fast CI job's dynamic
+      # link would not otherwise catch), not against MSYS2's own routine
+      # patch bumps within it.
+      - name: Confirm the packaged SDL3 is on the 3.4.x line
+        run: pacman -Q mingw-w64-ucrt-x86_64-sdl3 | grep -qE ' 3\.4\.[0-9]+-'
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DWITH_INTV_ROMS=OFF
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure

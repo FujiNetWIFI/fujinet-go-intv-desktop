@@ -16,6 +16,7 @@
 #include "debugger/dbg_window.h"
 #include "display.h"
 #include "keypad/keypad_window.h"
+#include "keysym_map.h"
 
 struct _IntvWindow {
     AdwApplicationWindow parent_instance;
@@ -42,7 +43,8 @@ void intv_window_toast(IntvWindow *self, const char *message)
 static gboolean forward_key(IntvWindow *self, guint keyval,
                             GdkModifierType state, int down)
 {
-    intvsession_key_mapping m = intvsession_key_from_keysym(keyval);
+    intvsession_key_mapping m =
+        intvsession_key_from_keysym(intv_keysym_from_gdk(keyval));
     (void)state;
     if (m.kind == INTVSESSION_MAP_KEY)
         intvsession_pad_key(self->session, m.side, m.key, down);

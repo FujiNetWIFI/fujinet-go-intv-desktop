@@ -648,6 +648,32 @@ M5 -- GNOME frontend (GTK4 + libadwaita):
       untouched. All 16 ctest cases pass; clean-room rebuild confirmed
       with WITH_INTV_ROMS=OFF.
 
+  [x] Real M5 bug, found while starting M6 (not reported by the user --
+      caught by re-reading the code while porting its pattern to KDE):
+      intvsession_key_from_keysym() expects its OWN private numbering for
+      non-printable keys (intvsession.h's INTVSESSION_KEYSYM_* enum,
+      starting at 0x1000), not an X11/GDK keysym -- but both
+      frontends/gnome/window.c and keypad/keypad_window.c passed GDK's
+      raw keyval straight through. GDK's own values for arrows/numpad/
+      modifiers (e.g. GDK_KEY_Up == 0xFF52) looked plausible but matched
+      no case in the switch, silently falling through to
+      INTVSESSION_MAP_NONE every time -- meaning arrow keys, the numeric
+      keypad, and Shift/Ctrl/Alt (the action buttons) never worked via a
+      physical keyboard on either window. ASCII letters/digits kept
+      working by coincidence (GDK's keyval for a letter/digit IS its
+      ASCII value), which is exactly why this went unnoticed: gamepad and
+      mouse (keypad window clicks) input were both tested and worked,
+      and IJKM/DRWEASZXC (the letter-key disc bindings) worked too,
+      masking that the ARROW keys and numpad specifically were dead.
+      Fixed with a new frontends/gnome/keysym_map.h (intv_keysym_from_gdk),
+      shared by both files, translating the non-printable GDK keyvals to
+      the correct INTVSESSION_KEYSYM_* values before calling
+      intvsession_key_from_keysym; printable keys still pass through
+      unchanged. All 14 ctest cases pass; clean-room rebuild confirmed
+      with WITH_INTV_ROMS=ON (this bug could not have been caught by any
+      WITH_INTV_ROMS=OFF test, since it is purely a live-keyboard-input
+      issue).
+
 NOT STARTED:
 
   M6 -- KDE (Qt6 Widgets), macOS (AppKit), Windows (Win32) frontends: port

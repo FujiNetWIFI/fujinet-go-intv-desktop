@@ -27,6 +27,8 @@
 #define _USE_MATH_DEFINES
 #include <math.h>
 
+#include "../keysym_map.h"
+
 #define DISC_SIZE 150
 #define DISC_DEADZONE_FRAC 0.22
 
@@ -308,7 +310,7 @@ static gboolean forward_key(guint keyval, GdkModifierType state, int down)
     (void)state;
     if (!g_session)
         return FALSE;
-    m = intvsession_key_from_keysym(keyval);
+    m = intvsession_key_from_keysym(intv_keysym_from_gdk(keyval));
     if (m.kind == INTVSESSION_MAP_KEY)
         intvsession_pad_key(g_session, m.side, m.key, down);
     else if (m.kind == INTVSESSION_MAP_DISC)

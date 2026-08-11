@@ -408,14 +408,71 @@ symbols still open):
   above. cp1600dasm.c as a standalone wrapper is still not written (not
   required yet -- intvdebug_disassemble already covers every use so far).
 
+M5 -- GNOME frontend (GTK4 + libadwaita):
+
+  [x] frontends/gnome/{main,window,display}.c -- main window: header bar
+      with a menu (Keypad, Debugger, FujiNet Configuration/Console Log,
+      About), keyboard capture forwarding everything except F9 (keypad)/
+      F11 (fullscreen)/F12 (debugger) through intvsession_key_from_keysym,
+      and IntvDisplay -- a GdkMemoryTexture-per-frame widget at
+      INTVSESSION_FB_WIDTH x _HEIGHT (fixed geometry, unlike CoCo/MSX's
+      runtime-varying viewports -- no per-frame texture resize needed).
+      No intvsession_notify_vsync call: unlike CoCo/MSX, intvsession has
+      none -- jzIntv's own paced thread already governs itself to NTSC/PAL
+      speed independent of the frontend's frame clock.
+  [x] frontends/gnome/debugger/dbg_window.c -- poll-based stop tracking
+      (intvdebug_stop_serial on a frame-clock tick, modelled on the CoCo
+      port's own dbg_window.c -- the engine stops the machine on the
+      emulator thread, so a GTK callback from there would be a threading
+      bug), with a CPU tab (disassembly with a breakpoint gutter, editable-
+      by-poke registers, a memory hex view) and an STIC tab (BACKTAB, all
+      8 MOBs, the GRAM/GROM card sheet with pager, palette, and decoded
+      register/mode text), laid out like the MSX port's own VDP tab. Owns
+      its own intvsymtab instance for disassembly annotation (intvdebug
+      has no symbol table of its own, unlike cocodebug).
+  [x] frontends/gnome/keypad/keypad_window.c -- the clickable keypad
+      sub-window: both hand controllers side by side, each a 3x4 keypad
+      grid (raw GtkGestureClick press/release, not GtkButton's "clicked" --
+      a keypad digit is a real held button, matching intvsession_pad_key's
+      press/release contract), three action buttons, and a 16-position
+      direction disc (GtkDrawingArea + GtkGestureClick +
+      GtkEventControllerMotion for drag-around, hit-tested geometrically
+      by angle rather than 16 separate widgets). Forwards keyboard events
+      to the session exactly like the main window does rather than trying
+      to refuse focus outright -- GTK4 has no reliable cross-platform way
+      to stop a toplevel being focused on click, so typing still drives
+      the machine correctly whichever window has focus.
+  [x] VERIFIED against the real running app (not just a build check): ran
+      the actual GNOME binary under Wayland (grim screenshots), confirmed
+      it boots straight to the FujiNet config ROM's HOST SLOTS screen with
+      no ROM argument or menu interaction (the core M5 acceptance
+      criterion); opened the debugger (INTV_OPEN_DEBUGGER=1 developer
+      affordance, matching the sibling repos) and confirmed disassembly/
+      registers/memory populate with real paused-machine data and the
+      STIC tab's rendered BACKTAB pixel-matches the main display's own
+      "HOST SLOTS" text exactly; opened the keypad window
+      (INTV_OPEN_KEYPAD=1) and confirmed both controllers render correctly
+      including the direction discs. CAUGHT (and fixed) two real bugs this
+      way: the frontend executable failed to link ("undefined reference to
+      std::locale::~locale") because it only reaches jzintv_core's one
+      C++ file (src/locutus/) transitively through intv_session's PUBLIC
+      link, one hop too far for CMake's linker-language inference to pick
+      up libstdc++ automatically -- fixed by linking stdc++ explicitly in
+      frontends/gnome/CMakeLists.txt; and the keypad's number grid/action
+      row were left-justified under the "Left/Right Controller" heading
+      instead of centered -- fixed with an explicit GTK_ALIGN_CENTER on
+      each.
+  [x] All 15 ctest cases pass (11 core + 4 new: no_embedded_roms for the
+      gnome binary, desktop-entry-validate, appstream metainfo validate,
+      plus the existing 11 unaffected). Clean-room rebuild confirmed with
+      WITH_INTV_ROMS=OFF and the default FRONTEND=all (KDE correctly still
+      reports "not implemented yet -- skipping").
+
 NOT STARTED:
 
-  M5 -- GNOME frontend (GTK4 + libadwaita): main window, debugger window,
-        keypad sub-window (both hand controllers, clickable keypad/disc/
-        action buttons -- no precedent in any sibling project, build this
-        one first and port its layout to the other three).
-
-  M6 -- KDE (Qt6 Widgets), macOS (AppKit), Windows (Win32) frontends.
+  M6 -- KDE (Qt6 Widgets), macOS (AppKit), Windows (Win32) frontends: port
+        the GNOME layout above (main window, debugger window, keypad
+        window) to each.
 
   M7 -- Packaging: icons, flatpak manifests, NSIS installer, CPack DEB/RPM/
         TGZ, CI workflows (linux/windows/macos/flatpak/release), all release

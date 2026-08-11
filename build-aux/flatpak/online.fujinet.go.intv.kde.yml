@@ -176,5 +176,5 @@ modules:
         dest: third_party/jzintv
       - type: git
         url: https://github.com/FujiNetWIFI/fujinet-firmware
-        commit: 2fae40fd322abcbf7fe702ea9cd4b309c0288767
+        commit: a0991d7bd176ba8aa833b869571e328749d964be
         dest: third_party/fujinet-firmware

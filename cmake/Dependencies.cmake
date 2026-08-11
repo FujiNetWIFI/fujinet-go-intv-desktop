@@ -39,7 +39,7 @@ set(JZINTV_VERSION "20200712")
 set(JZINTV_URL "http://spatula-city.org/~im14u2c/intv/dl/jzintv-${JZINTV_VERSION}-src.zip")
 set(JZINTV_SHA256 "b36b3b274d0fc05cb227818d4957f96620d23d8d6b7596c24f07675ced7129f3")
 
-set(FUJINET_COMMIT "2fae40fd322abcbf7fe702ea9cd4b309c0288767")
+set(FUJINET_COMMIT "a0991d7bd176ba8aa833b869571e328749d964be")
 set(FUJINET_URL "https://github.com/FujiNetWIFI/fujinet-firmware")
 
 # intv_provide_dependency(NAME <n> PATH <p> SENTINEL <file> OVERRIDE <VAR>

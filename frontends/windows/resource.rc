@@ -1,0 +1,9 @@
+#include "resource.h"
+
+/* No app.ico yet -- M7 (packaging/icons) has not run for this project; the
+ * window falls back to the default system icon (LoadIconA returns NULL for
+ * a missing resource, which is a harmless no-op for wc.hIcon). */
+
+/* 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID: visual styles (comctl32 v6) and
+ * per-monitor DPI awareness. */
+1 24 "app.manifest"

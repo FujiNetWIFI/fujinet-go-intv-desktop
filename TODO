@@ -750,14 +750,99 @@ M6 -- KDE (Qt6 Widgets):
       the default FRONTEND=all (both GNOME and KDE build together on
       Linux).
 
+M6 (cont'd) -- Windows (Win32) frontend: DONE, genuinely smoke-tested (not
+      just written), unlike the macOS status below:
+  [x] frontends/windows/{main.c,resource.h,resource.rc,app.manifest.in,
+      CMakeLists.txt} + debugger/dbg_window.{h,c} +
+      keypad/keypad_window.{h,c}: same layout/scope as the GNOME/KDE
+      ports (GDI StretchDIBits display, full keyboard mapping via a
+      Win32-VK-to-INTVSESSION_KEYSYM_* table, a common-controls debugger
+      window with CPU/STIC tabs, a keypad window with both hand
+      controllers). No register/memory editing (intvdebug has no
+      register-write call, matching every other port's scope).
+  [x] cmake/toolchains/mingw-w64.cmake: MinGW-w64 cross-compile toolchain
+      (adapted from the MSX port's own, simplified since jzintv_core has
+      no SDL2 dependency of its own) using a prebuilt SDL3 mingw devel
+      archive (SDL3-devel-3.4.14-mingw.tar.gz from SDL's own GitHub
+      releases) rather than building SDL3 from source.
+  [x] core/CMakeLists.txt: added src/pads/pads_cgc_win32.c to
+      JZINTV_CORE_SOURCES under `if(WIN32)` -- jzIntv's own pads_cgc.c
+      calls pad_cgc_win32_init() unconditionally under #ifdef WIN32 with
+      no weak-symbol fallback (unlike Linux/macOS's pad_cgc_linux_init,
+      which IS __attribute__((weak)) specifically so CGC support can be
+      omitted). Gated behind WIN32 so it is a no-op on Linux; re-verified
+      by a clean Linux configure+build+ctest after this change (below).
+  [x] Two real bugs caught before or via an actual Wine run:
+        - dbg_window.c's refresh_regs() reused a 16-byte buffer for a
+          flags string that needs up to 78 bytes (found by inspection,
+          fixed with a separate properly-sized buffer before ever
+          building).
+        - A genuine buffer overflow, caught only by an ACTUAL WINE CRASH
+          (not by inspection): refresh_stic()'s shared `rgba_scratch`
+          static buffer was sized only for the cards-sheet render
+          (32768 bytes) but reused for all four STIC renders, including
+          the palette sheet (65536 bytes) and the BACKTAB (61440 bytes)
+          -- both larger than the buffer. The overflow silently wrote
+          pixel data past the end of the buffer into adjacent .bss,
+          corrupting the unrelated static `g_dbg` pointer a few hundred
+          bytes away. Wine's own SEH handler caught the resulting wild
+          pointer dereference (a page fault reading a garbage 0xC8-byte-
+          pattern address -- literally leaked pixel color bytes) inside
+          intv_debugger_pretranslate() on the very next message-loop
+          iteration after the debugger window opened, correctly
+          identified via disassembly of the crash address plus targeted
+          fprintf tracing through construction (which showed g_dbg still
+          correct immediately after the first refresh, then corrupted a
+          timer tick or two later -- consistent with per-frame pixel
+          data varying which bytes got clobbered). Fixed by sizing the
+          scratch buffer to the max of all four renders' byte counts.
+          This bug is unique to the Windows port; the GNOME/KDE debugger
+          windows do not share a single scratch buffer across renders.
+  [x] Layout fix (user-reported, 2026-08-10): the keypad window's digit
+      grid and action-button row were left-justified against each
+      controller's origin while the direction disc was centered within
+      the same 220px column -- visually lopsided. Fixed by centering all
+      three rows (digits, actions, disc) within that column, matching
+      the GNOME port's own gtk_widget_set_halign(..., GTK_ALIGN_CENTER)
+      on each row.
+  [x] VERIFIED under Wine (11.14) with a genuine MinGW-w64 cross-compiled
+      .exe -- not just "should work": ran with WITH_INTV_ROMS=ON and
+      confirmed via grim screenshots that (a) the main window renders the
+      actual FujiNet config ROM boot screen ("FUJINET CONFIG INTV" /
+      "CHECKING WIFI...") through the GDI StretchDIBits path with correct
+      colors; (b) the debugger window (INTV_OPEN_DEBUGGER=1) renders the
+      BACKTAB, MOB grid, GRAM/GROM card sheet, and palette strip
+      correctly, and stays stable through many 100ms refresh-timer ticks
+      after the scratch-buffer fix; (c) the keypad window
+      (INTV_OPEN_KEYPAD=1) renders both controllers with correctly
+      centered digit pads, action buttons, and direction discs; (d) all
+      three windows run simultaneously without crashing. Also confirmed
+      the ROM-less error path earlier (a real native MessageBoxA showing
+      the expected "missing exec.bin/grom.bin" text with correctly-
+      resolved Windows paths).
+  [x] Clean-room re-verification of the ordinary Linux build/ directory
+      (GNOME + KDE) after the two shared-file changes above
+      (core/CMakeLists.txt's WIN32-gated pads_cgc_win32.c,
+      CMakeLists.txt's Darwin-gated CMAKE_OSX_DEPLOYMENT_TARGET): fresh
+      cmake -B build configure + full build + all 16 ctest cases passing
+      with WITH_INTV_ROMS=OFF, then again with WITH_INTV_ROMS=ON (19
+      cases, the extra 3 being the ROM-gated boot/pad/audio/fujibus/
+      debug/stic tests), then reset back to OFF -- both shared-file
+      changes are confirmed inert on Linux.
+  [x] Windows cross-build itself reset to WITH_INTV_ROMS=OFF (the
+      redistributable default) before committing.
+
 NOT STARTED:
 
-  M6 (cont'd) -- macOS (AppKit) and Windows (Win32) frontends: port the
-        same GNOME/KDE layout to each. NOT STARTED YET and, unlike GNOME/
-        KDE, CANNOT be built or run-verified in this Linux environment --
-        do not treat any future macOS/Windows code here as tested the way
-        GNOME and KDE were until it has actually been built and run on
-        real hardware (or CI) for those platforms.
+  M6 (cont'd) -- macOS (AppKit) frontend: only frontends/macos/CMakeLists.txt
+        exists so far (the FujiNet runtime bundling logic, adapted from
+        CoCo's own). main.m, AppDelegate.h/.m, DisplayView.h/.m,
+        debugger/DebuggerWindow.h/.m, keypad/KeypadWindow.h/.m, and
+        Info.plist.in are NOT WRITTEN YET. Unlike GNOME/KDE/Windows,
+        macOS CANNOT be built or run-verified at all in this Linux
+        environment (no Wine-equivalent for Cocoa) -- any future macOS
+        code here must stay explicitly marked unverified until it has
+        actually been built and run on real macOS hardware or CI.
 
   M7 -- Packaging: icons, flatpak manifests, NSIS installer, CPack DEB/RPM/
         TGZ, CI workflows (linux/windows/macos/flatpak/release), all release

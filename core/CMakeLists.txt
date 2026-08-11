@@ -157,6 +157,17 @@ set(JZINTV_CORE_SOURCES
 )
 list(TRANSFORM JZINTV_CORE_SOURCES PREPEND "${JZ}/")
 
+# src/pads/pads_cgc.c's own pad_cgc_init() unconditionally calls
+# pad_cgc_win32_init() under `#ifdef WIN32` -- a real (non-weak) symbol
+# only pads_cgc_win32.c provides, discovered cross-compiling the Windows
+# frontend: unlike its Linux/macOS counterpart (pad_cgc_linux_init, marked
+# __attribute__((weak)) right in pads_cgc.c itself specifically so builds
+# without it still link), there is no such fallback for Win32, so this is
+# required, not optional, once WIN32 is defined.
+if(WIN32)
+  list(APPEND JZINTV_CORE_SOURCES "${JZ}/src/pads/pads_cgc_win32.c")
+endif()
+
 list(APPEND JZINTV_CORE_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/jzintv/desktop/gfx_desktop.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/jzintv/desktop/snd_desktop.c"

@@ -832,17 +832,49 @@ M6 (cont'd) -- Windows (Win32) frontend: DONE, genuinely smoke-tested (not
   [x] Windows cross-build itself reset to WITH_INTV_ROMS=OFF (the
       redistributable default) before committing.
 
-NOT STARTED:
+M6 (cont'd) -- macOS (AppKit) frontend: WRITTEN, but UNVERIFIED -- unlike
+      GNOME/KDE/Windows, macOS cannot be built or run at all in this Linux
+      environment (no Wine-equivalent for Cocoa/AppKit), so none of the
+      below has been compiled, let alone run. Do not treat this as tested
+      the way GNOME/KDE/Windows were until it has actually been built and
+      run on real macOS hardware or CI:
+  [ ] frontends/macos/{main.m,AppDelegate.h/.m,DisplayView.h/.m,
+      debugger/DebuggerWindow.h/.m,keypad/KeypadWindow.h/.m,
+      Info.plist.in}: same layout/scope as the GNOME/KDE/Windows ports
+      (CoreGraphics-drawn display letterboxed to a fixed 4:3, full
+      keyboard mapping via virtual keyCodes for arrows/numpad/modifiers
+      plus charactersIgnoringModifiers for the rest, an NSTabView
+      debugger window with CPU/STIC tabs, a keypad window with both hand
+      controllers). No Machine/Display/CPU radio menus (the Intellivision
+      has one fixed configuration, unlike CoCo/ADAM/MSX); no register/
+      memory editing or Load Symbols UI, matching GNOME/KDE/Windows'
+      scope exactly.
+  [ ] DisplayView.m uses a plain NSTimer (60Hz), not a CVDisplayLink-fed
+      phase-lock like the CoCo/ADAM ports: intvsession has no
+      notify_vsync call, matching the reasoning already established for
+      the GNOME frame-clock callback and the Windows WM_TIMER.
+  [ ] KeypadWindow.m's DiscView deliberately does NOT negate dy the way
+      the GNOME/KDE/Windows disc widgets each must -- AppKit's default
+      (non-flipped) NSView coordinate system already puts y increasing
+      upward, the same convention intv_host.h's disc_codes numbering
+      assumes, so negating here would reintroduce the exact N/S-inversion
+      bug those three ports had to fix (see their own file-header
+      comments). This is the one place the macOS port's logic correctly
+      diverges from the other three rather than transposing verbatim --
+      worth double-checking first if the disc ever misbehaves once
+      actually built.
+  [ ] DebuggerWindow.m's STIC scratch buffer is sized to the max of all
+      four intvstic_render_* outputs (STIC_SCRATCH_BYTES) from the start,
+      not just the cards sheet -- carrying forward the fix a real Wine
+      crash forced in the Windows port (frontends/windows/debugger/
+      dbg_window.c's own file comment has the full story) rather than
+      reintroducing the same undersized-buffer bug here blind.
+  [ ] frontends/macos/CMakeLists.txt (written earlier) references
+      data/icons/fujinet-go-intv.icns, which does not exist yet (M7,
+      below) -- the bundle icon will be missing until that lands, but
+      this does not block the app itself from building or running.
 
-  M6 (cont'd) -- macOS (AppKit) frontend: only frontends/macos/CMakeLists.txt
-        exists so far (the FujiNet runtime bundling logic, adapted from
-        CoCo's own). main.m, AppDelegate.h/.m, DisplayView.h/.m,
-        debugger/DebuggerWindow.h/.m, keypad/KeypadWindow.h/.m, and
-        Info.plist.in are NOT WRITTEN YET. Unlike GNOME/KDE/Windows,
-        macOS CANNOT be built or run-verified at all in this Linux
-        environment (no Wine-equivalent for Cocoa) -- any future macOS
-        code here must stay explicitly marked unverified until it has
-        actually been built and run on real macOS hardware or CI.
+NOT STARTED:
 
   M7 -- Packaging: icons, flatpak manifests, NSIS installer, CPack DEB/RPM/
         TGZ, CI workflows (linux/windows/macos/flatpak/release), all release

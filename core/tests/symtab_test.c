@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "symbols.h"
+#include "test_tmpdir.h"
 
 static int failed = 0;
 
@@ -59,7 +60,8 @@ int main(void)
      * Format confirmed against jzIntv's own loader (src/debug/debug.c):
      * "hexaddr name" per line, undefined symbols marked with a leading '?'
      * and skipped, decimal-looking addresses above $FFFF skipped too. */
-    char path[] = "/tmp/intv-symtab-test-XXXXXX";
+    char path[1024];
+    test_tmp_template(path, sizeof(path), "intv-symtab-test-");
     int fd = mkstemp(path);
     check("mkstemp", fd >= 0);
     if (fd >= 0) {

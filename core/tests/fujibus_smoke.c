@@ -16,11 +16,13 @@
 #include <unistd.h>
 
 #include "intvsession.h"
+#include "test_tmpdir.h"
 
 int main(void)
 {
-    char config_dir[] = "/tmp/intv-fujibus-cfg-XXXXXX";
-    char data_dir[]   = "/tmp/intv-fujibus-data-XXXXXX";
+    char config_dir[1024], data_dir[1024];
+    test_tmp_template(config_dir, sizeof(config_dir), "intv-fujibus-cfg-");
+    test_tmp_template(data_dir, sizeof(data_dir), "intv-fujibus-data-");
     if (!mkdtemp(config_dir) || !mkdtemp(data_dir)) {
         perror("mkdtemp");
         return 1;

@@ -47,6 +47,7 @@
 #include "intvdebug.h"
 #include "intvstic.h"
 #include "roms_embedded.h"
+#include "test_tmpdir.h"
 
 static int failed = 0;
 
@@ -66,7 +67,8 @@ int main(void)
         return 77;
     }
 
-    char rom_dir[] = "/tmp/intv-stic-test-XXXXXX";
+    char rom_dir[1024];
+    test_tmp_template(rom_dir, sizeof(rom_dir), "intv-stic-test-");
     if (!mkdtemp(rom_dir)) { perror("mkdtemp"); return 1; }
 
     intv_host_opts opts = {

@@ -47,6 +47,7 @@
 
 #include "intv_host.h"
 #include "roms_embedded.h"
+#include "test_tmpdir.h"
 
 static int check(const char *what, int got, int want)
 {
@@ -68,7 +69,8 @@ int main(void)
         return 77;
     }
 
-    char rom_dir[] = "/tmp/intv-pad-test-XXXXXX";
+    char rom_dir[1024];
+    test_tmp_template(rom_dir, sizeof(rom_dir), "intv-pad-test-");
     if (!mkdtemp(rom_dir))
     {
         perror("mkdtemp");

@@ -12,6 +12,7 @@
 #include "intv_host.h"
 #include "intvdebug.h"
 #include "roms_embedded.h"
+#include "test_tmpdir.h"
 
 static int failed = 0;
 
@@ -43,7 +44,8 @@ int main(void)
         return 77;
     }
 
-    char rom_dir[] = "/tmp/intv-debug-test-XXXXXX";
+    char rom_dir[1024];
+    test_tmp_template(rom_dir, sizeof(rom_dir), "intv-debug-test-");
     if (!mkdtemp(rom_dir)) { perror("mkdtemp"); return 1; }
 
     intv_host_opts opts = {

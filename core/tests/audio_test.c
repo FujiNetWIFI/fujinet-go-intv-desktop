@@ -23,6 +23,7 @@
 #include "intv_audio.h"
 #include "intv_host.h"
 #include "roms_embedded.h"
+#include "test_tmpdir.h"
 
 int main(void)
 {
@@ -33,7 +34,8 @@ int main(void)
         return 77;
     }
 
-    char rom_dir[] = "/tmp/intv-audio-test-XXXXXX";
+    char rom_dir[1024];
+    test_tmp_template(rom_dir, sizeof(rom_dir), "intv-audio-test-");
     if (!mkdtemp(rom_dir))
     {
         perror("mkdtemp");

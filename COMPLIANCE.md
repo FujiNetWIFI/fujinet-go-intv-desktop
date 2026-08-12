@@ -41,7 +41,10 @@ bundle, or installer to anyone else.
 
 ## FujiNet runtime
 
-The bundled FujiNet runtime (`cmake/FujiNetRuntime.cmake`, not yet
-implemented -- see the project plan's M3 milestone) is built from
+The bundled FujiNet runtime (`cmake/FujiNetRuntime.cmake`) is built from
 [fujinet-firmware](https://github.com/FujiNetWIFI/fujinet-firmware)
-(GPL-3.0-or-later), pinned by commit in `cmake/Dependencies.cmake`.
+(GPL-3.0-or-later), pinned by commit in `cmake/Dependencies.cmake`. It is
+built as a shared library and `dlopen`'d at run time by
+`core/src/fujinet_runtime.c` (`-DWITH_FUJINET=OFF` skips building it, which
+`intv_session` tolerates at link time since the dependency is purely
+run-time).

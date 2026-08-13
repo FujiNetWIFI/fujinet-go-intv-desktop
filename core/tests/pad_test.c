@@ -127,6 +127,26 @@ int main(void)
     intv_host_pad_disc(INTV_PAD_LEFT, -1);
     failed |= check("left disc centered", intv.pad0.l[15], 0);
 
+    /* ECS's second controller pair -- intv.pad1.l[]/r[], same scan codes as
+     * pad0, selected by intv_pad_side's top bit (see intv_host.h's own
+     * comment on INTV_PAD_ECS_LEFT/_RIGHT). Writable regardless of whether
+     * ECS is actually enabled this run -- nothing on the peripheral bus
+     * reads pad1 unless it is, but the injection itself doesn't gate on
+     * that, matching every other intv_host_pad_key call. */
+    intv_host_pad_key(INTV_PAD_ECS_LEFT, INTV_PAD_KEY_5, 1);
+    failed |= check("ECS-left KP5 pressed", intv.pad1.l[5], 0x42);
+    failed |= check("ECS-left KP5 does not disturb pad0",
+                    intv.pad0.l[5], 0x00);
+    intv_host_pad_key(INTV_PAD_ECS_LEFT, INTV_PAD_KEY_5, 0);
+    failed |= check("ECS-left KP5 released", intv.pad1.l[5], 0x00);
+
+    intv_host_pad_disc(INTV_PAD_ECS_RIGHT, 4);
+    failed |= check("ECS-right disc North", intv.pad1.r[15], 4);
+    failed |= check("ECS-right disc does not disturb ECS-left",
+                    intv.pad1.l[15], 0);
+    intv_host_pad_disc(INTV_PAD_ECS_RIGHT, -1);
+    failed |= check("ECS-right disc centered", intv.pad1.r[15], 0);
+
     intv_host_stop();
 
     if (failed)

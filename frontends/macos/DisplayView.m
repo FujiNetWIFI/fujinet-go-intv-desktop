@@ -171,6 +171,9 @@ enum {
     kVK_RightArrow = 0x7C,
     kVK_DownArrow = 0x7D,
     kVK_UpArrow = 0x7E,
+    kVK_Return = 0x24,
+    kVK_Delete = 0x33, /* "Backspace" on a Mac keyboard */
+    kVK_Escape = 0x35,
 };
 
 static uint32_t special_keysym(unsigned short keyCode)
@@ -198,6 +201,11 @@ static uint32_t special_keysym(unsigned short keyCode)
     case kVK_RightControl: return INTVSESSION_KEYSYM_RCTRL;
     case kVK_Option:       return INTVSESSION_KEYSYM_LALT;
     case kVK_RightOption:  return INTVSESSION_KEYSYM_RALT;
+    /* Non-printable keys the base controller map has no use for, but the
+     * ECS keyboard map (forwarded below when "keyboard_mode" is on) does. */
+    case kVK_Return: return INTVSESSION_KEYSYM_RETURN;
+    case kVK_Delete: return INTVSESSION_KEYSYM_BACKSPACE;
+    case kVK_Escape: return INTVSESSION_KEYSYM_ESCAPE;
     default:
         return 0;
     }
@@ -217,6 +225,17 @@ static uint32_t special_keysym(unsigned short keyCode)
             return; /* not a key the emulated controller has */
     }
 
+    /* "ECS Keyboard" input mode (Settings, or toggled live from there)
+     * steals the keyboard for the ECS's own keyboard instead of the hand
+     * controllers -- see intvsession_ecs_key_from_keysym's own comment on
+     * why the two can't both claim it at once. */
+    if (intvsession_get_int(_session, "keyboard_mode", 0)) {
+        intvsession_ecs_key key = intvsession_ecs_key_from_keysym(keysym);
+        if (key != INTVSESSION_ECS_KEY_NONE)
+            intvsession_ecs_key_set(_session, key, down);
+        return;
+    }
+
     m = intvsession_key_from_keysym(keysym);
     if (m.kind == INTVSESSION_MAP_KEY)
         intvsession_pad_key(_session, m.side, m.key, down);
@@ -234,6 +253,15 @@ static uint32_t special_keysym(unsigned short keyCode)
 - (void)keyUp:(NSEvent *)event
 {
     [self forwardKeyEvent:event down:0];
+}
+
+/* Losing first-responder status shouldn't leave a key stuck down in
+ * whichever matrix was active -- see intvsession_ecs_keys_clear's own
+ * comment. */
+- (BOOL)resignFirstResponder
+{
+    intvsession_ecs_keys_clear(_session);
+    return [super resignFirstResponder];
 }
 
 - (void)flagsChanged:(NSEvent *)event

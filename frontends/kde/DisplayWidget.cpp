@@ -27,6 +27,7 @@
 
 #include "DisplayWidget.h"
 
+#include <QFocusEvent>
 #include <QKeyEvent>
 #include <QPainter>
 #include <QTimer>
@@ -81,6 +82,11 @@ quint32 keysymForKey(const QKeyEvent *event)
      * also double as printable-key modifiers.
     */
     case Qt::Key_Shift: return INTVSESSION_KEYSYM_LSHIFT;
+    /* Non-printable keys the base controller map has no use for, but the
+     * ECS keyboard map (forwarded below when "keyboard_mode" is on) does. */
+    case Qt::Key_Escape:    return INTVSESSION_KEYSYM_ESCAPE;
+    case Qt::Key_Return:    return INTVSESSION_KEYSYM_RETURN;
+    case Qt::Key_Backspace: return INTVSESSION_KEYSYM_BACKSPACE;
     default:
         break;
     }
@@ -176,11 +182,30 @@ void DisplayWidget::forwardKey(const QKeyEvent *event, int down)
     if (keysym == 0)
         return;
 
+    /* "ECS Keyboard" input mode (Settings, or toggled live from there)
+     * steals the host keyboard for the ECS's own keyboard instead of the
+     * hand controllers -- see intvsession_ecs_key_from_keysym's own
+     * comment on why the two can't both claim it at once. */
+    if (intvsession_get_int(m_session, "keyboard_mode", 0)) {
+        intvsession_ecs_key key = intvsession_ecs_key_from_keysym(keysym);
+        if (key != INTVSESSION_ECS_KEY_NONE)
+            intvsession_ecs_key_set(m_session, key, down);
+        return;
+    }
+
     intvsession_key_mapping m = intvsession_key_from_keysym(keysym);
     if (m.kind == INTVSESSION_MAP_KEY)
         intvsession_pad_key(m_session, m.side, m.key, down);
     else if (m.kind == INTVSESSION_MAP_DISC)
         intvsession_pad_disc(m_session, m.side, down ? m.direction : -1);
+}
+
+void DisplayWidget::focusOutEvent(QFocusEvent *event)
+{
+    /* Losing keyboard focus shouldn't leave a key stuck down in whichever
+     * matrix was active -- see intvsession_ecs_keys_clear's own comment. */
+    intvsession_ecs_keys_clear(m_session);
+    QWidget::focusOutEvent(event);
 }
 
 void DisplayWidget::keyPressEvent(QKeyEvent *event)

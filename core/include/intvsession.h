@@ -68,11 +68,62 @@ void        intvsession_set_str(intvsession *s, const char *key,
                                 const char *value);
 void        intvsession_settings_flush(intvsession *s);
 
+/* ---- machine options --------------------------------------------------
+ * Tri-state hardware toggles, matching jzIntv's own cfg_t fields
+ * (ecs_enable/ivc_enable) one-for-one: AUTO lets jzIntv decide from
+ * cartridge metadata (its own default -- most carts want this), OFF/ON
+ * force the peripheral regardless. See core/jzintv/intv_host.h. */
+enum {
+    INTVSESSION_HW_AUTO = 0,
+    INTVSESSION_HW_OFF,
+    INTVSESSION_HW_ON,
+};
+
+enum {
+    INTVSESSION_VIDEO_NTSC = 0,
+    INTVSESSION_VIDEO_PAL,
+};
+
+/* Read by intvsession_start; filled from the settings store (keys "ecs",
+ * "ivoice", "video_standard") by intvsession_default_opts so every frontend
+ * builds the same options the same way -- see that function's own comment
+ * for the exact keys and defaults. */
+typedef struct {
+    int ecs;    /* INTVSESSION_HW_* */
+    int ivoice; /* INTVSESSION_HW_* */
+    int video;  /* INTVSESSION_VIDEO_* */
+} intvsession_start_opts;
+
+/* Fills *opts from the settings store: ecs/ivoice default to
+ * INTVSESSION_HW_AUTO (jzIntv's own cart-metadata-driven default), video
+ * defaults to INTVSESSION_VIDEO_NTSC. A frontend applying a machine-option
+ * change should re-call this (after intvsession_set_int on the relevant
+ * key) rather than hand-assemble the struct, so a new option added here
+ * only has to be read in one place. */
+void intvsession_default_opts(intvsession *s, intvsession_start_opts *opts);
+
+/* Menu/combo label tables, NULL past the end so a caller walks idx = 0..
+ * until NULL rather than hardcoding a count. */
+const char *intvsession_hw_mode_name(int idx);   /* "Auto" / "Off" / "On" */
+const char *intvsession_video_name(int idx);     /* "NTSC (60 Hz)" / "PAL (50 Hz)" */
+
+/* 1 when the ROM directory holds a 24576-byte ecs.bin -- a Settings dialog
+ * should disable the ECS option (rather than let intvsession_start refuse
+ * it) when this is 0. Deliberately separate from
+ * intvsession_has_system_roms: a missing ecs.bin must not stop the machine
+ * from booting at all for users who never turn ECS on. */
+int intvsession_has_ecs_rom(const intvsession *s);
+
 /* ---- lifecycle ------------------------------------------------------------
- * Starts the emulator thread; boots the embedded FujiNet config ROM until a
- * frontend loads a cartridge (cartridge loading is not implemented yet).
- * Returns 0 on success, -1 with intvsession_last_error() set. */
-int  intvsession_start(intvsession *s);
+ * Starts the emulator thread with the given machine options (NULL ==
+ * everything AUTO/NTSC, equivalent to intvsession_default_opts on a
+ * from-scratch settings store); boots the embedded FujiNet config ROM until
+ * a frontend loads a cartridge (cartridge loading is not implemented yet).
+ * Returns 0 on success, -1 with intvsession_last_error() set -- including
+ * when opts->ecs is forced ON without a usable ecs.bin (checked before the
+ * emulator thread starts; see intv_host_start's own comment on why this
+ * can't be left to jzIntv itself to discover). */
+int  intvsession_start(intvsession *s, const intvsession_start_opts *opts);
 void intvsession_stop(intvsession *s);
 int  intvsession_is_running(const intvsession *s);
 const char *intvsession_last_error(const intvsession *s);
@@ -90,10 +141,14 @@ int intvsession_copy_frame(intvsession *s, uint32_t *dst,
 /* ---- input -----------------------------------------------------------------
  * See core/jzintv/intv_host.h for exactly what each id writes and why this
  * is a direct pad_t.l[]/r[] injection rather than going through jzIntv's own
- * keysym/event layer. side: 0 = left controller, 1 = right. */
+ * keysym/event layer. side: 0 = left controller, 1 = right, 2/3 = the ECS's
+ * own second controller pair (meaningful only when ECS is enabled -- see
+ * intvsession_start_opts). */
 typedef enum {
     INTVSESSION_PAD_LEFT = 0,
     INTVSESSION_PAD_RIGHT = 1,
+    INTVSESSION_PAD_ECS_LEFT = 2,
+    INTVSESSION_PAD_ECS_RIGHT = 3,
 } intvsession_pad_side;
 
 typedef enum {
@@ -113,6 +168,45 @@ void intvsession_pad_key(intvsession *s, intvsession_pad_side side,
 /* direction: 0-15 clock position (0 = East, clockwise), or -1 to center. */
 void intvsession_pad_disc(intvsession *s, intvsession_pad_side side,
                           int direction);
+
+/* ---- ECS keyboard -----------------------------------------------------
+ * The ECS's own 7x8 scan-matrix keyboard, distinct from the hand
+ * controllers above -- see core/jzintv/intv_host.h's intv_ecs_key for the
+ * full key list and why chording works here (unlike the disc). Meaningful
+ * only when ECS is enabled. A frontend switching its keyboard focus away
+ * from "ECS keyboard" mode (or losing window focus) should call
+ * intvsession_ecs_keys_clear() so a key held at that moment doesn't stay
+ * stuck down in the emulated matrix. */
+typedef enum {
+    INTVSESSION_ECS_KEY_LEFT = 0, INTVSESSION_ECS_KEY_PERIOD,
+    INTVSESSION_ECS_KEY_SEMI, INTVSESSION_ECS_KEY_P, INTVSESSION_ECS_KEY_ESC,
+    INTVSESSION_ECS_KEY_0, INTVSESSION_ECS_KEY_ENTER,
+    INTVSESSION_ECS_KEY_COMMA, INTVSESSION_ECS_KEY_M, INTVSESSION_ECS_KEY_K,
+    INTVSESSION_ECS_KEY_I, INTVSESSION_ECS_KEY_9, INTVSESSION_ECS_KEY_8,
+    INTVSESSION_ECS_KEY_O, INTVSESSION_ECS_KEY_L,
+    INTVSESSION_ECS_KEY_N, INTVSESSION_ECS_KEY_B, INTVSESSION_ECS_KEY_H,
+    INTVSESSION_ECS_KEY_Y, INTVSESSION_ECS_KEY_7, INTVSESSION_ECS_KEY_6,
+    INTVSESSION_ECS_KEY_U, INTVSESSION_ECS_KEY_J,
+    INTVSESSION_ECS_KEY_V, INTVSESSION_ECS_KEY_C, INTVSESSION_ECS_KEY_F,
+    INTVSESSION_ECS_KEY_R, INTVSESSION_ECS_KEY_5, INTVSESSION_ECS_KEY_4,
+    INTVSESSION_ECS_KEY_T, INTVSESSION_ECS_KEY_G,
+    INTVSESSION_ECS_KEY_X, INTVSESSION_ECS_KEY_Z, INTVSESSION_ECS_KEY_S,
+    INTVSESSION_ECS_KEY_W, INTVSESSION_ECS_KEY_3, INTVSESSION_ECS_KEY_2,
+    INTVSESSION_ECS_KEY_E, INTVSESSION_ECS_KEY_D,
+    INTVSESSION_ECS_KEY_SPACE, INTVSESSION_ECS_KEY_DOWN,
+    INTVSESSION_ECS_KEY_UP, INTVSESSION_ECS_KEY_Q, INTVSESSION_ECS_KEY_1,
+    INTVSESSION_ECS_KEY_RIGHT, INTVSESSION_ECS_KEY_CTRL,
+    INTVSESSION_ECS_KEY_A,
+    INTVSESSION_ECS_KEY_SHIFT,
+    INTVSESSION_ECS_KEY_NONE, /* returned by intvsession_ecs_key_from_keysym
+                              * for a keysym with no ECS keyboard mapping;
+                              * not a real key -- never pass this to
+                              * intvsession_ecs_key(). */
+} intvsession_ecs_key;
+
+void intvsession_ecs_key_set(intvsession *s, intvsession_ecs_key key,
+                             int pressed);
+void intvsession_ecs_keys_clear(intvsession *s);
 
 /* ---- audio ------------------------------------------------------------
  * jzIntv's PSG mixer produces mono int16 samples (see
@@ -165,6 +259,13 @@ typedef enum {
     INTVSESSION_KEYSYM_RCTRL,
     INTVSESSION_KEYSYM_LALT,
     INTVSESSION_KEYSYM_RALT,
+    /* Non-printable keys the base controller map has no use for, but the
+     * ECS keyboard map (intvsession_ecs_key_from_keysym) does -- mapping.c's
+     * "ESCAPE"/"RETURN"/"BACKSPACE" rows. Space, being printable ASCII
+     * (0x20), needs no symbol of its own -- see that function. */
+    INTVSESSION_KEYSYM_ESCAPE,
+    INTVSESSION_KEYSYM_RETURN,
+    INTVSESSION_KEYSYM_BACKSPACE,
 } intvsession_keysym;
 
 typedef enum {
@@ -189,6 +290,16 @@ typedef struct {
  * INTVSESSION_KEYSYM_* symbols above. Case-insensitive for letters. Pure
  * function; unit-tested on its own (core/tests/keymap_test.c). */
 intvsession_key_mapping intvsession_key_from_keysym(uint32_t keysym);
+
+/* ECS keyboard equivalent of intvsession_key_from_keysym: same keysym
+ * space, but mapped from cfg_key_bind[]'s column 3 ("ECS Keyboard setup")
+ * instead of column 0, since the two modes can't both claim the host
+ * keyboard at once -- a frontend switches which of these two functions it
+ * calls based on its own "ECS keyboard focus" toggle. Returns
+ * INTVSESSION_ECS_KEY_NONE when keysym has no ECS keyboard mapping;
+ * F10/F11/F12 stay reserved for the frontends here too. Pure function;
+ * unit-tested in core/tests/keymap_test.c. */
+intvsession_ecs_key intvsession_ecs_key_from_keysym(uint32_t keysym);
 
 /* ---- FujiNet ---------------------------------------------------------
  * The runtime (libfujinet.{so,dylib}/fujinet.dll, built by

@@ -17,6 +17,7 @@ set(GNOME_SOURCES
   main.c
   window.c
   display.c
+  prefs.c
   debugger/dbg_window.c
   keypad/keypad_window.c
 )

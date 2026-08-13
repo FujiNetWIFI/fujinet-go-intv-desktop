@@ -21,6 +21,13 @@
 extern "C" {
 #endif
 
+/* Tri-state hardware toggle matching jzIntv's own cfg_t fields
+ * (ecs_enable/ivc_enable): -1 lets jzIntv decide from cartridge metadata
+ * (its own default), 0/1 force the peripheral off/on regardless. */
+#define INTV_HW_AUTO (-1)
+#define INTV_HW_OFF  0
+#define INTV_HW_ON   1
+
 typedef struct {
     const char *rom_dir;     /* Directory holding exec.bin/grom.bin --
                               * provisioned from the embedded table first if
@@ -32,6 +39,13 @@ typedef struct {
                               * intvsession.h's INTVSESSION_BOIP_PORT) so a
                               * standalone fujinet-pc on the jzIntv default
                               * is never fought over. */
+    int         ecs;          /* INTV_HW_* -- requires <rom_dir>/ecs.bin when
+                              * forced ON; see intv_host_start's own comment
+                              * on why that is checked here rather than left
+                              * to jzIntv's cfg_init (which exit()s). */
+    int         ivoice;       /* INTV_HW_* -- no ROM needed (the SP0256 mask
+                              * ROM is compiled into jzIntv itself). */
+    int         pal;          /* 0 = NTSC (default), 1 = PAL (50 Hz). */
 } intv_host_opts;
 
 /* Writes any of exec.bin/grom.bin missing from opts->rom_dir out of the
@@ -40,12 +54,20 @@ typedef struct {
  * 0 on success, -1 on a write failure. */
 int intv_host_provision_roms(const char *rom_dir);
 
+/* True iff <rom_dir>/ecs.bin exists and is exactly the 24576-byte size
+ * cfg.c's file_read_rom16(f, 12*1024, cfg->ecs_img) expects. */
+int intv_host_has_ecs_rom(const char *rom_dir);
+
 /* Starts jzintv_entry_point() on its own thread, with --fujinet always set
  * (see the file header on why: the FujiNet mailbox is inert, not fatal, with
  * nothing listening -- fn_sock.c connects out non-blockingly) and no ROM
  * argument, so the machine boots the embedded FujiNet config ROM until a
  * frontend loads a cartridge. Returns 0 on success, -1 if a session is
- * already running or the ROM directory is missing exec.bin/grom.bin. */
+ * already running, the ROM directory is missing exec.bin/grom.bin, or
+ * opts->ecs is forced ON without a valid ecs.bin present (checked here,
+ * rather than letting jzIntv's own cfg_init() discover it and exit(1) the
+ * whole process out from under the emulator thread -- see cfg.c's ECS ROM
+ * load, which is fatal on a user-forced --ecs=1 with no image). */
 int intv_host_start(const intv_host_opts *opts);
 
 /* Requests the emulator thread stop (intv.do_exit = 1) and joins it. Safe to
@@ -65,10 +87,20 @@ int intv_host_is_running(void);
  *
  * INTV_PAD_KEY_* below is both the pad_t.l[]/r[] array index AND carries the
  * scan-code value intv_host_pad_key writes -- see the .c file's key_codes
- * table, copied verbatim from mapping.c's PD0L_KP and PD0L_A entries. */
+ * table, copied verbatim from mapping.c's PD0L_KP and PD0L_A entries.
+ *
+ * INTV_PAD_ECS_LEFT/_RIGHT address the ECS's own second controller pair
+ * (intv.pad1.l[]/r[], mapping.c's PD1L_ and PD1R_ prefixed entries --
+ * registered at 0x00F0 only when ECS is enabled, see cfg.c's
+ * pad_init(&cfg->pad1, ...)).
+ * The scan codes are identical to the base pair's, so key_codes/key_index
+ * are shared; only the target pad_t (pad0 vs pad1) differs, selected by the
+ * enum's top bit. */
 typedef enum {
     INTV_PAD_LEFT = 0,
     INTV_PAD_RIGHT = 1,
+    INTV_PAD_ECS_LEFT = 2,
+    INTV_PAD_ECS_RIGHT = 3,
 } intv_pad_side;
 
 typedef enum {
@@ -100,6 +132,43 @@ void intv_host_pad_key(intv_pad_side side, intv_pad_key key, int pressed);
  * clickable disc widget has exactly one position active at a time, never a
  * combination of separately-held keys. */
 void intv_host_pad_disc(intv_pad_side side, int direction);
+
+/* ---- ECS keyboard injection ------------------------------------------------
+ * The ECS's own keyboard is a 7x8 scan matrix read through intv.pad1.k[0..6]
+ * (pad_t.k[], distinct from the disc/keypad's l[]/r[] arrays), each row a
+ * bitmask of which of that row's keys are currently down -- see mapping.c's
+ * "KEYB_*" entries (column 3 of cfg_key_bind[], "ECS Keyboard setup"), which
+ * this table is transposed from entry-by-entry. Unlike the disc (one
+ * position at a time) these OR/AND their own bit in, so chords (e.g. SHIFT
+ * held with a letter) work exactly as upstream's keyboard event path
+ * produces them. Meaningful only when ECS is enabled; harmless otherwise
+ * (nothing reads intv.pad1 without ECS registered on the bus). */
+typedef enum {
+    INTV_ECS_KEY_LEFT = 0, INTV_ECS_KEY_PERIOD, INTV_ECS_KEY_SEMI,
+    INTV_ECS_KEY_P, INTV_ECS_KEY_ESC, INTV_ECS_KEY_0, INTV_ECS_KEY_ENTER,
+    INTV_ECS_KEY_COMMA, INTV_ECS_KEY_M, INTV_ECS_KEY_K, INTV_ECS_KEY_I,
+    INTV_ECS_KEY_9, INTV_ECS_KEY_8, INTV_ECS_KEY_O, INTV_ECS_KEY_L,
+    INTV_ECS_KEY_N, INTV_ECS_KEY_B, INTV_ECS_KEY_H, INTV_ECS_KEY_Y,
+    INTV_ECS_KEY_7, INTV_ECS_KEY_6, INTV_ECS_KEY_U, INTV_ECS_KEY_J,
+    INTV_ECS_KEY_V, INTV_ECS_KEY_C, INTV_ECS_KEY_F, INTV_ECS_KEY_R,
+    INTV_ECS_KEY_5, INTV_ECS_KEY_4, INTV_ECS_KEY_T, INTV_ECS_KEY_G,
+    INTV_ECS_KEY_X, INTV_ECS_KEY_Z, INTV_ECS_KEY_S, INTV_ECS_KEY_W,
+    INTV_ECS_KEY_3, INTV_ECS_KEY_2, INTV_ECS_KEY_E, INTV_ECS_KEY_D,
+    INTV_ECS_KEY_SPACE, INTV_ECS_KEY_DOWN, INTV_ECS_KEY_UP, INTV_ECS_KEY_Q,
+    INTV_ECS_KEY_1, INTV_ECS_KEY_RIGHT, INTV_ECS_KEY_CTRL, INTV_ECS_KEY_A,
+    INTV_ECS_KEY_SHIFT,
+    INTV_ECS_KEY_COUNT
+} intv_ecs_key;
+
+/* Sets/clears one ECS keyboard matrix bit. Safe whether or not the emulator
+ * is running or ECS is enabled, same as intv_host_pad_key. */
+void intv_host_ecs_key(intv_ecs_key key, int pressed);
+
+/* Releases every ECS keyboard key at once (all 7 of intv.pad1.k[]'s rows
+ * zeroed) -- for a frontend to call on focus loss or when leaving ECS
+ * keyboard input mode, so a key held down when focus moved elsewhere doesn't
+ * stay stuck down in the emulated matrix. */
+void intv_host_ecs_keys_clear(void);
 
 /* Writes PSG0 (the base unit's AY-3-8914) registers intended to produce an
  * audible tone on channel A: register 0 (tone A period, low byte), register

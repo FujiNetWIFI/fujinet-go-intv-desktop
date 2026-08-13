@@ -28,6 +28,7 @@ add_executable(fujinet-go-intv-kde
   MainWindow.cpp
   DisplayWidget.cpp
   FujiNetWindows.cpp
+  SettingsDialog.cpp
   debugger/DebuggerWindow.cpp
   keypad/KeypadWindow.cpp
 )

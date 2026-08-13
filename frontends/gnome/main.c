@@ -52,7 +52,9 @@ static void on_activate(AdwApplication *app, gpointer user_data)
             g_application_quit(G_APPLICATION(app));
             return;
         }
-        if (intvsession_start(g_session) != 0)
+        intvsession_start_opts opts;
+        intvsession_default_opts(g_session, &opts);
+        if (intvsession_start(g_session, &opts) != 0)
             g_printerr("session start: %s\n",
                        intvsession_last_error(g_session));
     }

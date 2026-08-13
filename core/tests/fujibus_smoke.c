@@ -42,7 +42,7 @@ int main(void)
         return 77;
     }
 
-    if (intvsession_start(s) != 0) {
+    if (intvsession_start(s, NULL) != 0) {
         fprintf(stderr, "fujibus_smoke: intvsession_start failed: %s\n",
                 intvsession_last_error(s));
         intvsession_free(s);

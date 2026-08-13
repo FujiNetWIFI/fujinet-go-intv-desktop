@@ -951,6 +951,101 @@ M7 -- Packaging: DONE.
       artifact -- CI's ubuntu-latest runner has it, so the shipped
       packages will carry real dependency lists).
 
+M11 -- ECS, Intellivoice, NTSC/PAL, and a Settings dialog for all four
+frontends -- requested 2026-08-12:
+
+  [x] tools/jzintv/roms/ecs.bin (24576 bytes, from the same jzIntv
+      20200712 source release exec.bin/grom.bin came from) added
+      alongside them; tools/jzintv/embed-roms.py's EXPECTED table and
+      core/CMakeLists.txt's INTV_ROM_DIR_SRC list both gained the third
+      entry. core/tests/no_embedded_roms.py picks it up automatically (it
+      scans every .bin in the ROM directory, not a fixed list) -- no
+      script change needed there. COMPLIANCE.md's EXEC/GROM section
+      renamed and extended to cover ECS.
+  [x] core/jzintv/intv_host.{h,c}: intv_host_opts gained ecs/ivoice/pal
+      fields (INTV_HW_AUTO/OFF/ON tri-state for the first two, matching
+      jzIntv's own ecs_enable/ivc_enable convention); intv_host_start's
+      previously-fixed 5-element argv became a counted push_arg()
+      appender emitting --ecs=/--voice=/--pal only when not AUTO/off. A
+      user-forced ECS=On is pre-checked against a real 24576-byte
+      <rom_dir>/ecs.bin (intv_host_has_ecs_rom) BEFORE any argv is built,
+      refusing with -1 rather than letting jzIntv's own cfg_init() discover
+      a missing image and exit(1) the whole process out from under the
+      emulator thread -- confirmed this matters: an early version of
+      hwopts_test (below) hit exactly this failure mode until
+      core/CMakeLists.txt's ROM list actually included ecs.bin.
+  [x] intv_pad_side widened with INTV_PAD_ECS_LEFT/_RIGHT (top bit selects
+      intv.pad1 vs intv.pad0, same scan codes) -- intv_host_pad_key/_disc
+      needed only an AND-with-2/AND-with-1 change, no new functions, so
+      every existing 0/1 caller (all four keypad windows, pad_test.c) kept
+      working unmodified. New intv_host_ecs_key/_ecs_keys_clear inject
+      directly into intv.pad1.k[0..6]'s scan matrix, transposed
+      entry-by-entry from the staged tree's cfg/mapping.c "KEYB_*" table
+      (48 base keys + Shift/Ctrl/Esc; the upstream "<<8" shifted-symbol
+      convenience entries -- KEYB_MINUS/EQUAL/QUOTE/etc -- deliberately
+      NOT carried over, since real shifted characters work by holding
+      Shift with the base key, exactly like the real hardware).
+  [x] core/include/intvsession.h + core/src/session.c: intvsession_start
+      now takes an intvsession_start_opts * (NULL = everything AUTO/NTSC);
+      intvsession_default_opts reads it from the settings store ("ecs",
+      "ivoice", "video_standard" keys); intvsession_has_ecs_rom mirrors
+      but stays separate from intvsession_has_system_roms (a missing
+      ecs.bin must not stop the machine from booting at all).
+      intvsession_hw_mode_name/video_name are NULL-terminated label tables
+      every frontend's Settings dialog walks rather than hardcoding
+      option strings four times over. intvsession_pad_side widened to
+      match intv_pad_side; intvsession_ecs_key_set/_ecs_keys_clear wrap
+      the intv_host_ecs_key calls. Breaking change to intvsession_start's
+      signature -- every one of the four frontends' call sites updated in
+      the same pass (grep confirmed no stragglers).
+  [x] core/src/intv_keymap.c: intvsession_ecs_key_from_keysym, a second
+      pure function mirroring intvsession_key_from_keysym but sourced from
+      cfg_key_bind[]'s column 3 ("ECS Keyboard setup") instead of column
+      0. Needed three new non-printable keysym symbols
+      (INTVSESSION_KEYSYM_ESCAPE/_RETURN/_BACKSPACE) the base map never
+      needed. A session-wide "keyboard_mode" setting (0 = hand
+      controllers, 1 = ECS keyboard) picks which of the two functions a
+      frontend's key handler calls, since the host keyboard can't drive
+      both at once.
+  [x] core/src/gamepad_sdl.c: the hardcoded 2-side poll/dispatch loops
+      became NUM_SIDES (4) -- pads 3/4 auto-assign to the ECS pair the
+      same way pads 1/2 already assign to the base pair. No ECS-enabled
+      check needed: driving intv.pad1 when ECS is off is harmless (nothing
+      reads it off the peripheral bus).
+  [x] All four frontends: a Settings/Preferences dialog (GNOME:
+      AdwPreferencesDialog in a new prefs.c; KDE: a new SettingsDialog
+      QDialog; macOS: inline in AppDelegate.m, Cmd-, in the app menu;
+      Windows: inline WNDCLASSA in main.c, new IDM_SETTINGS/IDC_SET_*
+      ids) -- ECS/Intellivoice/Video Standard apply by restarting the
+      session when the dialog closes (each frontend already had, or
+      gained, its own restart_session/-restartSession/
+      intv_window_restart_session helper); the ECS Keyboard toggle applies
+      live. Each frontend's key-forward path also gained the
+      keyboard_mode branch and a focus-loss handler
+      (GtkEventControllerFocus / QWidget::focusOutEvent /
+      -resignFirstResponder / WM_KILLFOCUS) calling
+      intvsession_ecs_keys_clear so a key held at the moment focus moves
+      away doesn't stay stuck in the emulated matrix.
+  [x] New tests: core/tests/hwopts_test.c (white-box cfg_t intv.ecs_enable/
+      ivc_enable/pal_mode/stic.pal/speed.periph.min_tick assertions per
+      option, one intv_host_start/stop cycle per case) and
+      core/tests/ecs_key_test.c (intv_host_ecs_key bit-exact + chording +
+      clear-all). Extended pad_test.c (ECS pair injection doesn't disturb
+      pad0), session_test.c (settings round-trip + intvsession_default_opts
+      + the forced-ECS-with-no-ROM refusal path), keymap_test.c (ECS
+      keysym mapping), and gamepad_test.c (4-side intv_pad_for_port
+      auto-assignment). VERIFIED: full ctest (14 suites, up from 12) green
+      in both WITH_INTV_ROMS=ON and =OFF configs.
+  [x] VERIFIED end to end: GNOME and KDE built and ctest-passed natively;
+      Windows cross-built with mingw-w64 (build-win/) and ctest-passed
+      under Wine (WINEPATH pointed at the mingw/SDL3 runtime DLLs). macOS
+      is source-complete (AppDelegate.m Settings window, DisplayView.m ECS
+      routing) but, as with the rest of that frontend, NOT built or run in
+      this environment -- see README's own macOS caveat; first real
+      compile will be macOS CI.
+  [x] README.md's frontends paragraph and ctest suite count (12 -> 14)
+      updated; COMPLIANCE.md's EXEC/GROM section extended to EXEC/GROM/ECS.
+
 NOT STARTED:
 
   Pushing to https://github.com/FujiNetWIFI/fujinet-go-intv-desktop,

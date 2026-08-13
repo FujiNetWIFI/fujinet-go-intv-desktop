@@ -32,7 +32,9 @@ int main(int argc, const char *argv[])
             fprintf(stderr, "fatal: could not create the session\n");
             return 1;
         }
-        if (intvsession_start(session) != 0)
+        intvsession_start_opts opts;
+        intvsession_default_opts(session, &opts);
+        if (intvsession_start(session, &opts) != 0)
             fprintf(stderr, "session start: %s\n",
                     intvsession_last_error(session));
 

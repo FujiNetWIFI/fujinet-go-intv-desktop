@@ -28,7 +28,7 @@ ctest --test-dir build --output-on-failure
 
 By default this configures `FRONTEND=all` (whichever of GNOME/KDE it can
 find on Linux, or the native frontend on Windows/macOS), `WITH_INTV_ROMS=ON`
-(embeds Mattel's EXEC/GROM firmware for a zero-setup local build -- **not**
+(embeds Mattel's EXEC/GROM/ECS firmware for a zero-setup local build -- **not**
 for redistribution, see `COMPLIANCE.md`), and `WITH_WEBVIEW=ON` (embeds the
 FujiNet web UI via WebKitGTK/QtWebEngine).
 
@@ -43,11 +43,12 @@ cmake -B build -DFRONTEND=none -DWITH_INTV_ROMS=OFF
 cmake -B build -DFRONTEND=gnome   # or kde, macos, windows
 ```
 
-`ctest` runs 12 suites covering the headless jzIntv core, ROM embedding, the
-frame/audio publish contract, pad and keyboard input mapping, the public
-session API, the debugger's symbol table and STIC views, and (when
-`WITH_INTV_ROMS=OFF`) that no Mattel firmware bytes ended up in the shipped
-binary.
+`ctest` runs 14 suites covering the headless jzIntv core, ROM embedding, the
+frame/audio publish contract, pad and keyboard input mapping (including the
+ECS keyboard/second controller pair and the ECS/Intellivoice/PAL machine
+options), the public session API, the debugger's symbol table and STIC
+views, and (when `WITH_INTV_ROMS=OFF`) that no Mattel firmware bytes ended up
+in the shipped binary.
 
 Set `INTV_OPEN_DEBUGGER=1` and/or `INTV_OPEN_KEYPAD=1` in the environment
 before launching a built frontend to have it open those windows on startup.
@@ -62,12 +63,19 @@ before launching a built frontend to have it open those windows on startup.
   (`core/debugger/`), and `core/tests/`.
 - `frontends/{gnome,kde,macos,windows}/` -- one native UI per platform, each
   wrapping the same `core/` library: fixed 4:3 display, a debugger window
-  (BACKTAB/MOB grid/GRAM-GROM sheet/palette), and a clickable keypad window
-  for both hand controllers. No per-machine configuration UI -- the
-  Intellivision has one fixed hardware configuration, unlike the CoCo/ADAM/
-  MSX ports in this family.
+  (BACKTAB/MOB grid/GRAM-GROM sheet/palette), a clickable keypad window for
+  both hand controllers, and a Settings dialog for the three machine
+  options -- ECS (the Entertainment Computer System: a second controller
+  pair, its own keyboard, and extra sound), Intellivoice (speech synthesis),
+  and NTSC/PAL video standard. ECS and Intellivoice are tri-state
+  (Auto/Off/On, matching jzIntv's own cart-metadata-driven default);
+  changing any of the three restarts the emulator to apply. The ECS
+  keyboard has its own input-mode toggle (in Settings, or live from a
+  frontend's View menu) since the host keyboard can't drive both the ECS
+  keyboard and the hand controllers at once. ECS is only selectable once an
+  `ecs.bin` has been embedded or imported -- see `COMPLIANCE.md`.
 - `tools/jzintv/` -- the jzIntv source patch, staging/patch scripts, and the
-  Mattel EXEC/GROM images used for `WITH_INTV_ROMS=ON` builds.
+  Mattel EXEC/GROM/ECS images used for `WITH_INTV_ROMS=ON` builds.
 - `tools/icons/` -- icon rendering (`make-icons.py`) from `data/icons/src/`
   into every installed size plus `.icns`/`.ico`.
 - `build-aux/` -- flatpak manifests (GNOME + KDE) and the Windows NSIS

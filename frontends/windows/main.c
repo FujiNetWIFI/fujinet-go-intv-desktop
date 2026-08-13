@@ -140,9 +140,12 @@ static uint32_t special_keysym(WPARAM vk)
     case VK_LMENU:    return INTVSESSION_KEYSYM_LALT;
     case VK_RMENU:    return INTVSESSION_KEYSYM_RALT;
     /* VK_RETURN doubles as the numpad Enter key when the extended-key bit
-     * is set (checked by the caller via lParam), otherwise it is the main
-     * Enter and falls through to base_char's own '\r'-less printable path
-     * -- so it is deliberately NOT resolved here; see on_key. */
+     * is set (checked by the caller via lParam), otherwise it resolves to
+     * INTVSESSION_KEYSYM_RETURN in on_key itself, not here (this table has
+     * no lParam to check). Non-printable keys the base controller map has
+     * no use for, but the ECS keyboard map (on_key's own ECS branch) does. */
+    case VK_ESCAPE: return INTVSESSION_KEYSYM_ESCAPE;
+    case VK_BACK:   return INTVSESSION_KEYSYM_BACKSPACE;
     default:
         return 0;
     }
@@ -215,17 +218,31 @@ static void on_key(HWND hwnd, WPARAM vk, LPARAM lp, int down)
 
     rvk = resolve_side(vk, lp);
     /* Numpad Enter reports as VK_RETURN with the extended-key bit set;
-     * plain Enter does not carry a keypad binding in intv_keymap.c at all
-     * (jzIntv's own mapping.c has no ENTER-key binding outside the
-     * numpad), so only the extended form maps to anything. */
+     * plain Enter has no keypad binding in intv_keymap.c's base controller
+     * map (jzIntv's own mapping.c has no ENTER-key binding outside the
+     * numpad), but the ECS keyboard map below does want it, hence
+     * INTVSESSION_KEYSYM_RETURN rather than dropping it outright. */
     if (rvk == VK_RETURN && (lp & 0x01000000))
         keysym = INTVSESSION_KEYSYM_KP_ENTER;
+    else if (rvk == VK_RETURN)
+        keysym = INTVSESSION_KEYSYM_RETURN;
     else
         keysym = special_keysym(rvk);
     if (!keysym) {
         keysym = base_char(rvk);
         if (!keysym)
             return; /* not a key the emulated controller has */
+    }
+
+    /* "ECS Keyboard" input mode (Settings, or toggled live from there)
+     * steals the keyboard for the ECS's own keyboard instead of the hand
+     * controllers -- see intvsession_ecs_key_from_keysym's own comment on
+     * why the two can't both claim it at once. */
+    if (intvsession_get_int(g_session, "keyboard_mode", 0)) {
+        intvsession_ecs_key key = intvsession_ecs_key_from_keysym(keysym);
+        if (key != INTVSESSION_ECS_KEY_NONE)
+            intvsession_ecs_key_set(g_session, key, down);
+        return;
     }
 
     m = intvsession_key_from_keysym(keysym);
@@ -310,6 +327,206 @@ static void open_keypad(void)
     intv_keypad_window_toggle(g_hwnd, g_session);
 }
 
+/* Stops and restarts the session with intvsession_default_opts() re-read
+ * from the settings store -- the "apply" side of a Settings dialog change
+ * to ECS/Intellivoice/video standard, matching the GNOME/KDE frontends'
+ * own restart helpers. */
+static void restart_session(void)
+{
+    intvsession_start_opts opts;
+    intvsession_stop(g_session);
+    intvsession_default_opts(g_session, &opts);
+    if (intvsession_start(g_session, &opts) != 0)
+        MessageBoxA(g_hwnd, intvsession_last_error(g_session),
+                    "FujiNet Go Intv", MB_ICONWARNING);
+}
+
+/* ---- settings --------------------------------------------------------------
+ * A registered WNDCLASSA + programmatically created child controls (combo
+ * boxes for the tri-state ECS/Intellivoice options and the video standard,
+ * a checkbox for the ECS keyboard input mode) -- not a DIALOGEX resource
+ * template, matching every other secondary window in this frontend (the
+ * keypad and debugger windows). Key/default list matches the GNOME/KDE
+ * frontends' own settings dialogs (frontends/gnome/prefs.c's header is the
+ * canonical reference):
+ *   "ecs"/"ivoice"    INTVSESSION_HW_* (default AUTO)     -- restart to apply
+ *   "video_standard"  INTVSESSION_VIDEO_* (default NTSC)  -- restart to apply
+ *   "keyboard_mode"   0 = hand controllers, 1 = ECS keyboard -- applies live
+ */
+
+static HWND g_settings_window;
+static int g_settings_dirty;
+
+static void fill_combo(HWND combo, const char *(*name_fn)(int), int cur)
+{
+    int i;
+    for (i = 0; name_fn(i); i++)
+        SendMessageA(combo, CB_ADDSTRING, 0, (LPARAM)name_fn(i));
+    SendMessageA(combo, CB_SETCURSEL, (WPARAM)cur, 0);
+}
+
+static void settings_hw_combo_changed(int ctrl_id, const char *key)
+{
+    int sel = (int)SendMessageA(GetDlgItem(g_settings_window, ctrl_id),
+                                CB_GETCURSEL, 0, 0);
+    if (intvsession_get_int(g_session, key, INTVSESSION_HW_AUTO) == sel)
+        return;
+    intvsession_set_int(g_session, key, sel);
+    g_settings_dirty = 1;
+}
+
+static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp,
+                                      LPARAM lp)
+{
+    switch (msg) {
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case IDC_SET_ECS:
+            if (HIWORD(wp) == CBN_SELCHANGE)
+                settings_hw_combo_changed(IDC_SET_ECS, "ecs");
+            return 0;
+        case IDC_SET_IVOICE:
+            if (HIWORD(wp) == CBN_SELCHANGE)
+                settings_hw_combo_changed(IDC_SET_IVOICE, "ivoice");
+            return 0;
+        case IDC_SET_VIDEO:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                int sel = (int)SendMessageA(GetDlgItem(hwnd, IDC_SET_VIDEO),
+                                            CB_GETCURSEL, 0, 0);
+                if (intvsession_get_int(g_session, "video_standard",
+                                        INTVSESSION_VIDEO_NTSC) != sel) {
+                    intvsession_set_int(g_session, "video_standard", sel);
+                    g_settings_dirty = 1;
+                }
+            }
+            return 0;
+        case IDC_SET_ECS_KEYBOARD: {
+            int on = SendMessageA(GetDlgItem(hwnd, IDC_SET_ECS_KEYBOARD),
+                                  BM_GETCHECK, 0, 0) == BST_CHECKED;
+            if (intvsession_get_int(g_session, "keyboard_mode", 0) !=
+                (on ? 1 : 0)) {
+                intvsession_set_int(g_session, "keyboard_mode", on ? 1 : 0);
+                if (!on)
+                    intvsession_ecs_keys_clear(g_session);
+            }
+            return 0;
+        }
+        default:
+            break;
+        }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        g_settings_window = NULL;
+        if (g_settings_dirty) {
+            g_settings_dirty = 0;
+            restart_session();
+        }
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static void show_settings(HINSTANCE inst)
+{
+    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HWND combo, check, note;
+    int y = 16;
+    int have_ecs_rom;
+
+    if (g_settings_window) {
+        SetForegroundWindow(g_settings_window);
+        return;
+    }
+    {
+        static int registered;
+        if (!registered) {
+            WNDCLASSA wc;
+            memset(&wc, 0, sizeof(wc));
+            wc.lpfnWndProc = settings_proc;
+            wc.hInstance = inst;
+            wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+            wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+            wc.lpszClassName = "IntvSettingsWindow";
+            RegisterClassA(&wc);
+            registered = 1;
+        }
+    }
+    g_settings_window = CreateWindowA(
+        "IntvSettingsWindow", "Settings",
+        WS_OVERLAPPEDWINDOW & ~(WS_MAXIMIZEBOX | WS_THICKFRAME),
+        CW_USEDEFAULT, CW_USEDEFAULT, 400, 300, NULL, NULL, inst, NULL);
+
+    have_ecs_rom = intvsession_has_ecs_rom(g_session);
+    CreateWindowExA(0, "STATIC", "ECS:", WS_CHILD | WS_VISIBLE, 16, y, 120,
+                    20, g_settings_window, NULL, inst, NULL);
+    combo = CreateWindowExA(
+        0, "COMBOBOX", "", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST |
+                              WS_VSCROLL | (have_ecs_rom ? 0 : WS_DISABLED),
+        140, y - 2, 220, 200, g_settings_window,
+        (HMENU)(INT_PTR)IDC_SET_ECS, inst, NULL);
+    fill_combo(combo, intvsession_hw_mode_name,
+              intvsession_get_int(g_session, "ecs", INTVSESSION_HW_AUTO));
+    SendMessageA(combo, WM_SETFONT, (WPARAM)font, TRUE);
+    y += 28;
+    if (!have_ecs_rom) {
+        CreateWindowExA(0, "STATIC",
+                        "ecs.bin not found in the ROM directory",
+                        WS_CHILD | WS_VISIBLE, 140, y, 240, 18,
+                        g_settings_window, NULL, inst, NULL);
+        y += 20;
+    }
+
+    CreateWindowExA(0, "STATIC", "Intellivoice:", WS_CHILD | WS_VISIBLE, 16,
+                    y, 120, 20, g_settings_window, NULL, inst, NULL);
+    combo = CreateWindowExA(
+        0, "COMBOBOX", "",
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 140, y - 2,
+        220, 200, g_settings_window, (HMENU)(INT_PTR)IDC_SET_IVOICE, inst,
+        NULL);
+    fill_combo(combo, intvsession_hw_mode_name,
+              intvsession_get_int(g_session, "ivoice", INTVSESSION_HW_AUTO));
+    SendMessageA(combo, WM_SETFONT, (WPARAM)font, TRUE);
+    y += 32;
+
+    CreateWindowExA(0, "STATIC", "Video Standard:", WS_CHILD | WS_VISIBLE,
+                    16, y, 120, 20, g_settings_window, NULL, inst, NULL);
+    combo = CreateWindowExA(
+        0, "COMBOBOX", "",
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 140, y - 2,
+        220, 200, g_settings_window, (HMENU)(INT_PTR)IDC_SET_VIDEO, inst,
+        NULL);
+    fill_combo(combo, intvsession_video_name,
+              intvsession_get_int(g_session, "video_standard",
+                                  INTVSESSION_VIDEO_NTSC));
+    SendMessageA(combo, WM_SETFONT, (WPARAM)font, TRUE);
+    y += 36;
+
+    check = CreateWindowExA(
+        0, "BUTTON", "ECS Keyboard (types on the ECS instead of the hand controllers)",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 16, y, 360, 22,
+        g_settings_window, (HMENU)(INT_PTR)IDC_SET_ECS_KEYBOARD, inst, NULL);
+    SendMessageA(check, BM_SETCHECK,
+                intvsession_get_int(g_session, "keyboard_mode", 0)
+                    ? BST_CHECKED
+                    : BST_UNCHECKED,
+                0);
+    SendMessageA(check, WM_SETFONT, (WPARAM)font, TRUE);
+    y += 32;
+
+    note = CreateWindowExA(
+        0, "STATIC",
+        "ECS/Intellivoice/Video Standard apply when this window is closed "
+        "(the session restarts). ECS Keyboard applies immediately.",
+        WS_CHILD | WS_VISIBLE, 16, y, 360, 40, g_settings_window, NULL, inst,
+        NULL);
+    SendMessageA(note, WM_SETFONT, (WPARAM)font, TRUE);
+
+    ShowWindow(g_settings_window, SW_SHOW);
+}
+
 /* ---- fullscreen ---------------------------------------------------------------- */
 
 static void toggle_fullscreen(HWND hwnd)
@@ -349,6 +566,7 @@ static HMENU build_menu(void)
     HMENU bar = CreateMenu();
     HMENU fujinet = CreatePopupMenu();
     HMENU view = CreatePopupMenu();
+    HMENU settings = CreatePopupMenu();
     HMENU help = CreatePopupMenu();
 
     AppendMenuA(fujinet, MF_STRING, IDM_FUJINET_CONFIG, "Configuration...");
@@ -359,6 +577,9 @@ static HMENU build_menu(void)
     AppendMenuA(view, MF_STRING, IDM_FULLSCREEN, "Fullscreen\tF11");
     AppendMenuA(view, MF_STRING, IDM_DEBUGGER, "Debugger\tF12");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)view, "&View");
+
+    AppendMenuA(settings, MF_STRING, IDM_SETTINGS, "Settings...");
+    AppendMenuA(bar, MF_POPUP, (UINT_PTR)settings, "&Settings");
 
     AppendMenuA(help, MF_STRING, IDM_ABOUT, "About FujiNet Go Intv");
     AppendMenuA(help, MF_SEPARATOR, 0, NULL);
@@ -399,6 +620,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (wp == VK_F10)
             break;
         return 0;
+    case WM_KILLFOCUS:
+        /* Losing keyboard focus shouldn't leave a key stuck down in
+         * whichever matrix was active -- see intvsession_ecs_keys_clear's
+         * own comment. */
+        intvsession_ecs_keys_clear(g_session);
+        break;
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case IDM_KEYPAD:         open_keypad(); break;
@@ -408,6 +635,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             break;
         case IDM_FULLSCREEN: toggle_fullscreen(hwnd); break;
         case IDM_DEBUGGER:   open_debugger(); break;
+        case IDM_SETTINGS:
+            show_settings((HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE));
+            break;
         case IDM_ABOUT:
             MessageBoxA(hwnd,
                         "FujiNet Go Intv\n"
@@ -443,9 +673,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
                     MB_ICONERROR);
         return 1;
     }
-    if (intvsession_start(g_session) != 0)
-        MessageBoxA(NULL, intvsession_last_error(g_session), "FujiNet Go Intv",
-                    MB_ICONWARNING);
+    {
+        intvsession_start_opts opts;
+        intvsession_default_opts(g_session, &opts);
+        if (intvsession_start(g_session, &opts) != 0)
+            MessageBoxA(NULL, intvsession_last_error(g_session),
+                       "FujiNet Go Intv", MB_ICONWARNING);
+    }
 
     memset(&wc, 0, sizeof(wc));
     wc.cbSize = sizeof(wc);

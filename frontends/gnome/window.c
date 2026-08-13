@@ -17,6 +17,7 @@
 #include "display.h"
 #include "keypad/keypad_window.h"
 #include "keysym_map.h"
+#include "prefs.h"
 
 struct _IntvWindow {
     AdwApplicationWindow parent_instance;
@@ -33,6 +34,15 @@ void intv_window_toast(IntvWindow *self, const char *message)
     adw_toast_overlay_add_toast(self->toasts, adw_toast_new(message));
 }
 
+void intv_window_restart_session(IntvWindow *self)
+{
+    intvsession_start_opts opts;
+    intvsession_stop(self->session);
+    intvsession_default_opts(self->session, &opts);
+    if (intvsession_start(self->session, &opts) != 0)
+        intv_window_toast(self, intvsession_last_error(self->session));
+}
+
 /* ---- keyboard capture ---------------------------------------------------
  * Everything goes to the machine except F9 (keypad window), F11
  * (fullscreen) and F12 (debugger). Both press and release are forwarded:
@@ -43,9 +53,21 @@ void intv_window_toast(IntvWindow *self, const char *message)
 static gboolean forward_key(IntvWindow *self, guint keyval,
                             GdkModifierType state, int down)
 {
-    intvsession_key_mapping m =
-        intvsession_key_from_keysym(intv_keysym_from_gdk(keyval));
+    uint32_t keysym = intv_keysym_from_gdk(keyval);
     (void)state;
+
+    /* "ECS Keyboard" input mode (Preferences -> Input, or toggled live from
+     * there) steals the host keyboard for the ECS's own keyboard instead of
+     * the hand controllers -- the two can't both claim it at once. See
+     * intvsession_ecs_key_from_keysym's own comment. */
+    if (intvsession_get_int(self->session, "keyboard_mode", 0)) {
+        intvsession_ecs_key key = intvsession_ecs_key_from_keysym(keysym);
+        if (key != INTVSESSION_ECS_KEY_NONE)
+            intvsession_ecs_key_set(self->session, key, down);
+        return TRUE;
+    }
+
+    intvsession_key_mapping m = intvsession_key_from_keysym(keysym);
     if (m.kind == INTVSESSION_MAP_KEY)
         intvsession_pad_key(self->session, m.side, m.key, down);
     else if (m.kind == INTVSESSION_MAP_DISC)
@@ -91,6 +113,17 @@ static void on_key_released(GtkEventControllerKey *controller, guint keyval,
     if (keyval == GDK_KEY_F9 || keyval == GDK_KEY_F11 || keyval == GDK_KEY_F12)
         return;
     forward_key(self, keyval, state, 0);
+}
+
+/* Losing keyboard focus (alt-tab, another window raised) shouldn't leave a
+ * key stuck down in whichever matrix was active -- see
+ * intvsession_ecs_keys_clear's own comment. */
+static void on_focus_leave(GtkEventControllerFocus *controller,
+                           gpointer user_data)
+{
+    IntvWindow *self = INTV_WINDOW(user_data);
+    (void)controller;
+    intvsession_ecs_keys_clear(self->session);
 }
 
 /* ---- actions ------------------------------------------------------------ */
@@ -156,6 +189,15 @@ static void action_debugger(GSimpleAction *action, GVariant *param,
     intv_debugger_show(GTK_WINDOW(self), self->session);
 }
 
+static void action_preferences(GSimpleAction *action, GVariant *param,
+                               gpointer user_data)
+{
+    IntvWindow *self = INTV_WINDOW(user_data);
+    (void)action;
+    (void)param;
+    intv_prefs_show(self, self->session);
+}
+
 static void action_about(GSimpleAction *action, GVariant *param,
                          gpointer user_data)
 {
@@ -181,6 +223,7 @@ static const GActionEntry win_actions[] = {
     {.name = "fujinet-config", .activate = action_fujinet_config},
     {.name = "fujinet-log", .activate = action_fujinet_log},
     {.name = "debugger", .activate = action_debugger},
+    {.name = "preferences", .activate = action_preferences},
     {.name = "about", .activate = action_about},
 };
 
@@ -209,6 +252,7 @@ static GMenu *build_menu(void)
     g_menu_append(fujinet, "FujiNet Console Log…", "win.fujinet-log");
     g_menu_append_section(menu, "FujiNet", G_MENU_MODEL(fujinet));
 
+    g_menu_append(tail, "Preferences…", "win.preferences");
     g_menu_append(tail, "About FujiNet Go Intv", "win.about");
     g_menu_append_section(menu, NULL, G_MENU_MODEL(tail));
 
@@ -267,6 +311,12 @@ GtkWidget *intv_window_new(AdwApplication *app, intvsession *session)
     g_signal_connect(keys, "key-pressed", G_CALLBACK(on_key_pressed), self);
     g_signal_connect(keys, "key-released", G_CALLBACK(on_key_released), self);
     gtk_widget_add_controller(GTK_WIDGET(self), keys);
+
+    {
+        GtkEventController *focus = gtk_event_controller_focus_new();
+        g_signal_connect(focus, "leave", G_CALLBACK(on_focus_leave), self);
+        gtk_widget_add_controller(GTK_WIDGET(self), focus);
+    }
 
     gtk_widget_grab_focus(GTK_WIDGET(self->display));
 

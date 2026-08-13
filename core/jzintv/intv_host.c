@@ -61,6 +61,7 @@ static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
  * gone the instant it returns). Freed once the thread has been joined. */
 static char **s_argv;
 static int    s_argc;
+static int    s_argv_cap;
 
 static int write_file_if_missing(const char *path, const unsigned char *data,
                                  size_t size)
@@ -103,6 +104,33 @@ int intv_host_provision_roms(const char *rom_dir)
     return rc;
 }
 
+/* 12K words = 24576 bytes, matching cfg.c's
+ * file_read_rom16(f, 12*1024, cfg->ecs_img). */
+#define ECS_ROM_SIZE (12 * 1024 * 2)
+
+int intv_host_has_ecs_rom(const char *rom_dir)
+{
+    char path[4096];
+    FILE *f;
+    long size;
+
+    if (!rom_dir)
+        return 0;
+
+    snprintf(path, sizeof(path), "%s/ecs.bin", rom_dir);
+    f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    if (fseek(f, 0, SEEK_END) != 0)
+    {
+        fclose(f);
+        return 0;
+    }
+    size = ftell(f);
+    fclose(f);
+    return size == ECS_ROM_SIZE;
+}
+
 static void *thread_main(void *arg)
 {
     (void)arg;
@@ -123,6 +151,7 @@ static void free_argv(void)
     free(s_argv);
     s_argv = NULL;
     s_argc = 0;
+    s_argv_cap = 0;
 }
 
 static char *xstrdup(const char *s)
@@ -134,6 +163,31 @@ static char *xstrdup(const char *s)
         abort();
     }
     return d;
+}
+
+/* Appends one string onto s_argv, growing it (doubling) as needed and
+ * keeping it NULL-terminated (jzintv_entry_point's argv, like any argv,
+ * doesn't need argc's slot NULL'd, but this makes free_argv's bound and any
+ * accidental strlen-till-NULL walk equally safe). Returns 0 on success, -1
+ * on allocation failure (s_argv is left in a valid, freeable state either
+ * way -- the caller's job is to call free_argv() and bail). */
+static int push_arg(const char *s)
+{
+    if (s_argc + 1 >= s_argv_cap)
+    {
+        const int new_cap = s_argv_cap ? s_argv_cap * 2 : 8;
+        char **grown = realloc(s_argv, (size_t)new_cap * sizeof(*s_argv));
+        if (!grown)
+        {
+            fprintf(stderr, "intv_host: out of memory\n");
+            return -1;
+        }
+        s_argv = grown;
+        s_argv_cap = new_cap;
+    }
+    s_argv[s_argc++] = xstrdup(s);
+    s_argv[s_argc] = NULL;
+    return 0;
 }
 
 int intv_host_start(const intv_host_opts *opts)
@@ -179,6 +233,23 @@ int intv_host_start(const intv_host_opts *opts)
     }
     fclose(f);
 
+    /* ECS precheck: do this before touching s_argv at all, so a rejected
+     * request leaves the previous argv (if any) alone. A user-forced
+     * --ecs=1 with no readable/right-sized ecs.bin would otherwise reach
+     * cfg_init() and exit(1) the whole process (cfg.c's ECS ROM load) --
+     * refuse here instead, same shape as the exec/grom check above. */
+    char ecs_path[4096] = {0};
+    if (opts->ecs > 0)
+    {
+        snprintf(ecs_path, sizeof(ecs_path), "%s/ecs.bin", opts->rom_dir);
+        if (!intv_host_has_ecs_rom(opts->rom_dir))
+        {
+            fprintf(stderr, "intv_host: ECS enabled but %s is missing or "
+                            "not %d bytes\n", ecs_path, ECS_ROM_SIZE);
+            return -1;
+        }
+    }
+
     snprintf(fujinet_arg, sizeof(fujinet_arg), "--fujinet=%s:%d",
              (opts->fujinet_host && opts->fujinet_host[0])
                  ? opts->fujinet_host : "127.0.0.1",
@@ -187,17 +258,46 @@ int intv_host_start(const intv_host_opts *opts)
     snprintf(g_arg, sizeof(g_arg), "-g%s", grom_path);
 
     free_argv();
-    s_argc = 5;
-    s_argv = calloc((size_t)s_argc + 1, sizeof(*s_argv));
-    if (!s_argv)
+    if (push_arg("fujinet-go-intv") != 0 ||
+        push_arg(e_arg) != 0 ||
+        push_arg(g_arg) != 0 ||
+        push_arg(fujinet_arg) != 0)
     {
-        fprintf(stderr, "intv_host: out of memory\n");
+        free_argv();
         return -1;
     }
-    s_argv[0] = xstrdup("fujinet-go-intv");
-    s_argv[1] = xstrdup(e_arg);
-    s_argv[2] = xstrdup(g_arg);
-    s_argv[3] = xstrdup(fujinet_arg);
+
+    /* ECS/Intellivoice are tri-state (INTV_HW_AUTO/OFF/ON): only emit the
+     * flag when the caller actually wants to override jzIntv's own
+     * cart-metadata-driven default, matching --ecs/--voice's own "0/1"
+     * argument convention (cfg.c's optional-argument parsing, so the value
+     * must be attached with no space -- "--ecs=1", never "--ecs 1"). */
+    if (opts->ecs != INTV_HW_AUTO)
+    {
+        char flag[16];
+        snprintf(flag, sizeof(flag), "--ecs=%d", opts->ecs > 0 ? 1 : 0);
+        if (push_arg(flag) != 0) { free_argv(); return -1; }
+
+        if (opts->ecs > 0)
+        {
+            char e_ecs_arg[4160];
+            /* jzIntv's own default "ecs.bin" resolves against its rom_path
+             * search list, not our session's ROM dir -- always pass the
+             * absolute path explicitly. */
+            snprintf(e_ecs_arg, sizeof(e_ecs_arg), "-E%s", ecs_path);
+            if (push_arg(e_ecs_arg) != 0) { free_argv(); return -1; }
+        }
+    }
+
+    if (opts->ivoice != INTV_HW_AUTO)
+    {
+        char flag[16];
+        snprintf(flag, sizeof(flag), "--voice=%d", opts->ivoice > 0 ? 1 : 0);
+        if (push_arg(flag) != 0) { free_argv(); return -1; }
+    }
+
+    if (opts->pal && push_arg("--pal") != 0) { free_argv(); return -1; }
+
     /* cfg.c defaults rate_ctl to "on" UNLESS plat_is_batch_mode() says
      * otherwise (src/cfg/cfg.c: "cfg->rate_ctl = !batch_mode"), and our
      * plat backend is src/plat/plat_null.c, whose plat_is_batch_mode()
@@ -209,8 +309,7 @@ int intv_host_start(const intv_host_opts *opts)
      * something specific to us, it's the same throttle a real windowed
      * jzIntv build gets for free from plat_sdl.c's own (non-batch)
      * plat_is_batch_mode(). */
-    s_argv[4] = xstrdup("-r1");
-    s_argv[5] = NULL;
+    if (push_arg("-r1") != 0) { free_argv(); return -1; }
 
     pthread_mutex_lock(&s_lock);
     s_running = 1;
@@ -313,6 +412,12 @@ static const uint32_t disc_codes[16] = {
     /* 15 ESE */ 129,
 };
 
+/* side's top bit picks pad0 (Master Component) vs pad1 (ECS second pair);
+ * the low bit picks l[]/r[] within that pad, exactly matching
+ * INTV_PAD_LEFT=0/RIGHT=1/ECS_LEFT=2/ECS_RIGHT=3's own encoding. pad1 is
+ * only bus-registered when ECS is enabled, but writing its l[]/r[] array
+ * unconditionally is harmless -- same "safe whether or not running" shape
+ * as the base pair. */
 void intv_host_pad_key(intv_pad_side side, intv_pad_key key, int pressed)
 {
     if (key < 0 || key >= INTV_PAD_KEY_COUNT)
@@ -320,11 +425,12 @@ void intv_host_pad_key(intv_pad_side side, intv_pad_key key, int pressed)
 
     const uint32_t value = pressed ? key_codes[key] : 0;
     const int idx = key_index[key];
+    pad_t *const pad = (side & 2) ? &intv.pad1 : &intv.pad0;
 
-    if (side == INTV_PAD_LEFT)
-        intv.pad0.l[idx] = value;
+    if ((side & 1) == 0)
+        pad->l[idx] = value;
     else
-        intv.pad0.r[idx] = value;
+        pad->r[idx] = value;
 }
 
 void intv_host_pad_disc(intv_pad_side side, int direction)
@@ -333,10 +439,94 @@ void intv_host_pad_disc(intv_pad_side side, int direction)
     if (direction >= 0 && direction < 16)
         value = disc_codes[direction];
 
-    if (side == INTV_PAD_LEFT)
-        intv.pad0.l[15] = value;
+    pad_t *const pad = (side & 2) ? &intv.pad1 : &intv.pad0;
+    if ((side & 1) == 0)
+        pad->l[15] = value;
     else
-        intv.pad0.r[15] = value;
+        pad->r[15] = value;
+}
+
+/* ---- ECS keyboard injection -------------------------------------------- */
+
+/* Indexed by intv_ecs_key; {row, mask} into intv.pad1.k[row]. Transposed
+ * entry-by-entry from mapping.c's "KEYB_*" table (cfg_key_bind[] column 3,
+ * pad1.k[0..6]) -- see intv_host.h's own comment on this table. */
+static const struct { uint8_t row; uint32_t mask; }
+ecs_key_codes[INTV_ECS_KEY_COUNT] = {
+    [INTV_ECS_KEY_LEFT]    = { 0, 1   },
+    [INTV_ECS_KEY_PERIOD]  = { 0, 2   },
+    [INTV_ECS_KEY_SEMI]    = { 0, 4   },
+    [INTV_ECS_KEY_P]       = { 0, 8   },
+    [INTV_ECS_KEY_ESC]     = { 0, 16  },
+    [INTV_ECS_KEY_0]       = { 0, 32  },
+    [INTV_ECS_KEY_ENTER]   = { 0, 64  },
+
+    [INTV_ECS_KEY_COMMA]   = { 1, 1   },
+    [INTV_ECS_KEY_M]       = { 1, 2   },
+    [INTV_ECS_KEY_K]       = { 1, 4   },
+    [INTV_ECS_KEY_I]       = { 1, 8   },
+    [INTV_ECS_KEY_9]       = { 1, 16  },
+    [INTV_ECS_KEY_8]       = { 1, 32  },
+    [INTV_ECS_KEY_O]       = { 1, 64  },
+    [INTV_ECS_KEY_L]       = { 1, 128 },
+
+    [INTV_ECS_KEY_N]       = { 2, 1   },
+    [INTV_ECS_KEY_B]       = { 2, 2   },
+    [INTV_ECS_KEY_H]       = { 2, 4   },
+    [INTV_ECS_KEY_Y]       = { 2, 8   },
+    [INTV_ECS_KEY_7]       = { 2, 16  },
+    [INTV_ECS_KEY_6]       = { 2, 32  },
+    [INTV_ECS_KEY_U]       = { 2, 64  },
+    [INTV_ECS_KEY_J]       = { 2, 128 },
+
+    [INTV_ECS_KEY_V]       = { 3, 1   },
+    [INTV_ECS_KEY_C]       = { 3, 2   },
+    [INTV_ECS_KEY_F]       = { 3, 4   },
+    [INTV_ECS_KEY_R]       = { 3, 8   },
+    [INTV_ECS_KEY_5]       = { 3, 16  },
+    [INTV_ECS_KEY_4]       = { 3, 32  },
+    [INTV_ECS_KEY_T]       = { 3, 64  },
+    [INTV_ECS_KEY_G]       = { 3, 128 },
+
+    [INTV_ECS_KEY_X]       = { 4, 1   },
+    [INTV_ECS_KEY_Z]       = { 4, 2   },
+    [INTV_ECS_KEY_S]       = { 4, 4   },
+    [INTV_ECS_KEY_W]       = { 4, 8   },
+    [INTV_ECS_KEY_3]       = { 4, 16  },
+    [INTV_ECS_KEY_2]       = { 4, 32  },
+    [INTV_ECS_KEY_E]       = { 4, 64  },
+    [INTV_ECS_KEY_D]       = { 4, 128 },
+
+    [INTV_ECS_KEY_SPACE]   = { 5, 1   },
+    [INTV_ECS_KEY_DOWN]    = { 5, 2   },
+    [INTV_ECS_KEY_UP]      = { 5, 4   },
+    [INTV_ECS_KEY_Q]       = { 5, 8   },
+    [INTV_ECS_KEY_1]       = { 5, 16  },
+    [INTV_ECS_KEY_RIGHT]   = { 5, 32  },
+    [INTV_ECS_KEY_CTRL]    = { 5, 64  },
+    [INTV_ECS_KEY_A]       = { 5, 128 },
+
+    [INTV_ECS_KEY_SHIFT]   = { 6, 128 },
+};
+
+void intv_host_ecs_key(intv_ecs_key key, int pressed)
+{
+    if (key < 0 || key >= INTV_ECS_KEY_COUNT)
+        return;
+
+    const uint8_t row = ecs_key_codes[key].row;
+    const uint32_t mask = ecs_key_codes[key].mask;
+
+    if (pressed)
+        intv.pad1.k[row] |= mask;
+    else
+        intv.pad1.k[row] &= ~mask;
+}
+
+void intv_host_ecs_keys_clear(void)
+{
+    for (int row = 0; row < 7; row++)
+        intv.pad1.k[row] = 0;
 }
 
 void intv_host_debug_test_tone(void)

@@ -8,9 +8,10 @@
  * file of that name is already there, so a ROM the user imported always
  * wins over the compiled-in one.
  *
- * One class only: EXEC and GROM are both Mattel copyrighted firmware, unlike
- * the CoCo port's split between a freely-redistributable and a system class.
- * This table is non-empty only in a WITH_INTV_ROMS=ON build, which must not
+ * One class only: EXEC, GROM, and (when ECS support is enabled) the ECS
+ * cartridge ROM are all Mattel copyrighted firmware, unlike the CoCo port's
+ * split between a freely-redistributable and a system class. This table is
+ * non-empty only in a WITH_INTV_ROMS=ON build, which must not
  * be redistributed -- every artifact this repository publishes is built
  * WITH_INTV_ROMS=OFF, and core/tests/no_embedded_roms.py checks that claim
  * against the shipped binaries. See COMPLIANCE.md.

@@ -22,6 +22,7 @@ from pathlib import Path
 EXPECTED = {
     "exec": 8192,
     "grom": 2048,
+    "ecs": 24576,
 }
 
 

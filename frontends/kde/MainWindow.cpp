@@ -21,6 +21,7 @@
 
 #include "DisplayWidget.h"
 #include "FujiNetWindows.h"
+#include "SettingsDialog.h"
 #include "debugger/DebuggerWindow.h"
 #include "keypad/KeypadWindow.h"
 
@@ -52,6 +53,29 @@ void MainWindow::showKeypad()
     KeypadWindow::showFor(this, m_session);
 }
 
+void MainWindow::restartSession()
+{
+    intvsession_start_opts opts;
+    intvsession_stop(m_session);
+    intvsession_default_opts(m_session, &opts);
+    if (intvsession_start(m_session, &opts) != 0)
+        statusBar()->showMessage(
+            QString::fromUtf8(intvsession_last_error(m_session)), 5000);
+}
+
+void MainWindow::showSettings()
+{
+    SettingsDialog dlg(m_session, this);
+    dlg.exec();
+    if (dlg.sessionDirty()) {
+        restartSession();
+        statusBar()->showMessage(
+            QStringLiteral("Machine options applied (session restarted)"),
+            5000);
+    }
+    m_display->setFocus();
+}
+
 void MainWindow::buildMenus()
 {
     QMenu *view = menuBar()->addMenu(QStringLiteral("&View"));
@@ -65,6 +89,10 @@ void MainWindow::buildMenus()
                        [this] { fujinet_config_show(this, m_session); });
     fujinet->addAction(QStringLiteral("Console &Log…"), this,
                        [this] { fujinet_log_show(this, m_session); });
+
+    QMenu *settings = menuBar()->addMenu(QStringLiteral("&Settings"));
+    settings->addAction(QStringLiteral("&Settings…"), this,
+                        &MainWindow::showSettings);
 
     QMenu *help = menuBar()->addMenu(QStringLiteral("&Help"));
     help->addAction(QStringLiteral("&Quit"), QKeySequence::Quit, qApp,

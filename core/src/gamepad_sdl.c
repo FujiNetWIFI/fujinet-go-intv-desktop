@@ -116,12 +116,22 @@ int intv_pad_for_port(const int *bindings, int npads, int side)
 
 /* ---- SDL glue ------------------------------------------------------------ */
 
+/* 4 sides, not 2: INTVSESSION_PAD_LEFT/_RIGHT (the Master Component's own
+ * pair) plus INTVSESSION_PAD_ECS_LEFT/_RIGHT (the ECS's second pair, only
+ * meaningful when ECS is enabled). Driving pad1 when ECS is off is
+ * harmless -- nothing reads it off the peripheral bus -- so this poll loop
+ * doesn't need to know ECS's on/off state at all; a gamepad simply never
+ * gets auto-assigned to a side 3/4 slot unless a 3rd/4th pad is plugged in
+ * (intv_pad_for_port's own automatic-assignment order). */
+#define NUM_SIDES 4
+
 typedef struct {
     SDL_JoystickID id;
     SDL_Gamepad *handle;
     int bound_side; /* -1 = automatic */
-    int last_disc[2]; /* last direction sent per side this pad could drive,
-                       * to avoid spamming intv_host_pad_disc every poll */
+    int last_disc[NUM_SIDES]; /* last direction sent per side this pad could
+                              * drive, to avoid spamming intv_host_pad_disc
+                              * every poll */
 } pad_slot;
 
 static pthread_t s_thread;
@@ -183,8 +193,8 @@ static void open_pad(SDL_JoystickID id)
             slot->id = id;
             slot->handle = h;
             slot->bound_side = -1;
-            slot->last_disc[0] = -1;
-            slot->last_disc[1] = -1;
+            for (int side = 0; side < NUM_SIDES; side++)
+                slot->last_disc[side] = -1;
         }
     }
     pthread_mutex_unlock(&s_lock);
@@ -211,7 +221,7 @@ static void poll_sticks(void)
     for (int i = 0; i < s_pad_count; i++)
         bindings[i] = s_pads[i].bound_side;
 
-    for (int side = 0; side < 2; side++)
+    for (int side = 0; side < NUM_SIDES; side++)
     {
         int idx = intv_pad_for_port(bindings, s_pad_count, side);
         if (idx < 0)
@@ -293,7 +303,7 @@ static void *thread_main(void *arg)
                 pthread_mutex_unlock(&s_lock);
                 if (idx < 0)
                     break;
-                for (int side = 0; side < 2; side++)
+                for (int side = 0; side < NUM_SIDES; side++)
                     if (intv_pad_for_port(bindings, s_pad_count, side) == idx)
                         handle_button((intv_pad_side)side, ev.gbutton.button,
                                      ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN);

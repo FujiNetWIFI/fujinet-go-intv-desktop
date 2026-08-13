@@ -66,6 +66,41 @@ int main(void)
     if (s)
         check("setting persisted", intvsession_get_int(s, "volume", -1) == 7);
 
+    /* ---- machine options ---- */
+    check("hw_mode_name(0) is Auto",
+          strcmp(intvsession_hw_mode_name(0), "Auto") == 0);
+    check("hw_mode_name table terminates",
+          intvsession_hw_mode_name(3) == NULL);
+    check("video_name(0) is NTSC",
+          strstr(intvsession_video_name(0), "NTSC") != NULL);
+    check("video_name table terminates",
+          intvsession_video_name(2) == NULL);
+
+    intvsession_start_opts opts;
+    intvsession_default_opts(s, &opts);
+    check("default ecs is Auto", opts.ecs == INTVSESSION_HW_AUTO);
+    check("default ivoice is Auto", opts.ivoice == INTVSESSION_HW_AUTO);
+    check("default video is NTSC", opts.video == INTVSESSION_VIDEO_NTSC);
+
+    intvsession_set_int(s, "ecs", INTVSESSION_HW_ON);
+    intvsession_set_int(s, "ivoice", INTVSESSION_HW_OFF);
+    intvsession_set_int(s, "video_standard", INTVSESSION_VIDEO_PAL);
+    intvsession_set_int(s, "keyboard_mode", 1);
+    intvsession_default_opts(s, &opts);
+    check("default_opts reflects ecs", opts.ecs == INTVSESSION_HW_ON);
+    check("default_opts reflects ivoice", opts.ivoice == INTVSESSION_HW_OFF);
+    check("default_opts reflects video", opts.video == INTVSESSION_VIDEO_PAL);
+    check("keyboard_mode round-trips",
+          intvsession_get_int(s, "keyboard_mode", 0) == 1);
+
+    /* Restore Auto/Auto/NTSC/controllers for the lifecycle checks below --
+     * a from-scratch session is what a real first run would see, and ECS
+     * needing ecs.bin is exercised on its own below rather than here. */
+    intvsession_set_int(s, "ecs", INTVSESSION_HW_AUTO);
+    intvsession_set_int(s, "ivoice", INTVSESSION_HW_AUTO);
+    intvsession_set_int(s, "video_standard", INTVSESSION_VIDEO_NTSC);
+    intvsession_set_int(s, "keyboard_mode", 0);
+
     /* ---- paths ---- */
     check("roms_path under data_dir",
           strncmp(intvsession_roms_path(s), data_dir, strlen(data_dir)) == 0);
@@ -80,7 +115,7 @@ int main(void)
                         "checks SKIPPED (build -DWITH_INTV_ROMS=ON to run "
                         "them)\n", intvsession_roms_path(s));
     } else {
-        check("start", intvsession_start(s) == 0);
+        check("start", intvsession_start(s, NULL) == 0);
         check("is_running", intvsession_is_running(s));
 
         uint32_t pixels[INTVSESSION_FB_WIDTH * INTVSESSION_FB_HEIGHT];
@@ -98,8 +133,43 @@ int main(void)
         intvsession_pad_disc(s, INTVSESSION_PAD_RIGHT, 4);
         intvsession_pad_disc(s, INTVSESSION_PAD_RIGHT, -1);
 
+        /* ECS pair + keyboard through the public API, exercised only if
+         * ecs.bin was embedded (WITH_INTV_ROMS=ON puts it in the same
+         * embedded-ROM table as exec/grom -- see roms_embedded.h). */
+        if (intvsession_has_ecs_rom(s)) {
+            intvsession_pad_key(s, INTVSESSION_PAD_ECS_LEFT,
+                               INTVSESSION_KEY_1, 1);
+            intvsession_pad_key(s, INTVSESSION_PAD_ECS_LEFT,
+                               INTVSESSION_KEY_1, 0);
+            intvsession_ecs_key_set(s, INTVSESSION_ECS_KEY_A, 1);
+            intvsession_ecs_keys_clear(s);
+        } else {
+            fprintf(stderr, "session_test: no ecs.bin in %s -- ECS checks "
+                            "SKIPPED\n", intvsession_roms_path(s));
+        }
+
         intvsession_stop(s);
         check("stopped", !intvsession_is_running(s));
+
+        /* A user-forced ECS=On with no ecs.bin must refuse cleanly rather
+         * than reach jzIntv's cfg_init() and exit(1) the process -- see
+         * intv_host_start's own comment on why this is checked before the
+         * emulator thread ever starts. Only meaningful when ecs.bin isn't
+         * already there (a WITH_INTV_ROMS=ON build always has one). */
+        if (!intvsession_has_ecs_rom(s)) {
+            intvsession_start_opts ecs_opts = {
+                .ecs = INTVSESSION_HW_ON,
+                .ivoice = INTVSESSION_HW_AUTO,
+                .video = INTVSESSION_VIDEO_NTSC,
+            };
+            check("forced ECS with no ecs.bin refuses",
+                  intvsession_start(s, &ecs_opts) != 0);
+            check("...and leaves an error message",
+                  intvsession_last_error(s) != NULL &&
+                      intvsession_last_error(s)[0] != '\0');
+            check("...and does not leave the session running",
+                  !intvsession_is_running(s));
+        }
     }
 
     intvsession_free(s);

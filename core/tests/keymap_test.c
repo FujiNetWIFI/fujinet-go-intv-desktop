@@ -85,6 +85,42 @@ int main(void)
     expect_none('F');   /* ECS-keyboard-only in upstream, no pad action */
     expect_none(0x9999); /* nonsense keysym */
 
+    /* ---- ECS keyboard map (intvsession_ecs_key_from_keysym) -------------
+     * A separate function/table from the pad map above -- 'Q'/'F' are
+     * unmapped there (upstream hotkeys/no pad action) but ARE mapped here
+     * (mapping.c's ECS Keyboard column). */
+    if (intvsession_ecs_key_from_keysym('Q') != INTVSESSION_ECS_KEY_Q) {
+        fprintf(stderr, "keymap_test: FAILED: ecs 'Q'\n");
+        failed = 1;
+    }
+    if (intvsession_ecs_key_from_keysym('f') != INTVSESSION_ECS_KEY_F) {
+        fprintf(stderr, "keymap_test: FAILED: ecs 'f' (case-insensitive)\n");
+        failed = 1;
+    }
+    if (intvsession_ecs_key_from_keysym(INTVSESSION_KEYSYM_ESCAPE) !=
+        INTVSESSION_ECS_KEY_ESC) {
+        fprintf(stderr, "keymap_test: FAILED: ecs ESCAPE\n");
+        failed = 1;
+    }
+    if (intvsession_ecs_key_from_keysym(INTVSESSION_KEYSYM_RSHIFT) !=
+        INTVSESSION_ECS_KEY_SHIFT) {
+        fprintf(stderr, "keymap_test: FAILED: ecs RSHIFT\n");
+        failed = 1;
+    }
+    if (intvsession_ecs_key_from_keysym(INTVSESSION_KEYSYM_LSHIFT) !=
+        INTVSESSION_ECS_KEY_SHIFT) {
+        fprintf(stderr, "keymap_test: FAILED: ecs LSHIFT\n");
+        failed = 1;
+    }
+    /* F10/F11/F12 stay reserved for the frontends in the ECS map too --
+     * there is no INTVSESSION_KEYSYM_F10/11/12 to even pass in, so this is
+     * really just confirming an unrelated/garbage keysym is INTVSESSION_
+     * ECS_KEY_NONE, same contract as the pad map's expect_none. */
+    if (intvsession_ecs_key_from_keysym(0x9999) != INTVSESSION_ECS_KEY_NONE) {
+        fprintf(stderr, "keymap_test: FAILED: ecs nonsense keysym\n");
+        failed = 1;
+    }
+
     if (failed) {
         fprintf(stderr, "keymap_test: FAILED\n");
         return 1;

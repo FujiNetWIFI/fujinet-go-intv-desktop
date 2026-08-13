@@ -47,12 +47,67 @@ void intvsession_free(intvsession *s)
     free(s);
 }
 
-int intvsession_start(intvsession *s)
+/* HW_AUTO/OFF/ON -> INTV_HW_AUTO/OFF/ON (-1/0/1); jzIntv's own tri-state
+ * encoding, see intv_host.h. */
+static int hw_to_intv(int hw)
 {
+    switch (hw) {
+    case INTVSESSION_HW_OFF: return INTV_HW_OFF;
+    case INTVSESSION_HW_ON:  return INTV_HW_ON;
+    default:                return INTV_HW_AUTO;
+    }
+}
+
+void intvsession_default_opts(intvsession *s, intvsession_start_opts *opts)
+{
+    opts->ecs = intvsession_get_int(s, "ecs", INTVSESSION_HW_AUTO);
+    opts->ivoice = intvsession_get_int(s, "ivoice", INTVSESSION_HW_AUTO);
+    opts->video = intvsession_get_int(s, "video_standard",
+                                      INTVSESSION_VIDEO_NTSC);
+}
+
+static const char *const hw_mode_names[] = { "Auto", "Off", "On", NULL };
+
+const char *intvsession_hw_mode_name(int idx)
+{
+    if (idx < 0 || (size_t)idx >= sizeof(hw_mode_names) / sizeof(hw_mode_names[0]) - 1)
+        return NULL;
+    return hw_mode_names[idx];
+}
+
+static const char *const video_names[] = { "NTSC (60 Hz)", "PAL (50 Hz)", NULL };
+
+const char *intvsession_video_name(int idx)
+{
+    if (idx < 0 || (size_t)idx >= sizeof(video_names) / sizeof(video_names[0]) - 1)
+        return NULL;
+    return video_names[idx];
+}
+
+int intvsession_has_ecs_rom(const intvsession *s)
+{
+    return intv_host_has_ecs_rom(s->roms_dir);
+}
+
+int intvsession_start(intvsession *s, const intvsession_start_opts *opts)
+{
+    intvsession_start_opts defaults;
+    if (!opts) {
+        intvsession_default_opts(s, &defaults);
+        opts = &defaults;
+    }
+
     if (!intvsession_has_system_roms(s)) {
         session_set_error(s, "%s is missing exec.bin/grom.bin -- import "
                           "system ROMs, or build -DWITH_INTV_ROMS=ON for "
                           "local testing", s->roms_dir);
+        return -1;
+    }
+
+    if (opts->ecs == INTVSESSION_HW_ON && !intvsession_has_ecs_rom(s)) {
+        session_set_error(s, "ECS is enabled but %s/ecs.bin is missing or "
+                          "the wrong size -- import an ECS ROM, or turn ECS "
+                          "off in Settings", s->roms_dir);
         return -1;
     }
 
@@ -65,12 +120,15 @@ int intvsession_start(intvsession *s)
     if (fujinet_start(s) == 0)
         fujinet_wait_for_boip(s, 3000);
 
-    intv_host_opts opts = {
+    intv_host_opts host_opts = {
         .rom_dir = s->roms_dir,
         .fujinet_host = "127.0.0.1",
         .fujinet_port = s->fujinet_port,
+        .ecs = hw_to_intv(opts->ecs),
+        .ivoice = hw_to_intv(opts->ivoice),
+        .pal = opts->video == INTVSESSION_VIDEO_PAL,
     };
-    if (intv_host_start(&opts) != 0) {
+    if (intv_host_start(&host_opts) != 0) {
         session_set_error(s, "failed to start the emulator thread");
         fujinet_stop(s);
         return -1;
@@ -130,4 +188,19 @@ void intvsession_pad_disc(intvsession *s, intvsession_pad_side side,
 {
     (void)s;
     intv_host_pad_disc((intv_pad_side)side, direction);
+}
+
+void intvsession_ecs_key_set(intvsession *s, intvsession_ecs_key key,
+                             int pressed)
+{
+    (void)s;
+    if (key < 0 || key >= INTVSESSION_ECS_KEY_NONE)
+        return;
+    intv_host_ecs_key((intv_ecs_key)key, pressed);
+}
+
+void intvsession_ecs_keys_clear(intvsession *s)
+{
+    (void)s;
+    intv_host_ecs_keys_clear();
 }

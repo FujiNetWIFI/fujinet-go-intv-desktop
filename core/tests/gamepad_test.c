@@ -99,6 +99,27 @@ int main(void)
         check("no pad drives an unconnected side",
               intv_pad_for_port(bindings, 1, INTVSESSION_PAD_RIGHT) == -1);
     }
+    {
+        /* Four pads, all automatic: with ECS enabled, sides 2/3
+         * (INTVSESSION_PAD_ECS_LEFT/_RIGHT) are driven by the 3rd/4th
+         * connected pad, same automatic-assignment order as the base
+         * pair -- this is the widening gamepad_sdl.c's NUM_SIDES == 4
+         * depends on. */
+        int bindings[4] = {-1, -1, -1, -1};
+        check("auto: pad 2 drives ECS-left",
+              intv_pad_for_port(bindings, 4, INTVSESSION_PAD_ECS_LEFT) == 2);
+        check("auto: pad 3 drives ECS-right",
+              intv_pad_for_port(bindings, 4, INTVSESSION_PAD_ECS_RIGHT) == 3);
+    }
+    {
+        /* Only 2 pads connected: nothing drives the ECS pair yet, and the
+         * base pair is unaffected by ECS sides existing at all. */
+        int bindings[2] = {-1, -1};
+        check("only 2 pads: nothing drives ECS-left",
+              intv_pad_for_port(bindings, 2, INTVSESSION_PAD_ECS_LEFT) == -1);
+        check("only 2 pads: base pair still assigns normally",
+              intv_pad_for_port(bindings, 2, INTVSESSION_PAD_LEFT) == 0);
+    }
 
     /* ---- SDL subsystem lifecycle, no hardware required ---- */
     check("gamepad subsystem starts", intv_gamepad_start() == 0);

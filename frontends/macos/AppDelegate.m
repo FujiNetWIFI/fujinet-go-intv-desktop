@@ -38,6 +38,26 @@
     NSWindow *_logWindow;
     NSTextView *_logView;
     NSTimer *_logTimer;
+    NSWindow *_settingsWindow;
+    BOOL _sessionDirty;
+}
+
+/* Settings keys shared with the GNOME/KDE/Windows frontends (all four read/
+ * write the same settings.ini -- see frontends/gnome/prefs.c's own header
+ * for the canonical key/default list):
+ *   "ecs"/"ivoice"    INTVSESSION_HW_* (default AUTO)     -- restart to apply
+ *   "video_standard"  INTVSESSION_VIDEO_* (default NTSC)  -- restart to apply
+ *   "keyboard_mode"   0 = hand controllers, 1 = ECS keyboard -- applies live
+ * The restart-class key set, mirroring the CoCo/ADAM macOS ports' own
+ * sessionSettingKeys()/machineSettingKeys() helpers. */
+static NSArray<NSString *> *restartSettingKeys(void)
+{
+    static NSArray<NSString *> *keys;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+      keys = @[ @"ecs", @"ivoice", @"video_standard" ];
+    });
+    return keys;
 }
 
 - (instancetype)initWithSession:(intvsession *)session
@@ -46,6 +66,24 @@
     if (self)
         _session = session;
     return self;
+}
+
+/* Stops and restarts the session with intvsession_default_opts() re-read
+ * from the settings store -- the "apply" side of a Settings window change
+ * to ECS/Intellivoice/video standard, matching the GNOME/KDE/Windows
+ * frontends' own restart helpers. */
+- (void)restartSession
+{
+    intvsession_start_opts opts;
+    intvsession_stop(_session);
+    intvsession_default_opts(_session, &opts);
+    if (intvsession_start(_session, &opts) != 0) {
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"FujiNet Go Intv";
+        alert.informativeText =
+            [NSString stringWithUTF8String:intvsession_last_error(_session)];
+        [alert runModal];
+    }
 }
 
 /* ---- actions ------------------------------------------------------------ */
@@ -165,6 +203,135 @@
     [DebuggerWindow showForSession:_session];
 }
 
+/* ---- settings -------------------------------------------------------- */
+
+- (NSPopUpButton *)hwModePopUpForKey:(const char *)key
+{
+    NSPopUpButton *pop = [[NSPopUpButton alloc] initWithFrame:NSZeroRect
+                                                     pullsDown:NO];
+    pop.target = self;
+    pop.action = @selector(settingChanged:);
+    pop.identifier = [NSString stringWithUTF8String:key];
+    for (int i = 0; intvsession_hw_mode_name(i); i++)
+        [pop addItemWithTitle:[NSString
+                                  stringWithUTF8String:intvsession_hw_mode_name(i)]];
+    [pop selectItemAtIndex:intvsession_get_int(_session, key,
+                                               INTVSESSION_HW_AUTO)];
+    return pop;
+}
+
+- (void)settingChanged:(id)sender
+{
+    NSControl *control = sender;
+    NSString *key = control.identifier;
+    int value;
+
+    if ([control isKindOfClass:[NSPopUpButton class]])
+        value = (int)((NSPopUpButton *)control).indexOfSelectedItem;
+    else
+        value = ((NSButton *)control).state == NSControlStateValueOn ? 1 : 0;
+
+    intvsession_set_int(_session, key.UTF8String, value);
+
+    if ([restartSettingKeys() containsObject:key]) {
+        _sessionDirty = YES;
+    } else if ([key isEqualToString:@"keyboard_mode"] && value == 0) {
+        /* Leaving ECS keyboard mode -- release anything still held; see
+         * intvsession_ecs_keys_clear's own comment. */
+        intvsession_ecs_keys_clear(_session);
+    }
+}
+
+- (void)showSettings:(id)sender
+{
+    (void)sender;
+    if (_settingsWindow) {
+        [_settingsWindow makeKeyAndOrderFront:nil];
+        return;
+    }
+
+    BOOL haveEcsRom = intvsession_has_ecs_rom(_session);
+    NSPopUpButton *ecsPop = [self hwModePopUpForKey:"ecs"];
+    ecsPop.enabled = haveEcsRom;
+    ecsPop.toolTip =
+        haveEcsRom
+            ? @"Entertainment Computer System -- second controller pair, "
+              @"ECS keyboard, extra sound"
+            : @"Unavailable: ecs.bin not found in the ROM directory";
+
+    NSPopUpButton *videoPop =
+        [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    videoPop.target = self;
+    videoPop.action = @selector(settingChanged:);
+    videoPop.identifier = @"video_standard";
+    for (int i = 0; intvsession_video_name(i); i++)
+        [videoPop
+            addItemWithTitle:[NSString
+                                 stringWithUTF8String:intvsession_video_name(i)]];
+    [videoPop selectItemAtIndex:intvsession_get_int(_session, "video_standard",
+                                                     INTVSESSION_VIDEO_NTSC)];
+
+    NSButton *ecsKeyboard =
+        [NSButton checkboxWithTitle:@""
+                             target:self
+                             action:@selector(settingChanged:)];
+    ecsKeyboard.state = intvsession_get_int(_session, "keyboard_mode", 0)
+                            ? NSControlStateValueOn
+                            : NSControlStateValueOff;
+    ecsKeyboard.identifier = @"keyboard_mode";
+
+    NSArray<NSArray<NSView *> *> *rows = @[
+        @[ [NSTextField labelWithString:@"ECS"], ecsPop ],
+        @[ [NSTextField labelWithString:@"Intellivoice"],
+           [self hwModePopUpForKey:"ivoice"] ],
+        @[ [NSTextField labelWithString:@"Video Standard"], videoPop ],
+        @[ [NSTextField labelWithString:@"ECS Keyboard"], ecsKeyboard ],
+    ];
+    NSGridView *grid = [NSGridView gridViewWithViews:rows];
+    grid.rowSpacing = 8;
+    grid.columnSpacing = 12;
+    [grid columnAtIndex:0].xPlacement = NSGridCellPlacementTrailing;
+
+    NSTextField *note = [NSTextField
+        labelWithString:@"ECS/Intellivoice/Video Standard apply when this "
+                        @"window is closed (the session restarts). ECS "
+                        @"Keyboard applies immediately."];
+    note.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    note.textColor = NSColor.secondaryLabelColor;
+    note.preferredMaxLayoutWidth = 360;
+
+    NSStackView *root = [NSStackView stackViewWithViews:@[ grid, note ]];
+    root.orientation = NSUserInterfaceLayoutOrientationVertical;
+    root.alignment = NSLayoutAttributeLeading;
+    root.spacing = 12;
+    root.edgeInsets = NSEdgeInsetsMake(16, 16, 16, 16);
+
+    _settingsWindow = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(0, 0, 420, 260)
+                  styleMask:NSWindowStyleMaskTitled |
+                            NSWindowStyleMaskClosable |
+                            NSWindowStyleMaskMiniaturizable
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    _settingsWindow.title = @"Settings";
+    _settingsWindow.releasedWhenClosed = NO;
+    _settingsWindow.delegate = self;
+    _settingsWindow.contentView = root;
+    [_settingsWindow center];
+    [_settingsWindow makeKeyAndOrderFront:nil];
+}
+
+/* Deferred restart-class apply -- collected while the Settings window is
+ * open, applied once when it closes (mirroring the GNOME/KDE/Windows
+ * frontends' own "apply on close" idiom). */
+- (void)windowWillClose:(NSNotification *)note
+{
+    if (note.object != _settingsWindow || !_sessionDirty)
+        return;
+    _sessionDirty = NO;
+    [self restartSession];
+}
+
 /* ---- menus ---------------------------------------------------------------- */
 
 - (NSMenuItem *)item:(NSString *)title action:(SEL)sel key:(NSString *)key
@@ -191,6 +358,11 @@
     [appMenu addItemWithTitle:[@"About " stringByAppendingString:appName]
                        action:@selector(orderFrontStandardAboutPanel:)
                 keyEquivalent:@""];
+    [appMenu addItem:[NSMenuItem separatorItem]];
+
+    [appMenu addItem:[self item:@"Settings…"
+                         action:@selector(showSettings:)
+                            key:@","]];
     [appMenu addItem:[NSMenuItem separatorItem]];
 
     NSMenu *servicesMenu = [[NSMenu alloc] initWithTitle:@"Services"];

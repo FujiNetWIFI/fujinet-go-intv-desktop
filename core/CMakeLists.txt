@@ -217,15 +217,17 @@ else()
 endif()
 
 # ---- the Intellivision system ROMs -----------------------------------------
-# jzIntv resolves EXEC/GROM by exact path (its -e/-g flags), not by searching
-# a ROM directory the way XRoar does -- so intv_host.c (M3) materialises
-# whatever is embedded here into the session's ROM directory on first start
-# and passes -e/-g pointing at it. What changes with WITH_INTV_ROMS is only
-# whether this table has anything in it. See COMPLIANCE.md.
+# jzIntv resolves EXEC/GROM/ECS by exact path (-e/-g/-E), not by searching a
+# ROM directory the way XRoar does -- so intv_host.c materialises whatever is
+# embedded here into the session's ROM directory on first start and passes
+# -e/-g (and, when ECS is enabled, -E) pointing at it. What changes with
+# WITH_INTV_ROMS is only whether this table has anything in it. See
+# COMPLIANCE.md.
 set(INTV_ROM_DIR_SRC "${CMAKE_SOURCE_DIR}/tools/jzintv/roms")
 set(INTV_SYSTEM_ROMS
   "${INTV_ROM_DIR_SRC}/exec.bin"
-  "${INTV_ROM_DIR_SRC}/grom.bin")
+  "${INTV_ROM_DIR_SRC}/grom.bin"
+  "${INTV_ROM_DIR_SRC}/ecs.bin")
 
 if(WITH_INTV_ROMS)
   set(_embed_roms ${INTV_SYSTEM_ROMS})
@@ -307,6 +309,14 @@ add_executable(pad_test tests/pad_test.c)
 target_link_libraries(pad_test jzintv_core)
 target_include_directories(pad_test PRIVATE src)
 
+add_executable(ecs_key_test tests/ecs_key_test.c)
+target_link_libraries(ecs_key_test jzintv_core)
+target_include_directories(ecs_key_test PRIVATE src)
+
+add_executable(hwopts_test tests/hwopts_test.c)
+target_link_libraries(hwopts_test jzintv_core)
+target_include_directories(hwopts_test PRIVATE src)
+
 add_executable(session_test tests/session_test.c)
 target_link_libraries(session_test intv_session)
 target_include_directories(session_test PRIVATE src)
@@ -345,6 +355,8 @@ target_include_directories(symtab_test PRIVATE debugger)
 add_test(NAME no_sdl_link COMMAND no_sdl_link_test)
 add_test(NAME boot_smoke COMMAND boot_smoke)
 add_test(NAME pad_test COMMAND pad_test)
+add_test(NAME ecs_key COMMAND ecs_key_test)
+add_test(NAME hwopts COMMAND hwopts_test)
 add_test(NAME session COMMAND session_test)
 add_test(NAME keymap COMMAND keymap_test)
 add_test(NAME audio COMMAND audio_test)
@@ -357,7 +369,7 @@ add_test(NAME symtab COMMAND symtab_test)
 set_tests_properties(fujibus_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
                      RUN_SERIAL ON)
 set_tests_properties(debug stic PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
-set_tests_properties(pad_test boot_smoke audio PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+set_tests_properties(pad_test ecs_key hwopts boot_smoke audio PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 # Needs WITH_INTV_ROMS=ON to have anything to provision; reported as 77
 # (skipped) rather than a failure otherwise, and it boots a real machine, so
 # it is the one test here that takes real wall-clock time.

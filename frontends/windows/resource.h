@@ -11,5 +11,12 @@
 #define IDM_DEBUGGER       205
 #define IDM_ABOUT          206
 #define IDM_EXIT           207
+#define IDM_SETTINGS       208
+
+/* Settings window child control ids. */
+#define IDC_SET_ECS          301
+#define IDC_SET_IVOICE       302
+#define IDC_SET_VIDEO        303
+#define IDC_SET_ECS_KEYBOARD 304
 
 #endif

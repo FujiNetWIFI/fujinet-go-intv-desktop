@@ -18,6 +18,7 @@ add_executable(fujinet-go-intv-windows WIN32
   main.c
   debugger/dbg_window.c
   keypad/keypad_window.c
+  ecskbd/ecskbd_window.c
   resource.rc
 )
 # See frontends/gnome/CMakeLists.txt's own comment on the underlying

@@ -17,19 +17,32 @@
  * sound card's DMA ring makes.
  *
  * LATENCY: intv_audio_copy also self-corrects lag on every call, not just
- * on overflow. If more than double a call's own request is sitting unread
- * (the consumer -- an SDL audio callback -- fell a bit behind but hasn't
- * stopped entirely), it fast-forwards all the way down to exactly that
- * request's worth before copying -- not just under the trigger threshold,
- * which would still hand back whatever's oldest within that cushion, i.e.
- * still stale -- so what comes out is always the freshest possible
- * samples rather than working through a growing backlog. Without this,
- * this ring's own generous capacity (half a second, sized for a UI thread
- * that only polls once a video frame) became a latency budget of its
- * own: a consumer draining even slightly slower than the emulator
- * produces would let audio drift further and further behind video, up to
- * that half-second ceiling, before the plain-overflow drop above ever
- * kicked in.
+ * on overflow. If more than RING_HIGHWATER_SAMPLES (a fixed ~100ms) is
+ * sitting unread, the consumer has been running behind for a while (not
+ * stalled outright -- that overflow case is handled by intv_audio_publish
+ * above), so the ring is fast-forwarded down to RING_TARGET_SAMPLES
+ * (~30ms) before copying, rather than left to keep growing toward the
+ * ring's full half-second capacity.
+ *
+ * This threshold is deliberately an ABSOLUTE sample count, not scaled by
+ * the caller's own max_samples: the ring is fed by the emulator in fixed
+ * bursts (snd_desktop.c publishes SND_BUF_SIZE_DEFAULT samples at a time,
+ * independent of anything a consumer asks for), so a request-relative
+ * threshold fires or doesn't purely based on how the consumer's chunk size
+ * happens to compare to the producer's -- on a host whose audio device
+ * quantum is smaller than one producer burst, a relative threshold trimmed
+ * the ring after every single publish, discarding most of the emulator's
+ * output and starving the consumer between bursts. Fixed sample counts
+ * derived from INTV_AUDIO_RATE make the trim fire only on genuine
+ * sustained lag, regardless of either side's chunk size.
+ *
+ * PRIMING: intv_audio_copy also withholds samples until the ring has
+ * accumulated RING_TARGET_SAMPLES at least once (and again after it fully
+ * drains), rather than trickling out whatever's there as soon as the first
+ * few samples land. Without this, bursty production (the emulator
+ * publishes in chunks, not continuously) would make the very first
+ * requests after a publish under-fill, one micro-gap per burst instead of
+ * a single clean gap at startup.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -58,8 +71,14 @@ void intv_audio_publish(const int16_t *samples, int count);
 
 /* Consumer thread: copies up to max_samples into dst (mono int16), removing
  * them from the ring. Returns the number actually copied (0 if the ring was
- * empty -- not an error, just means nothing new has played yet). */
+ * empty, or not yet primed -- see this file's own PRIMING note -- not an
+ * error, just means nothing new has played yet). */
 int intv_audio_copy(int16_t *dst, int max_samples);
+
+/* Empties the ring and clears the prime gate. Call when (re)starting
+ * playback (e.g. audio_start) so a fresh session never plays samples left
+ * over from a previous one. Safe to call from any thread. */
+void intv_audio_reset(void);
 
 #ifdef __cplusplus
 }

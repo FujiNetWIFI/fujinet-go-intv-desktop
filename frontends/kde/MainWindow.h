@@ -27,6 +27,7 @@ private:
     void buildMenus();
     void showDebugger();
     void showKeypad();
+    void showEcsKeyboard();
     void showSettings();
 
     intvsession *m_session;

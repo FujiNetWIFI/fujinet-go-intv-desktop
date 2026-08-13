@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "intv_audio.h"
 #include "session_internal.h"
 
 typedef struct {
@@ -39,7 +40,16 @@ static void audio_cb(void *ud, SDL_AudioStream *stream, int additional_amount,
                              ? (int)sizeof(buf)
                              : additional_amount;
         int want_samples = want_bytes / 2;
-        intvsession_render_audio(s, buf, want_samples);
+        /* intvsession_render_audio only fills as many samples as the ring
+         * actually has and leaves the rest of buf untouched -- pad the
+         * shortfall with silence rather than handing the device whatever
+         * was left over from a previous callback (or, on the very first
+         * callback, uninitialised stack memory). Without this, any
+         * underrun played back as a buzz/click instead of a gap. */
+        int n = intvsession_render_audio(s, buf, want_samples);
+        if (n < want_samples)
+            SDL_memset(buf + n, 0,
+                      (size_t)(want_samples - n) * sizeof(buf[0]));
         SDL_PutAudioStreamData(stream, buf, want_samples * 2);
         additional_amount -= want_samples * 2;
     }
@@ -74,6 +84,10 @@ int audio_start(struct intvsession *s)
         free(a);
         return -1;
     }
+    /* Discard anything left over from a previous session (e.g. a
+     * Settings-driven restart) so playback doesn't open with up to half a
+     * second of stale audio replaying from the ring. */
+    intv_audio_reset();
     SDL_ResumeAudioStreamDevice(a->stream);
     s->audio = a;
     return 0;

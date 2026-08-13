@@ -20,6 +20,7 @@ set(GNOME_SOURCES
   prefs.c
   debugger/dbg_window.c
   keypad/keypad_window.c
+  ecskbd/ecskbd_window.c
 )
 
 set(GNOME_APP_ID online.fujinet.go.intv.gnome)

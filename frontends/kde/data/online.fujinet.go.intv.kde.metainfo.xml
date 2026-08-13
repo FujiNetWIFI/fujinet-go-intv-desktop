@@ -33,6 +33,19 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.3.0" date="2026-08-13">
+      <description>
+        <p>
+          Fixes audio distortion caused by the emulator's output ring
+          buffer being trimmed too aggressively on hosts with a small
+          audio device quantum, and by underruns playing back stale or
+          uninitialized audio instead of silence. Adds a clickable ECS
+          Keyboard window (F10), the on-screen counterpart to the existing
+          hand-controller keypad, so the ECS's own keyboard can be driven
+          entirely with a mouse.
+        </p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-08-12">
       <description>
         <p>

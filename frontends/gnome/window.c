@@ -1,8 +1,9 @@
 /*
  * IntvWindow: main window of the GNOME frontend. Header bar + menu over the
  * emulator display; keyboard capture routes everything except F9 (keypad
- * window), F11 (fullscreen) and F12 (debugger) to the Intellivision. No
- * on-screen input panels are shown unless the user asks for them.
+ * window), F10 (ECS keyboard window), F11 (fullscreen) and F12 (debugger)
+ * to the Intellivision. No on-screen input panels are shown unless the
+ * user asks for them.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -15,6 +16,7 @@
 
 #include "debugger/dbg_window.h"
 #include "display.h"
+#include "ecskbd/ecskbd_window.h"
 #include "keypad/keypad_window.h"
 #include "keysym_map.h"
 #include "prefs.h"
@@ -87,6 +89,9 @@ static gboolean on_key_pressed(GtkEventControllerKey *controller, guint keyval,
     case GDK_KEY_F9:
         intv_keypad_window_toggle(GTK_WINDOW(self), self->session);
         return TRUE;
+    case GDK_KEY_F10:
+        intv_ecskbd_window_toggle(GTK_WINDOW(self), self->session);
+        return TRUE;
     case GDK_KEY_F11:
         if (gtk_window_is_fullscreen(GTK_WINDOW(self)))
             gtk_window_unfullscreen(GTK_WINDOW(self));
@@ -110,7 +115,8 @@ static void on_key_released(GtkEventControllerKey *controller, guint keyval,
     IntvWindow *self = INTV_WINDOW(user_data);
     (void)controller;
     (void)keycode;
-    if (keyval == GDK_KEY_F9 || keyval == GDK_KEY_F11 || keyval == GDK_KEY_F12)
+    if (keyval == GDK_KEY_F9 || keyval == GDK_KEY_F10 ||
+        keyval == GDK_KEY_F11 || keyval == GDK_KEY_F12)
         return;
     forward_key(self, keyval, state, 0);
 }
@@ -135,6 +141,15 @@ static void action_keypad(GSimpleAction *action, GVariant *param,
     (void)action;
     (void)param;
     intv_keypad_window_toggle(GTK_WINDOW(self), self->session);
+}
+
+static void action_ecs_keyboard(GSimpleAction *action, GVariant *param,
+                                gpointer user_data)
+{
+    IntvWindow *self = INTV_WINDOW(user_data);
+    (void)action;
+    (void)param;
+    intv_ecskbd_window_toggle(GTK_WINDOW(self), self->session);
 }
 
 static void action_fujinet_config(GSimpleAction *action, GVariant *param,
@@ -220,6 +235,7 @@ static void action_about(GSimpleAction *action, GVariant *param,
 
 static const GActionEntry win_actions[] = {
     {.name = "keypad", .activate = action_keypad},
+    {.name = "ecs-keyboard", .activate = action_ecs_keyboard},
     {.name = "fujinet-config", .activate = action_fujinet_config},
     {.name = "fujinet-log", .activate = action_fujinet_log},
     {.name = "debugger", .activate = action_debugger},
@@ -245,6 +261,7 @@ static GMenu *build_menu(void)
     GMenu *tail = g_menu_new();
 
     g_menu_append(view, "Keypad (F9)", "win.keypad");
+    g_menu_append(view, "ECS Keyboard (F10)", "win.ecs-keyboard");
     g_menu_append(view, "Debugger (F12)", "win.debugger");
     g_menu_append_section(menu, "View", G_MENU_MODEL(view));
 

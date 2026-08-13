@@ -298,6 +298,16 @@ int intv_host_start(const intv_host_opts *opts)
 
     if (opts->pal && push_arg("--pal") != 0) { free_argv(); return -1; }
 
+    /* Shrink snd_desktop's producer burst from its 2048-sample default
+     * (~43ms at 48kHz) down to 512 (~11ms): intv_audio's ring
+     * (core/jzintv/intv_audio.c) is drained by an SDL callback whose own
+     * chunk size is whatever the host audio device quantum happens to be,
+     * which on Linux/PipeWire can be well under 2048 -- a smaller, more
+     * frequent producer burst keeps the ring topped up in smaller
+     * increments instead of arriving in one lump that has to last until
+     * the next 43ms publish, cutting both latency and jitter. */
+    if (push_arg("-B512") != 0) { free_argv(); return -1; }
+
     /* cfg.c defaults rate_ctl to "on" UNLESS plat_is_batch_mode() says
      * otherwise (src/cfg/cfg.c: "cfg->rate_ctl = !batch_mode"), and our
      * plat backend is src/plat/plat_null.c, whose plat_is_batch_mode()

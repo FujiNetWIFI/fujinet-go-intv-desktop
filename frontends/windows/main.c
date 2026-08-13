@@ -4,7 +4,7 @@
  * Mirrors the GNOME/KDE frontends over the shared intvsession API: a
  * GDI-blitted display letterboxed to 4:3, full keyboard mapping, a menu
  * bar, and the FujiNet configuration (default browser) and console-log
- * windows, plus a clickable keypad window.
+ * windows, plus clickable keypad and ECS keyboard windows.
  *
  * Unlike the CoCo/MSX Windows frontends, there is no vsync-feeding present
  * thread here: intvsession has no notify_vsync to feed (jzIntv's own paced
@@ -26,6 +26,7 @@
 
 #include "intvsession.h"
 #include "debugger/dbg_window.h"
+#include "ecskbd/ecskbd_window.h"
 #include "keypad/keypad_window.h"
 #include "resource.h"
 
@@ -191,6 +192,7 @@ static WPARAM resolve_side(WPARAM vk, LPARAM lp)
 static void toggle_fullscreen(HWND hwnd);
 static void open_debugger(void);
 static void open_keypad(void);
+static void open_ecskbd(void);
 
 static void on_key(HWND hwnd, WPARAM vk, LPARAM lp, int down)
 {
@@ -203,6 +205,13 @@ static void on_key(HWND hwnd, WPARAM vk, LPARAM lp, int down)
         case VK_F9:
             open_keypad();
             return;
+        case VK_F10:
+            /* Claimed here like F9/F11/F12 rather than left to Win32's own
+             * "F10 activates the menu bar" default -- see wnd_proc's own
+             * WM_KEYDOWN/WM_SYSKEYDOWN handling, which no longer lets F10
+             * fall through to DefWindowProc for this reason. */
+            open_ecskbd();
+            return;
         case VK_F11:
             toggle_fullscreen(hwnd);
             return;
@@ -212,7 +221,7 @@ static void on_key(HWND hwnd, WPARAM vk, LPARAM lp, int down)
         default:
             break;
         }
-    } else if (vk == VK_F9 || vk == VK_F11 || vk == VK_F12) {
+    } else if (vk == VK_F9 || vk == VK_F10 || vk == VK_F11 || vk == VK_F12) {
         return;
     }
 
@@ -325,6 +334,11 @@ static void open_debugger(void)
 static void open_keypad(void)
 {
     intv_keypad_window_toggle(g_hwnd, g_session);
+}
+
+static void open_ecskbd(void)
+{
+    intv_ecskbd_window_toggle(g_hwnd, g_session);
 }
 
 /* Stops and restarts the session with intvsession_default_opts() re-read
@@ -574,6 +588,7 @@ static HMENU build_menu(void)
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)fujinet, "&FujiNet");
 
     AppendMenuA(view, MF_STRING, IDM_KEYPAD, "Keypad\tF9");
+    AppendMenuA(view, MF_STRING, IDM_ECS_KEYBOARD, "ECS Keyboard\tF10");
     AppendMenuA(view, MF_STRING, IDM_FULLSCREEN, "Fullscreen\tF11");
     AppendMenuA(view, MF_STRING, IDM_DEBUGGER, "Debugger\tF12");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)view, "&View");
@@ -611,14 +626,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
         on_key(hwnd, wp, lp, 1);
-        if (wp == VK_F10)
-            break; /* let the system open the menu */
         return 0;
     case WM_KEYUP:
     case WM_SYSKEYUP:
         on_key(hwnd, wp, lp, 0);
-        if (wp == VK_F10)
-            break;
         return 0;
     case WM_KILLFOCUS:
         /* Losing keyboard focus shouldn't leave a key stuck down in
@@ -629,6 +640,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case IDM_KEYPAD:         open_keypad(); break;
+        case IDM_ECS_KEYBOARD:   open_ecskbd(); break;
         case IDM_FUJINET_CONFIG: show_fujinet_config(); break;
         case IDM_FUJINET_LOG:
             show_fujinet_log((HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE));

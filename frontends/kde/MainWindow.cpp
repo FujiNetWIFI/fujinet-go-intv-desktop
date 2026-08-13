@@ -23,6 +23,7 @@
 #include "FujiNetWindows.h"
 #include "SettingsDialog.h"
 #include "debugger/DebuggerWindow.h"
+#include "ecskbd/EcsKeyboardWindow.h"
 #include "keypad/KeypadWindow.h"
 
 #ifndef INTV_VERSION_STRING
@@ -53,6 +54,11 @@ void MainWindow::showKeypad()
     KeypadWindow::showFor(this, m_session);
 }
 
+void MainWindow::showEcsKeyboard()
+{
+    EcsKeyboardWindow::showFor(this, m_session);
+}
+
 void MainWindow::restartSession()
 {
     intvsession_start_opts opts;
@@ -81,6 +87,8 @@ void MainWindow::buildMenus()
     QMenu *view = menuBar()->addMenu(QStringLiteral("&View"));
     view->addAction(QStringLiteral("&Keypad"), QKeySequence(Qt::Key_F9), this,
                     &MainWindow::showKeypad);
+    view->addAction(QStringLiteral("ECS &Keyboard"), QKeySequence(Qt::Key_F10),
+                    this, &MainWindow::showEcsKeyboard);
     view->addAction(QStringLiteral("&Debugger"), QKeySequence(Qt::Key_F12),
                     this, &MainWindow::showDebugger);
 

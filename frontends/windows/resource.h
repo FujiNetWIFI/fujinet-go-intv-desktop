@@ -12,6 +12,7 @@
 #define IDM_ABOUT          206
 #define IDM_EXIT           207
 #define IDM_SETTINGS       208
+#define IDM_ECS_KEYBOARD   209
 
 /* Settings window child control ids. */
 #define IDC_SET_ECS          301

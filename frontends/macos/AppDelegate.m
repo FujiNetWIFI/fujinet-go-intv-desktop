@@ -8,8 +8,8 @@
  *
  * No Machine/Display/CPU radio menus, unlike the CoCo/ADAM/MSX macOS
  * ports: the Intellivision has one fixed configuration, matching the
- * GNOME/KDE/Windows frontends' own menu scope (View: Keypad/Fullscreen/
- * Debugger; FujiNet: Configuration/Console Log).
+ * GNOME/KDE/Windows frontends' own menu scope (View: Keypad/ECS Keyboard/
+ * Fullscreen/Debugger; FujiNet: Configuration/Console Log).
  *
  * NOT BUILT OR RUN-VERIFIED -- see main.m's file header.
  *
@@ -23,6 +23,7 @@
 
 #import "DisplayView.h"
 #import "debugger/DebuggerWindow.h"
+#import "ecskbd/EcsKeyboardWindow.h"
 #import "keypad/KeypadWindow.h"
 
 #include <stdlib.h>
@@ -92,6 +93,12 @@ static NSArray<NSString *> *restartSettingKeys(void)
 {
     (void)sender;
     [KeypadWindow toggleForSession:_session];
+}
+
+- (void)showEcsKeyboard:(id)sender
+{
+    (void)sender;
+    [EcsKeyboardWindow toggleForSession:_session];
 }
 
 - (void)showFujiNetConfig:(id)sender
@@ -414,6 +421,13 @@ static NSArray<NSString *> *restartSettingKeys(void)
                 key:[NSString stringWithFormat:@"%C", (unichar)NSF9FunctionKey]];
     keypad.keyEquivalentModifierMask = 0;
     [view addItem:keypad];
+    NSMenuItem *ecsKeyboard =
+        [self item:@"ECS Keyboard"
+             action:@selector(showEcsKeyboard:)
+                key:[NSString stringWithFormat:@"%C",
+                              (unichar)NSF10FunctionKey]];
+    ecsKeyboard.keyEquivalentModifierMask = 0;
+    [view addItem:ecsKeyboard];
     NSMenuItem *fs = [view addItemWithTitle:@"Toggle Full Screen"
                                      action:@selector(toggleFullScreen:)
                               keyEquivalent:@"f"];

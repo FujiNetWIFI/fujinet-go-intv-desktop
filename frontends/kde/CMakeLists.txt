@@ -31,6 +31,7 @@ add_executable(fujinet-go-intv-kde
   SettingsDialog.cpp
   debugger/DebuggerWindow.cpp
   keypad/KeypadWindow.cpp
+  ecskbd/EcsKeyboardWindow.cpp
 )
 
 # See frontends/gnome/CMakeLists.txt's own comment on why this is needed:

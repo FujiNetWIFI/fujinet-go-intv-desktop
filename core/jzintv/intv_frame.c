@@ -12,6 +12,14 @@
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t s_pixels[INTV_FRAME_WIDTH * INTV_FRAME_HEIGHT];
 static uint64_t s_serial = 0;
+static void (*s_publish_hook)(void *ctx) = NULL;
+static void *s_publish_hook_ctx = NULL;
+
+void intv_frame_set_publish_hook(void (*hook)(void *ctx), void *ctx)
+{
+    s_publish_hook = hook;
+    s_publish_hook_ctx = ctx;
+}
 
 void intv_frame_publish(const uint8_t *vid, const uint8_t palette[16][3],
                         int vid_enabled)
@@ -33,6 +41,9 @@ void intv_frame_publish(const uint8_t *vid, const uint8_t palette[16][3],
     memcpy(s_pixels, local, sizeof(s_pixels));
     s_serial++;
     pthread_mutex_unlock(&s_lock);
+
+    if (s_publish_hook)
+        s_publish_hook(s_publish_hook_ctx);
 }
 
 int intv_frame_copy(uint32_t *dst, uint64_t *serial_inout)

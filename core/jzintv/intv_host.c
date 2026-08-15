@@ -131,9 +131,18 @@ int intv_host_has_ecs_rom(const char *rom_dir)
     return size == ECS_ROM_SIZE;
 }
 
+static void (*s_thread_hook)(void) = NULL;
+
+void intv_host_set_thread_hook(void (*hook)(void))
+{
+    s_thread_hook = hook;
+}
+
 static void *thread_main(void *arg)
 {
     (void)arg;
+    if (s_thread_hook)
+        s_thread_hook();
     jzintv_entry_point(s_argc, s_argv);
 
     pthread_mutex_lock(&s_lock);
@@ -320,6 +329,25 @@ int intv_host_start(const intv_host_opts *opts)
      * jzIntv build gets for free from plat_sdl.c's own (non-batch)
      * plat_is_batch_mode(). */
     if (push_arg("-r1") != 0) { free_argv(); return -1; }
+
+    /* Trailing positional argument: cfg.c reads argv_copy[optind] (the
+     * first non-flag argument, which by construction is the last thing we
+     * push) into cfg->fn_game when present, and only falls back to booting
+     * the embedded FujiNet config ROM (fujinet_use_config_rom = 1) when it
+     * is absent -- so this MUST be pushed last, after every flag above. */
+    if (opts->cart_path && opts->cart_path[0])
+    {
+        f = fopen(opts->cart_path, "rb");
+        if (!f)
+        {
+            fprintf(stderr, "intv_host: cartridge not readable: %s\n",
+                    opts->cart_path);
+            free_argv();
+            return -1;
+        }
+        fclose(f);
+        if (push_arg(opts->cart_path) != 0) { free_argv(); return -1; }
+    }
 
     pthread_mutex_lock(&s_lock);
     s_running = 1;

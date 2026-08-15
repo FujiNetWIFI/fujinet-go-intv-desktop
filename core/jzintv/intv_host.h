@@ -46,6 +46,16 @@ typedef struct {
     int         ivoice;       /* INTV_HW_* -- no ROM needed (the SP0256 mask
                               * ROM is compiled into jzIntv itself). */
     int         pal;          /* 0 = NTSC (default), 1 = PAL (50 Hz). */
+    const char *cart_path;    /* NULL/"" -> boot the embedded FujiNet config
+                              * ROM, same as before this field existed
+                              * (src/cfg/cfg.c sets fujinet_use_config_rom
+                              * when no trailing positional argv is present).
+                              * Otherwise a path to a cartridge image
+                              * (.rom/.bin/.int, with an optional same-
+                              * basename .cfg memory-map sidecar picked up
+                              * automatically by jzIntv's own cfg loader),
+                              * passed through as jzintv_entry_point's
+                              * trailing positional argument. */
 } intv_host_opts;
 
 /* Writes any of exec.bin/grom.bin missing from opts->rom_dir out of the
@@ -75,6 +85,14 @@ int intv_host_start(const intv_host_opts *opts);
 void intv_host_stop(void);
 
 int intv_host_is_running(void);
+
+/* Registers a callback fired once, at the very top of the emulator thread
+ * (before jzintv_entry_point() is called), with that thread's own OS thread
+ * id. Unused by any desktop frontend, which have no need to name or
+ * schedule-hint the emulator thread individually -- added for the Android
+ * port, where the thread id is what an ADPF APerformanceHint session needs
+ * to include the emulator thread. Pass NULL to clear. */
+void intv_host_set_thread_hook(void (*hook)(void));
 
 /* ---- direct pad injection -------------------------------------------------
  * jzIntv's keyboard/joystick bindings (src/cfg/mapping.c) work by writing a

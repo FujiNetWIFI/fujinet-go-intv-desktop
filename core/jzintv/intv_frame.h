@@ -49,6 +49,16 @@ void intv_frame_publish(const uint8_t *vid, const uint8_t palette[16][3],
 /* See the file header for the copy contract. */
 int intv_frame_copy(uint32_t *dst, uint64_t *serial_inout);
 
+/* Registers a callback fired at the end of intv_frame_publish, after the
+ * new frame is visible to intv_frame_copy -- on the emulator thread, same
+ * as publish itself. Unused by any desktop frontend (they pull frames on
+ * their own vsync tick instead), but lets a presenter-style consumer (the
+ * Android port's render thread, which has no vsync tick of its own to poll
+ * on) block on a condvar and wake exactly once per published frame instead
+ * of either busy-polling or free-running ahead of the emulator. Pass NULL
+ * to clear. Not thread-safe against itself -- call once at startup. */
+void intv_frame_set_publish_hook(void (*hook)(void *ctx), void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

@@ -92,15 +92,39 @@ typedef struct {
     int ecs;    /* INTVSESSION_HW_* */
     int ivoice; /* INTVSESSION_HW_* */
     int video;  /* INTVSESSION_VIDEO_* */
+    const char *cart_path; /* NULL/"" -> boot the embedded FujiNet config
+                            * ROM (unchanged default). Otherwise a path to a
+                            * cartridge image, passed through to
+                            * intv_host_opts.cart_path. Not read from the
+                            * settings store by intvsession_default_opts
+                            * (see that function) -- callers that persist a
+                            * "last loaded cartridge" do so themselves and
+                            * set this field explicitly. */
 } intvsession_start_opts;
 
 /* Fills *opts from the settings store: ecs/ivoice default to
  * INTVSESSION_HW_AUTO (jzIntv's own cart-metadata-driven default), video
- * defaults to INTVSESSION_VIDEO_NTSC. A frontend applying a machine-option
- * change should re-call this (after intvsession_set_int on the relevant
- * key) rather than hand-assemble the struct, so a new option added here
- * only has to be read in one place. */
+ * defaults to INTVSESSION_VIDEO_NTSC, cart_path defaults to the "cart"
+ * settings key (NULL if unset, i.e. boot the embedded FujiNet config ROM).
+ * A frontend applying a machine-option change should re-call this (after
+ * intvsession_set_int/intvsession_set_str on the relevant key) rather than
+ * hand-assemble the struct, so a new option added here only has to be read
+ * in one place. The returned cart_path points into settings storage owned
+ * by s and is valid until the next settings mutation. */
 void intvsession_default_opts(intvsession *s, intvsession_start_opts *opts);
+
+/* Convenience: stop the running session (if any), set the "cart" settings
+ * key to path (or clear it if path is NULL/"", reverting to the embedded
+ * FujiNet config ROM), flush settings, and start again with the current
+ * defaults. jzIntv is a process-wide singleton (see intv_host.h) so loading
+ * a different cartridge is always stop-then-start, never a live swap.
+ * Returns 0 on success, -1 with intvsession_last_error() set. */
+int intvsession_load_cart(intvsession *s, const char *path);
+
+/* The currently persisted cartridge path ("" if none -- i.e. the embedded
+ * FujiNet config ROM boots), read from the same "cart" settings key
+ * intvsession_default_opts fills cart_path from. */
+const char *intvsession_cart_path(intvsession *s);
 
 /* Menu/combo label tables, NULL past the end so a caller walks idx = 0..
  * until NULL rather than hardcoding a count. */

@@ -64,6 +64,26 @@ void intvsession_default_opts(intvsession *s, intvsession_start_opts *opts)
     opts->ivoice = intvsession_get_int(s, "ivoice", INTVSESSION_HW_AUTO);
     opts->video = intvsession_get_int(s, "video_standard",
                                       INTVSESSION_VIDEO_NTSC);
+    opts->cart_path = intvsession_get_str(s, "cart", NULL);
+    if (opts->cart_path && !opts->cart_path[0])
+        opts->cart_path = NULL;
+}
+
+const char *intvsession_cart_path(intvsession *s)
+{
+    const char *path = intvsession_get_str(s, "cart", NULL);
+    return (path && path[0]) ? path : "";
+}
+
+int intvsession_load_cart(intvsession *s, const char *path)
+{
+    intvsession_stop(s);
+    intvsession_set_str(s, "cart", path && path[0] ? path : "");
+    intvsession_settings_flush(s);
+
+    intvsession_start_opts opts;
+    intvsession_default_opts(s, &opts);
+    return intvsession_start(s, &opts);
 }
 
 static const char *const hw_mode_names[] = { "Auto", "Off", "On", NULL };
@@ -127,6 +147,7 @@ int intvsession_start(intvsession *s, const intvsession_start_opts *opts)
         .ecs = hw_to_intv(opts->ecs),
         .ivoice = hw_to_intv(opts->ivoice),
         .pal = opts->video == INTVSESSION_VIDEO_PAL,
+        .cart_path = opts->cart_path,
     };
     if (intv_host_start(&host_opts) != 0) {
         session_set_error(s, "failed to start the emulator thread");

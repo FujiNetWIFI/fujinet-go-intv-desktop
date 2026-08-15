@@ -34,6 +34,24 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.4.0" date="2026-08-15">
+      <description>
+        <p>
+          Boots the larger Intellivision cartridges that previously failed
+          with ERR CODE 3, hangs, or corrupted graphics: cartridge memory
+          maps from a .cfg sidecar are now clamped at end-of-file the way
+          SDK-1600's bin2rom does, cartridges whose ROM occupies the
+          FujiNet mailbox window ($9C00-$9F3F) boot with the mailbox
+          disabled for the session instead of being rejected, .cfg
+          [memattr] cartridge RAM declarations are honored, and 40KB/48KB
+          bare .bin images get sensible default maps. The bundled FujiNet
+          runtime now finds .cfg sidecars on hosts with a path prefix set,
+          verifies the pushed byte count, and aborts cleanly on a short
+          transfer instead of booting partial data. The embedded FujiNet
+          config ROM now names the boot-failure reason on screen.
+        </p>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-08-13">
       <description>
         <p>

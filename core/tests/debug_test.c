@@ -80,9 +80,9 @@ int main(void)
      * of the ICart windows the config ROM occupies). */
     check("pc in a mapped ROM range",
           (regs.pc >= 0x1000 && regs.pc <= 0x1FFF) ||
-          (regs.pc >= 0x5000 && regs.pc <= 0x6BFF) ||
+          (regs.pc >= 0x5000 && regs.pc <= 0x6FFF) ||
           (regs.pc >= 0x8000 && regs.pc <= 0x9BFF) ||
-          (regs.pc >= 0xD000 && regs.pc <= 0xD5FF));
+          (regs.pc >= 0xD000 && regs.pc <= 0xDFFF));
 
     /* ---- disassembly at PC produces at least one real instruction ---- */
     intvdebug_dasm_line lines[4];

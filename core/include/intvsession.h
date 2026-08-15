@@ -126,6 +126,15 @@ int intvsession_load_cart(intvsession *s, const char *path);
  * intvsession_default_opts fills cart_path from. */
 const char *intvsession_cart_path(intvsession *s);
 
+/* Inverse of intvsession_load_cart: clears the persisted cartridge and
+ * restarts, which boots the embedded FujiNet config ROM (see
+ * intv_host_start's own comment on cart_path == NULL). A frontend's "Reset
+ * to CONFIG" action -- also the only way back to CONFIG once a cartridge's
+ * .cfg memory map has disabled the FujiNet mailbox for the session (see the
+ * staged jzIntv fujinet peripheral), since that only clears on restart.
+ * Returns 0 on success, -1 with intvsession_last_error() set. */
+int intvsession_reset_to_config(intvsession *s);
+
 /* Menu/combo label tables, NULL past the end so a caller walks idx = 0..
  * until NULL rather than hardcoding a count. */
 const char *intvsession_hw_mode_name(int idx);   /* "Auto" / "Off" / "On" */

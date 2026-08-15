@@ -193,6 +193,7 @@ static void toggle_fullscreen(HWND hwnd);
 static void open_debugger(void);
 static void open_keypad(void);
 static void open_ecskbd(void);
+static void reset_to_config(void);
 
 static void on_key(HWND hwnd, WPARAM vk, LPARAM lp, int down)
 {
@@ -218,10 +219,18 @@ static void on_key(HWND hwnd, WPARAM vk, LPARAM lp, int down)
         case VK_F12:
             open_debugger();
             return;
+        case 'R':
+            if (GetKeyState(VK_CONTROL) & 0x8000) {
+                reset_to_config();
+                return;
+            }
+            break;
         default:
             break;
         }
     } else if (vk == VK_F9 || vk == VK_F10 || vk == VK_F11 || vk == VK_F12) {
+        return;
+    } else if (vk == 'R' && (GetKeyState(VK_CONTROL) & 0x8000)) {
         return;
     }
 
@@ -351,6 +360,13 @@ static void restart_session(void)
     intvsession_stop(g_session);
     intvsession_default_opts(g_session, &opts);
     if (intvsession_start(g_session, &opts) != 0)
+        MessageBoxA(g_hwnd, intvsession_last_error(g_session),
+                    "FujiNet Go Intv", MB_ICONWARNING);
+}
+
+static void reset_to_config(void)
+{
+    if (intvsession_reset_to_config(g_session) != 0)
         MessageBoxA(g_hwnd, intvsession_last_error(g_session),
                     "FujiNet Go Intv", MB_ICONWARNING);
 }
@@ -583,6 +599,7 @@ static HMENU build_menu(void)
     HMENU settings = CreatePopupMenu();
     HMENU help = CreatePopupMenu();
 
+    AppendMenuA(fujinet, MF_STRING, IDM_RESET_CONFIG, "Reset to CONFIG\tCtrl+R");
     AppendMenuA(fujinet, MF_STRING, IDM_FUJINET_CONFIG, "Configuration...");
     AppendMenuA(fujinet, MF_STRING, IDM_FUJINET_LOG, "Console Log...");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)fujinet, "&FujiNet");
@@ -641,6 +658,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         switch (LOWORD(wp)) {
         case IDM_KEYPAD:         open_keypad(); break;
         case IDM_ECS_KEYBOARD:   open_ecskbd(); break;
+        case IDM_RESET_CONFIG:   reset_to_config(); break;
         case IDM_FUJINET_CONFIG: show_fujinet_config(); break;
         case IDM_FUJINET_LOG:
             show_fujinet_log((HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE));

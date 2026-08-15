@@ -101,6 +101,33 @@ int main(void)
     intvsession_set_int(s, "video_standard", INTVSESSION_VIDEO_NTSC);
     intvsession_set_int(s, "keyboard_mode", 0);
 
+    /* ---- reset to config ---- */
+    intvsession_set_str(s, "cart", "/nonexistent/whatever.rom");
+    check("cart_path reflects set",
+          strcmp(intvsession_cart_path(s), "/nonexistent/whatever.rom") == 0);
+    intvsession_default_opts(s, &opts);
+    check("default_opts cart_path non-NULL when cart set",
+          opts.cart_path != NULL);
+
+    /* reset_to_config clears the persisted cart regardless of whether the
+     * restart itself can succeed (no embedded ROMs -> intvsession_start
+     * refuses, but the settings-clear side effect still happens first). */
+    int reset_rc = intvsession_reset_to_config(s);
+    check("cart_path cleared after reset_to_config",
+          strcmp(intvsession_cart_path(s), "") == 0);
+    intvsession_default_opts(s, &opts);
+    check("default_opts cart_path NULL after reset_to_config",
+          opts.cart_path == NULL);
+    if (intvsession_has_system_roms(s)) {
+        check("reset_to_config succeeds with system ROMs present",
+              reset_rc == 0);
+        check("running after reset_to_config", intvsession_is_running(s));
+        /* Leave the session stopped for the lifecycle block below, which
+         * calls intvsession_start(s, NULL) itself and would otherwise find
+         * one already running. */
+        intvsession_stop(s);
+    }
+
     /* ---- paths ---- */
     check("roms_path under data_dir",
           strncmp(intvsession_roms_path(s), data_dir, strlen(data_dir)) == 0);

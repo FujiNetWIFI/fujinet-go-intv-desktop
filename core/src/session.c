@@ -86,6 +86,11 @@ int intvsession_load_cart(intvsession *s, const char *path)
     return intvsession_start(s, &opts);
 }
 
+int intvsession_reset_to_config(intvsession *s)
+{
+    return intvsession_load_cart(s, NULL);
+}
+
 static const char *const hw_mode_names[] = { "Auto", "Off", "On", NULL };
 
 const char *intvsession_hw_mode_name(int idx)

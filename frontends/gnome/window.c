@@ -101,6 +101,14 @@ static gboolean on_key_pressed(GtkEventControllerKey *controller, guint keyval,
     case GDK_KEY_F12:
         gtk_widget_activate_action(GTK_WIDGET(self), "win.debugger", NULL);
         return TRUE;
+    case GDK_KEY_r:
+    case GDK_KEY_R:
+        if (state & GDK_CONTROL_MASK) {
+            gtk_widget_activate_action(GTK_WIDGET(self), "win.reset-config",
+                                       NULL);
+            return TRUE;
+        }
+        break;
     default:
         break;
     }
@@ -117,6 +125,9 @@ static void on_key_released(GtkEventControllerKey *controller, guint keyval,
     (void)keycode;
     if (keyval == GDK_KEY_F9 || keyval == GDK_KEY_F10 ||
         keyval == GDK_KEY_F11 || keyval == GDK_KEY_F12)
+        return;
+    if ((keyval == GDK_KEY_r || keyval == GDK_KEY_R) &&
+        (state & GDK_CONTROL_MASK))
         return;
     forward_key(self, keyval, state, 0);
 }
@@ -150,6 +161,18 @@ static void action_ecs_keyboard(GSimpleAction *action, GVariant *param,
     (void)action;
     (void)param;
     intv_ecskbd_window_toggle(GTK_WINDOW(self), self->session);
+}
+
+static void action_reset_config(GSimpleAction *action, GVariant *param,
+                                gpointer user_data)
+{
+    IntvWindow *self = INTV_WINDOW(user_data);
+    (void)action;
+    (void)param;
+    if (intvsession_reset_to_config(self->session) != 0)
+        intv_window_toast(self, intvsession_last_error(self->session));
+    else
+        intv_window_toast(self, "Reset to CONFIG");
 }
 
 static void action_fujinet_config(GSimpleAction *action, GVariant *param,
@@ -236,6 +259,7 @@ static void action_about(GSimpleAction *action, GVariant *param,
 static const GActionEntry win_actions[] = {
     {.name = "keypad", .activate = action_keypad},
     {.name = "ecs-keyboard", .activate = action_ecs_keyboard},
+    {.name = "reset-config", .activate = action_reset_config},
     {.name = "fujinet-config", .activate = action_fujinet_config},
     {.name = "fujinet-log", .activate = action_fujinet_log},
     {.name = "debugger", .activate = action_debugger},
@@ -265,6 +289,7 @@ static GMenu *build_menu(void)
     g_menu_append(view, "Debugger (F12)", "win.debugger");
     g_menu_append_section(menu, "View", G_MENU_MODEL(view));
 
+    g_menu_append(fujinet, "Reset to CONFIG (Ctrl+R)", "win.reset-config");
     g_menu_append(fujinet, "FujiNet Configuration…", "win.fujinet-config");
     g_menu_append(fujinet, "FujiNet Console Log…", "win.fujinet-log");
     g_menu_append_section(menu, "FujiNet", G_MENU_MODEL(fujinet));

@@ -29,6 +29,7 @@ private:
     void showKeypad();
     void showEcsKeyboard();
     void showSettings();
+    void resetToConfig();
 
     intvsession *m_session;
     DisplayWidget *m_display;

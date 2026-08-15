@@ -101,6 +101,18 @@ static NSArray<NSString *> *restartSettingKeys(void)
     [EcsKeyboardWindow toggleForSession:_session];
 }
 
+- (void)resetToConfig:(id)sender
+{
+    (void)sender;
+    if (intvsession_reset_to_config(_session) != 0) {
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"FujiNet Go Intv";
+        alert.informativeText =
+            [NSString stringWithUTF8String:intvsession_last_error(_session)];
+        [alert runModal];
+    }
+}
+
 - (void)showFujiNetConfig:(id)sender
 {
     (void)sender;
@@ -402,6 +414,9 @@ static NSArray<NSString *> *restartSettingKeys(void)
 
     NSMenuItem *fujiItem = [[NSMenuItem alloc] init];
     NSMenu *fuji = [[NSMenu alloc] initWithTitle:@"FujiNet"];
+    [fuji addItem:[self item:@"Reset to CONFIG"
+                      action:@selector(resetToConfig:)
+                         key:@"r"]];
     [fuji addItem:[self item:@"Configuration…"
                       action:@selector(showFujiNetConfig:)
                          key:@""]];

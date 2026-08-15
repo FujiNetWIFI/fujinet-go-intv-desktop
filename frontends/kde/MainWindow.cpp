@@ -69,6 +69,16 @@ void MainWindow::restartSession()
             QString::fromUtf8(intvsession_last_error(m_session)), 5000);
 }
 
+void MainWindow::resetToConfig()
+{
+    if (intvsession_reset_to_config(m_session) != 0)
+        statusBar()->showMessage(
+            QString::fromUtf8(intvsession_last_error(m_session)), 5000);
+    else
+        statusBar()->showMessage(QStringLiteral("Reset to CONFIG"), 5000);
+    m_display->setFocus();
+}
+
 void MainWindow::showSettings()
 {
     SettingsDialog dlg(m_session, this);
@@ -93,6 +103,9 @@ void MainWindow::buildMenus()
                     this, &MainWindow::showDebugger);
 
     QMenu *fujinet = menuBar()->addMenu(QStringLiteral("&FujiNet"));
+    fujinet->addAction(QStringLiteral("&Reset to CONFIG"),
+                       QKeySequence(Qt::CTRL | Qt::Key_R), this,
+                       &MainWindow::resetToConfig);
     fujinet->addAction(QStringLiteral("&Configuration…"), this,
                        [this] { fujinet_config_show(this, m_session); });
     fujinet->addAction(QStringLiteral("Console &Log…"), this,

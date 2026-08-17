@@ -137,16 +137,23 @@ static void disc_draw(GtkDrawingArea *area, cairo_t *cr, int w, int h,
     cairo_arc(cr, cx, cy, r, 0, 2 * M_PI);
     cairo_fill(cr);
 
-    /* 16 wedge boundaries, offset by half a sector so each wedge is
-     * CENTERED on its compass direction (matching direction_from_point's
-     * own rounding, which snaps to the nearest sector centre). */
-    for (i = 0; i < 16; i++) {
-        double a0 = (i * 22.5 - 11.25) * M_PI / 180.0;
-        double a1 = (i * 22.5 + 11.25) * M_PI / 180.0;
-        if (i == d->direction) {
+    /* 8 wedges, one per reachable direction code (0,2,4,...,14), each
+     * CENTERED on its compass direction and spanning exactly the 45-degree
+     * sector that direction_from_point maps to it. direction_from_point
+     * works in math convention (CCW, up = +90deg); cairo angles grow
+     * CLOCKWISE in this y-down surface, so math angle `a` corresponds to
+     * device angle `-a` here -- the radial endpoints are computed directly
+     * as (cx + r*cos(a), cy - r*sin(a)) rather than handed to cairo_arc,
+     * which would otherwise draw the mirror image. */
+    for (i = 0; i < 8; i++) {
+        int dir = i * 2;
+        double a0 = (i * 45.0 - 22.5) * M_PI / 180.0;
+        double a1 = (i * 45.0 + 22.5) * M_PI / 180.0;
+        if (dir == d->direction) {
             cairo_set_source_rgb(cr, 0.30, 0.55, 0.90);
             cairo_move_to(cr, cx, cy);
-            cairo_arc(cr, cx, cy, r, a0, a1);
+            cairo_line_to(cr, cx + r * cos(a0), cy - r * sin(a0));
+            cairo_arc_negative(cr, cx, cy, r, -a0, -a1);
             cairo_close_path(cr);
             cairo_fill(cr);
         }
@@ -154,10 +161,10 @@ static void disc_draw(GtkDrawingArea *area, cairo_t *cr, int w, int h,
 
     cairo_set_source_rgb(cr, 0.45, 0.45, 0.5);
     cairo_set_line_width(cr, 1.5);
-    for (i = 0; i < 16; i++) {
-        double a = (i * 22.5 - 11.25) * M_PI / 180.0;
+    for (i = 0; i < 8; i++) {
+        double a = (i * 45.0 - 22.5) * M_PI / 180.0;
         cairo_move_to(cr, cx, cy);
-        cairo_line_to(cr, cx + r * cos(a), cy + r * sin(a));
+        cairo_line_to(cr, cx + r * cos(a), cy - r * sin(a));
         cairo_stroke(cr);
     }
     cairo_arc(cr, cx, cy, r, 0, 2 * M_PI);
@@ -354,7 +361,7 @@ static void ensure_window(GtkWindow *parent, intvsession *session)
         return;
 
     g_session = session;
-    g_win = GTK_WINDOW(gtk_window_new());
+    g_win = GTK_WINDOW(adw_window_new());
     gtk_window_set_title(g_win, "Keypad");
     gtk_window_set_default_size(g_win, 560, 360);
     gtk_window_set_resizable(g_win, FALSE);
@@ -379,7 +386,7 @@ static void ensure_window(GtkWindow *parent, intvsession *session)
     tb = adw_toolbar_view_new();
     adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(tb), header);
     adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(tb), root);
-    gtk_window_set_child(g_win, tb);
+    adw_window_set_content(ADW_WINDOW(g_win), tb);
 
     keys = gtk_event_controller_key_new();
     g_signal_connect(keys, "key-pressed", G_CALLBACK(on_key_pressed), NULL);

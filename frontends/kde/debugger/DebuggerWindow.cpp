@@ -44,6 +44,7 @@
 #include <QToolBar>
 #include <QVBoxLayout>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
@@ -275,12 +276,15 @@ void DebuggerWindow::buildUi()
         auto *bar = new QWidget;
         auto *barLayout = new QHBoxLayout(bar);
         barLayout->setContentsMargins(0, 0, 0, 0);
-        auto *prev = new QPushButton(QStringLiteral("◀"));
-        auto *next = new QPushButton(QStringLiteral("▶"));
+        auto *prev = new QPushButton(QStringLiteral("◀ Prev"));
+        auto *next = new QPushButton(QStringLiteral("Next ▶"));
         connect(prev, &QPushButton::clicked, this, [this] { cardsPage(-1); });
         connect(next, &QPushButton::clicked, this, [this] { cardsPage(1); });
+        m_cardsRange = new QLabel;
         barLayout->addWidget(prev);
         barLayout->addWidget(next);
+        barLayout->addWidget(m_cardsRange);
+        barLayout->addStretch();
         auto *col = new QVBoxLayout;
         col->addWidget(m_cards);
         col->addLayout(barLayout);
@@ -425,11 +429,18 @@ void DebuggerWindow::refreshStic()
     m_mobInfo->setPlainText(mobText);
 
     const int total = intvstic_card_count(&snap);
+    m_cardTotal = total;
     if (m_cardFirst >= total)
         m_cardFirst = 0;
     intvstic_render_cards(&snap, m_cardFirst, kCardRowsPerPage, cardsRgba);
     setRgba(m_cards, cardsRgba, INTVSTIC_CARDS_PER_ROW * 8,
            kCardRowsPerPage * 8);
+    const int page = INTVSTIC_CARDS_PER_ROW * kCardRowsPerPage;
+    const int lastShown = std::min(m_cardFirst + page, total) - 1;
+    m_cardsRange->setText(QStringLiteral("cards %1–%2 of %3")
+                              .arg(m_cardFirst)
+                              .arg(lastShown)
+                              .arg(total));
 
     intvstic_render_palette(m_dbg, palRgba);
     setRgba(m_palette, palRgba, INTVSTIC_PAL_CELL * 16, INTVSTIC_PAL_CELL);
@@ -441,11 +452,17 @@ void DebuggerWindow::refreshStic()
 void DebuggerWindow::cardsPage(int delta)
 {
     const int page = INTVSTIC_CARDS_PER_ROW * kCardRowsPerPage;
+    const int lastPage =
+        m_cardTotal > 0 ? ((m_cardTotal - 1) / page) * page : 0;
     int next = m_cardFirst + delta * page;
     if (next < 0)
         next = 0;
+    if (next > lastPage)
+        next = lastPage;
     m_cardFirst = next;
     m_seenSerial = 0;
+    if (intvdebug_is_paused(m_dbg))
+        refreshStic();
 }
 
 void DebuggerWindow::refreshAll()

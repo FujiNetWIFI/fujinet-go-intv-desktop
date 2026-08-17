@@ -33,6 +33,21 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.4.1" date="2026-08-17">
+      <description>
+        <p>
+          Fixes the debugger's GRAM/GROM card sheet pager, whose Prev/Next
+          buttons gave no indication they were controls or which cards were
+          on screen, and which silently wrapped back to the first page
+          instead of stopping at the last; it now shows a "cards N-M of
+          total" range and clamps at both ends. Fixes the keypad's
+          directional disc lighting the wrong side of the dial (top press
+          lit the bottom wedge, etc.) while still sending the correct
+          direction to the emulator; the highlighted wedge is now correctly
+          oriented and matches the sector that actually produces it.
+        </p>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-08-15">
       <description>
         <p>

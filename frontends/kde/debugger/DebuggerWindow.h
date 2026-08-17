@@ -54,9 +54,11 @@ private:
     uint16_t m_memBase = 0;
 
     QLabel *m_backtab, *m_mob[INTVSTIC_MOB_COUNT], *m_cards, *m_palette;
+    QLabel *m_cardsRange;
     QPlainTextEdit *m_mobInfo;
     QPlainTextEdit *m_sticState;
     int m_cardFirst = 0;
+    int m_cardTotal = 0;
 
     QTimer *m_tick;
     uint64_t m_seenSerial = 0;

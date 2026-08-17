@@ -129,9 +129,9 @@ static void disc_paint(HWND hwnd, disc_state *s)
          * window already uses -- so the two radial points are computed
          * with a negated sin term to match the disc's own East-clockwise
          * compass convention (see direction_from_point's own comment). */
-        double a0 = (s->direction * 22.5 - 33.75) * 3.14159265358979323846 /
+        double a0 = (s->direction * 22.5 - 22.5) * 3.14159265358979323846 /
                     180.0;
-        double a1 = (s->direction * 22.5 + 33.75) * 3.14159265358979323846 /
+        double a1 = (s->direction * 22.5 + 22.5) * 3.14159265358979323846 /
                     180.0;
         SelectObject(hdc, hi);
         Pie(hdc, cx - r, cy - r, cx + r, cy + r,

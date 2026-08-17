@@ -99,8 +99,8 @@ protected:
              * directionFromPoint's own angle convention exactly: degrees,
              * 0 = East (3 o'clock), positive = counter-clockwise. No unit
              * conversion or sign flip needed here. */
-            const double a0Deg = m_direction * 22.5 - 33.75;
-            const double sweepDeg = 67.5;
+            const double a0Deg = m_direction * 22.5 - 22.5;
+            const double sweepDeg = 45.0;
             QPainterPath wedge(QPointF(cx, cy));
             wedge.arcTo(QRectF(cx - r, cy - r, 2 * r, 2 * r), a0Deg, sweepDeg);
             wedge.closeSubpath();

@@ -19,6 +19,7 @@
 
 #include "debugger/dbg_window.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -50,9 +51,11 @@ typedef struct {
     GtkPicture *pic_mob[INTVSTIC_MOB_COUNT];
     GtkLabel *mob_info;
     GtkPicture *pic_cards;
+    GtkLabel *cards_range;
     GtkPicture *pic_pal;
     GtkTextView *stic_state;
     int card_first;
+    int card_total;
 
     guint tick_id;
     uint64_t seen_serial;
@@ -204,12 +207,23 @@ static void refresh_stic(DbgWin *w)
     g_string_free(mobtext, TRUE);
 
     total = intvstic_card_count(&snap);
+    w->card_total = total;
     rows = CARD_ROWS_PER_PAGE;
     if (w->card_first >= total)
         w->card_first = 0;
     intvstic_render_cards(&snap, w->card_first, rows, cards_rgba);
     set_picture(w->pic_cards, cards_rgba, INTVSTIC_CARDS_PER_ROW * 8,
                rows * 8);
+    {
+        int page = INTVSTIC_CARDS_PER_ROW * rows;
+        int last_shown = (w->card_first + page < total ? w->card_first + page
+                                                        : total) -
+                        1;
+        char range_text[64];
+        snprintf(range_text, sizeof(range_text), "cards %d\xe2\x80\x93%d of %d",
+                w->card_first, last_shown, total);
+        gtk_label_set_text(w->cards_range, range_text);
+    }
 
     intvstic_render_palette(w->dbg, pal_rgba);
     set_picture(w->pic_pal, pal_rgba, INTVSTIC_PAL_CELL * 16,
@@ -304,11 +318,18 @@ static void on_cards_page(GtkButton *btn, gpointer user_data)
     int delta =
         GPOINTER_TO_INT(g_object_get_data(G_OBJECT(btn), "delta"));
     int page = INTVSTIC_CARDS_PER_ROW * CARD_ROWS_PER_PAGE;
+    int last_page = w->card_total > 0
+                       ? ((w->card_total - 1) / page) * page
+                       : 0;
     int next = w->card_first + delta * page;
     if (next < 0)
         next = 0;
+    if (next > last_page)
+        next = last_page;
     w->card_first = next;
     w->seen_serial = 0;
+    if (intvdebug_is_paused(w->dbg))
+        refresh_stic(w);
 }
 
 static void load_symbols_done(GObject *source, GAsyncResult *result,
@@ -599,6 +620,8 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
         g_signal_connect(next, "clicked", G_CALLBACK(on_cards_page), w);
         gtk_box_append(GTK_BOX(cards_bar), prev);
         gtk_box_append(GTK_BOX(cards_bar), next);
+        w->cards_range = GTK_LABEL(gtk_label_new(""));
+        gtk_box_append(GTK_BOX(cards_bar), GTK_WIDGET(w->cards_range));
     }
     {
         GtkWidget *cbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);

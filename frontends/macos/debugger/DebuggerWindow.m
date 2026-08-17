@@ -106,7 +106,9 @@ static DebuggerWindow *g_debugger;
     NSImageView *_mobView[INTVSTIC_MOB_COUNT];
     NSTextView *_mobInfo;
     NSImageView *_cardsView;
+    NSTextField *_cardsRangeLabel;
     int _cardFirst;
+    int _cardTotal;
     NSImageView *_palView;
     NSTextView *_sticState;
 
@@ -322,10 +324,11 @@ static NSTextView *monoView(NSScrollView **scrollOut)
 
     _cardsView = [self pictureView:INTVSTIC_CARDS_PER_ROW * 8
                              height:CARD_ROWS_PER_PAGE * 8];
-    NSButton *prevBtn = [self button:@"<" action:@selector(cardsPrev:)];
-    NSButton *nextBtn = [self button:@">" action:@selector(cardsNext:)];
-    NSStackView *pagerRow =
-        [NSStackView stackViewWithViews:@[ prevBtn, nextBtn ]];
+    NSButton *prevBtn = [self button:@"< Prev" action:@selector(cardsPrev:)];
+    NSButton *nextBtn = [self button:@"Next >" action:@selector(cardsNext:)];
+    _cardsRangeLabel = [self label:@""];
+    NSStackView *pagerRow = [NSStackView
+        stackViewWithViews:@[ prevBtn, nextBtn, _cardsRangeLabel ]];
     pagerRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     NSStackView *cardsCol = [NSStackView stackViewWithViews:@[
         [self label:@"GRAM/GROM cards"], _cardsView, pagerRow
@@ -481,13 +484,21 @@ static NSTextView *monoView(NSScrollView **scrollOut)
     if (_cardFirst < 0)
         _cardFirst = 0;
     _seenSerial = 0;
+    if (intvdebug_is_paused(_dbg))
+        [self refreshStic];
 }
 
 - (void)cardsNext:(id)sender
 {
     (void)sender;
-    _cardFirst += INTVSTIC_CARDS_PER_ROW * CARD_ROWS_PER_PAGE;
+    int page = INTVSTIC_CARDS_PER_ROW * CARD_ROWS_PER_PAGE;
+    int lastPage = _cardTotal > 0 ? ((_cardTotal - 1) / page) * page : 0;
+    _cardFirst += page;
+    if (_cardFirst > lastPage)
+        _cardFirst = lastPage;
     _seenSerial = 0;
+    if (intvdebug_is_paused(_dbg))
+        [self refreshStic];
 }
 
 - (void)gotoMem:(id)sender
@@ -623,11 +634,20 @@ static NSTextView *monoView(NSScrollView **scrollOut)
     _mobInfo.string = mobtext;
 
     int total = intvstic_card_count(&snap);
+    _cardTotal = total;
     if (_cardFirst >= total)
         _cardFirst = 0;
     intvstic_render_cards(&snap, _cardFirst, CARD_ROWS_PER_PAGE, _scratch);
     _cardsView.image = imageFromRGBA(_scratch, INTVSTIC_CARDS_PER_ROW * 8,
                                      CARD_ROWS_PER_PAGE * 8, NO);
+    {
+        int page = INTVSTIC_CARDS_PER_ROW * CARD_ROWS_PER_PAGE;
+        int lastShown =
+            (_cardFirst + page < total ? _cardFirst + page : total) - 1;
+        _cardsRangeLabel.stringValue = [NSString
+            stringWithFormat:@"cards %d–%d of %d", _cardFirst,
+                            lastShown, total];
+    }
 
     intvstic_render_palette(_dbg, _scratch);
     _palView.image = imageFromRGBA(_scratch, INTVSTIC_PAL_CELL * 16,

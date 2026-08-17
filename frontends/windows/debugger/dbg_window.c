@@ -81,7 +81,7 @@ typedef struct {
 
     HWND backtab_label, backtab_view;
     HWND mob_label, mob_view[INTVSTIC_MOB_COUNT], mob_info;
-    HWND cards_label, cards_view, cards_prev, cards_next;
+    HWND cards_label, cards_view, cards_prev, cards_next, cards_range;
     HWND pal_label, pal_view;
     HWND state_label, stic_state;
 
@@ -91,6 +91,7 @@ typedef struct {
     uint8_t cards_bgrx[INTVSTIC_CARDS_PER_ROW * 8 * CARD_ROWS_PER_PAGE * 8 * 4];
     uint8_t pal_bgrx[INTVSTIC_PAL_CELL * 16 * INTVSTIC_PAL_CELL * 4];
     int card_first;
+    int card_total;
 
     intvsession *session;
     intvdebug *dbg;
@@ -299,10 +300,11 @@ static void build_controls(debugger *d)
     d->cards_label = label(d, "GRAM/GROM cards");
     d->cards_view = pixels(d, IDC_CARDS, &d->cards_pv, d->cards_bgrx,
                            INTVSTIC_CARDS_PER_ROW * 8, CARD_ROWS_PER_PAGE * 8);
-    d->cards_prev = child(d, "BUTTON", "<", WS_VISIBLE | BS_PUSHBUTTON,
+    d->cards_prev = child(d, "BUTTON", "< Prev", WS_VISIBLE | BS_PUSHBUTTON,
                           IDC_CARDS_PREV);
-    d->cards_next = child(d, "BUTTON", ">", WS_VISIBLE | BS_PUSHBUTTON,
+    d->cards_next = child(d, "BUTTON", "Next >", WS_VISIBLE | BS_PUSHBUTTON,
                           IDC_CARDS_NEXT);
+    d->cards_range = label(d, "");
     d->pal_label = label(d, "Palette");
     d->pal_view = pixels(d, IDC_PALETTE, &d->pal_pv, d->pal_bgrx,
                         INTVSTIC_PAL_CELL * 16, INTVSTIC_PAL_CELL);
@@ -339,6 +341,7 @@ static void show_page(debugger *d, int page)
     ShowWindow(d->cards_view, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
     ShowWindow(d->cards_prev, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
     ShowWindow(d->cards_next, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->cards_range, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
     ShowWindow(d->pal_label, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
     ShowWindow(d->pal_view, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
     ShowWindow(d->state_label, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
@@ -409,9 +412,11 @@ static void layout(debugger *d)
         MoveWindow(d->cards_view, sx, cy + 20, INTVSTIC_CARDS_PER_ROW * 8 * 2,
                   CARD_ROWS_PER_PAGE * 8 * 2, TRUE);
         MoveWindow(d->cards_prev, sx,
-                  cy + 24 + CARD_ROWS_PER_PAGE * 8 * 2, 40, 24, TRUE);
-        MoveWindow(d->cards_next, sx + 44,
-                  cy + 24 + CARD_ROWS_PER_PAGE * 8 * 2, 40, 24, TRUE);
+                  cy + 24 + CARD_ROWS_PER_PAGE * 8 * 2, 70, 24, TRUE);
+        MoveWindow(d->cards_next, sx + 74,
+                  cy + 24 + CARD_ROWS_PER_PAGE * 8 * 2, 70, 24, TRUE);
+        MoveWindow(d->cards_range, sx + 150,
+                  cy + 28 + CARD_ROWS_PER_PAGE * 8 * 2, 160, 18, TRUE);
 
         MoveWindow(d->pal_label, mx, cy, 200, 18, TRUE);
         MoveWindow(d->pal_view, mx, cy + 20, INTVSTIC_PAL_CELL * 16,
@@ -553,6 +558,7 @@ static void refresh_stic(debugger *d)
     SetWindowTextA(d->mob_info, mobtext);
 
     total = intvstic_card_count(&snap);
+    d->card_total = total;
     if (d->card_first >= total)
         d->card_first = 0;
     intvstic_render_cards(&snap, d->card_first, CARD_ROWS_PER_PAGE,
@@ -560,6 +566,15 @@ static void refresh_stic(debugger *d)
     rgba_to_bgrx(rgba_scratch, d->cards_bgrx, INTVSTIC_CARDS_PER_ROW * 8,
                 CARD_ROWS_PER_PAGE * 8);
     InvalidateRect(d->cards_view, NULL, FALSE);
+    {
+        int page = INTVSTIC_CARDS_PER_ROW * CARD_ROWS_PER_PAGE;
+        int last_shown =
+            (d->card_first + page < total ? d->card_first + page : total) - 1;
+        char range_text[64];
+        snprintf(range_text, sizeof(range_text), "cards %d-%d of %d",
+                d->card_first, last_shown, total);
+        SetWindowTextA(d->cards_range, range_text);
+    }
 
     intvstic_render_palette(d->dbg, rgba_scratch);
     rgba_to_bgrx(rgba_scratch, d->pal_bgrx, INTVSTIC_PAL_CELL * 16,
@@ -644,12 +659,20 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             d->card_first -= page;
             if (d->card_first < 0) d->card_first = 0;
             d->seen_serial = 0;
+            if (intvdebug_is_paused(d->dbg)) refresh_stic(d);
             return 0;
         }
-        case IDC_CARDS_NEXT:
-            d->card_first += INTVSTIC_CARDS_PER_ROW * CARD_ROWS_PER_PAGE;
+        case IDC_CARDS_NEXT: {
+            int page = INTVSTIC_CARDS_PER_ROW * CARD_ROWS_PER_PAGE;
+            int last_page = d->card_total > 0
+                               ? ((d->card_total - 1) / page) * page
+                               : 0;
+            d->card_first += page;
+            if (d->card_first > last_page) d->card_first = last_page;
             d->seen_serial = 0;
+            if (intvdebug_is_paused(d->dbg)) refresh_stic(d);
             return 0;
+        }
         default:
             break;
         }

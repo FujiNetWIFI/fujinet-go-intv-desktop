@@ -253,7 +253,7 @@ static void ensure_window(GtkWindow *parent, intvsession *session)
         return;
 
     g_session = session;
-    g_win = GTK_WINDOW(gtk_window_new());
+    g_win = GTK_WINDOW(adw_window_new());
     gtk_window_set_title(g_win, "ECS Keyboard");
     gtk_window_set_default_size(g_win, 640, 260);
     gtk_window_set_resizable(g_win, FALSE);
@@ -281,7 +281,7 @@ static void ensure_window(GtkWindow *parent, intvsession *session)
     tb = adw_toolbar_view_new();
     adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(tb), header);
     adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(tb), root);
-    gtk_window_set_child(g_win, tb);
+    adw_window_set_content(ADW_WINDOW(g_win), tb);
 
     keys = gtk_event_controller_key_new();
     g_signal_connect(keys, "key-pressed", G_CALLBACK(on_key_pressed), NULL);

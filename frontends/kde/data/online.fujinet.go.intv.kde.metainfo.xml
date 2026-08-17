@@ -33,6 +33,21 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.4.3" date="2026-08-17">
+      <description>
+        <p>
+          The debugger's symbol table now persists for the life of the app
+          instead of being thrown away every time the debugger window
+          closes, since loading a game's as1600 symbols is always a manual
+          step taken after FujiNet CONFIG has already booted the cart --
+          there is no path to auto-load one from. The "Load Symbols..."
+          picker remembers the last folder used. The memory "Address" box
+          and a new "Break at" field accept a symbol name as well as hex.
+          A new Symbols tab lists every loaded symbol, filterable by name,
+          with a click jumping the memory view to that address.
+        </p>
+      </description>
+    </release>
     <release version="0.4.2" date="2026-08-17">
       <description>
         <p>

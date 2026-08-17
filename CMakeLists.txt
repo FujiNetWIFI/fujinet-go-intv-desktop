@@ -15,7 +15,7 @@ endif()
 # and the release workflow all take it from PROJECT_VERSION, and cutting a
 # tag checks that the tag agrees with it (see "Cutting a release" in the
 # README).
-project(fujinet-go-intv-desktop VERSION 0.4.2 LANGUAGES C)
+project(fujinet-go-intv-desktop VERSION 0.4.3 LANGUAGES C)
 
 add_compile_definitions(INTV_VERSION_STRING="${PROJECT_VERSION}")
 

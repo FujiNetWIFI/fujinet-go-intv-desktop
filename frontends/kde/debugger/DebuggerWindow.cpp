@@ -287,7 +287,7 @@ void DebuggerWindow::buildUi()
         barLayout->addStretch();
         auto *col = new QVBoxLayout;
         col->addWidget(m_cards);
-        col->addLayout(barLayout);
+        col->addWidget(bar);
         auto *wrap = new QWidget;
         wrap->setLayout(col);
         sticGrid->addWidget(new QLabel(QStringLiteral("GRAM/GROM cards")), 2,

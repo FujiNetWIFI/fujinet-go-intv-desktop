@@ -134,7 +134,7 @@ static DebuggerWindow *g_debugger;
     uint16_t _memBase;
     NSTextField *_breakAddr;
 
-    NSTextView *_symList;
+    SymTextView *_symList;
     NSTextField *_symFilter;
     NSTextField *_symCount;
     unsigned _symSeenGen;

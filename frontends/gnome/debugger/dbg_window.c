@@ -9,9 +9,11 @@
  *
  * The disassembly, register and memory views drive intvdebug.h directly.
  * The symbol table (core/debugger/symbols.h) is not owned by intvdebug --
- * unlike cocodebug's built-in one -- so this window creates and owns its
- * own intvsymtab instance purely for disassembly annotation, destroyed
- * when the window closes.
+ * unlike cocodebug's built-in one -- so this window uses the process-wide
+ * intvsymtab_shared() instead of its own instance: a cart arrives through
+ * FujiNet CONFIG with no path a .sym could ever be derived from, so a user
+ * loading one by hand is the only way symbols get here at all, and that
+ * work should survive closing this window, not be thrown away with it.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -46,6 +48,13 @@ typedef struct {
     GtkEntry *mem_addr;
     GtkLabel *mem;
     uint16_t mem_view_addr;
+    GtkEntry *break_addr;
+
+    GtkListBox *symlist;
+    GtkEntry *sym_filter;
+    GtkLabel *sym_count;
+    unsigned sym_seen_gen;
+    char sym_filter_text[64];
 
     GtkPicture *pic_backtab;
     GtkPicture *pic_mob[INTVSTIC_MOB_COUNT];
@@ -178,6 +187,80 @@ static void refresh_mem(DbgWin *w)
     g_string_free(text, TRUE);
 }
 
+/* Case-insensitive substring test -- strcasestr is a glibc/BSD extension,
+ * not portable C, so this stays a plain local helper instead. */
+static int contains_ci(const char *hay, const char *needle)
+{
+    size_t hlen = strlen(hay), nlen = strlen(needle);
+    size_t i;
+    if (nlen == 0)
+        return 1;
+    if (nlen > hlen)
+        return 0;
+    for (i = 0; i + nlen <= hlen; i++)
+        if (g_ascii_strncasecmp(hay + i, needle, nlen) == 0)
+            return 1;
+    return 0;
+}
+
+static void on_sym_row_activated(GtkListBox *box, GtkListBoxRow *row,
+                                 gpointer user_data)
+{
+    DbgWin *w = user_data;
+    gpointer addr;
+    (void)box;
+    addr = g_object_get_data(G_OBJECT(row), "intv-addr");
+    w->mem_view_addr = (uint16_t)GPOINTER_TO_UINT(addr);
+    gtk_editable_set_text(GTK_EDITABLE(w->mem_addr), "");
+    w->seen_serial = 0;
+}
+
+/* Only rebuilds the list when the table's generation or the filter text has
+ * changed since the last call -- a real game .sym can be a few hundred
+ * entries, no reason to re-walk and re-widget it every tick. */
+static void refresh_symbols(DbgWin *w)
+{
+    unsigned gen = intvsymtab_generation(w->symtab);
+    const char *filter = gtk_editable_get_text(GTK_EDITABLE(w->sym_filter));
+    int n, i, shown = 0;
+    char text[128];
+
+    if (gen == w->sym_seen_gen && strcmp(filter, w->sym_filter_text) == 0)
+        return;
+    w->sym_seen_gen = gen;
+    snprintf(w->sym_filter_text, sizeof(w->sym_filter_text), "%s", filter);
+
+    gtk_list_box_remove_all(w->symlist);
+    n = intvsymtab_count(w->symtab);
+    for (i = 0; i < n; i++) {
+        uint16_t addr;
+        char name[64], note[64];
+        GtkWidget *row, *label;
+
+        if (!intvsymtab_enum(w->symtab, i, &addr, name, sizeof(name), note,
+                             sizeof(note)))
+            continue;
+        if (filter[0] && !contains_ci(name, filter))
+            continue;
+        snprintf(text, sizeof(text), "%04X  %-24s%s%s", addr, name,
+                note[0] ? "  ; " : "", note);
+        row = gtk_list_box_row_new();
+        label = gtk_label_new(text);
+        gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+        gtk_widget_add_css_class(label, "monospace");
+        gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), label);
+        g_object_set_data(G_OBJECT(row), "intv-addr", GUINT_TO_POINTER(addr));
+        gtk_list_box_append(w->symlist, row);
+        shown++;
+    }
+    snprintf(text, sizeof(text), "%d symbol%s%s", shown, shown == 1 ? "" : "s",
+            filter[0] ? " (filtered)" : "");
+    gtk_label_set_text(w->sym_count, text);
+}
+
+static void on_sym_filter_changed(GtkEditable *e, gpointer user_data)
+{ (void)e; refresh_symbols((DbgWin *)user_data); }
+
 static void refresh_stic(DbgWin *w)
 {
     static intvstic_snapshot snap;
@@ -254,6 +337,10 @@ static void refresh_all(DbgWin *w)
         gtk_list_box_remove_all(w->disasm);
         gtk_label_set_text(w->mem, "");
     }
+    /* Independent of run/pause -- the symbol list reflects what's loaded,
+     * not machine state, and is cheap to skip when nothing changed (see
+     * refresh_symbols's own comment). */
+    refresh_symbols(w);
     w->was_paused = paused;
 }
 
@@ -303,18 +390,41 @@ static void on_clear_bp(GtkButton *b, gpointer u)
     w->seen_serial = 0;
 }
 
+/* Errors here go straight to the status label, same as on_load_symbols'
+ * "Could not open symbol file" -- and, like that one, must NOT touch
+ * seen_serial: doing so would force the very next tick_cb to overwrite the
+ * message with the plain Paused/Running text before the user reads it. */
 static void go_to_mem_addr(DbgWin *w)
 {
     const char *text = gtk_editable_get_text(GTK_EDITABLE(w->mem_addr));
-    char *end;
-    unsigned long v = strtoul(text, &end, 16);
-    if (end != text)
-        w->mem_view_addr = (uint16_t)v;
-    w->seen_serial = 0;
+    uint16_t addr;
+    if (intvsym_parse_addr(w->symtab, text, &addr)) {
+        w->mem_view_addr = addr;
+        w->seen_serial = 0;
+    } else {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "No such symbol or address: %s", text);
+        gtk_label_set_text(w->status, msg);
+    }
 }
 
 static void on_mem_addr_activate(GtkEntry *entry, gpointer user_data)
 { (void)entry; go_to_mem_addr(user_data); }
+
+static void on_break_addr_activate(GtkEntry *entry, gpointer user_data)
+{
+    DbgWin *w = user_data;
+    const char *text = gtk_editable_get_text(GTK_EDITABLE(entry));
+    uint16_t addr;
+    if (intvsym_parse_addr(w->symtab, text, &addr)) {
+        intvdebug_breakpoint_toggle(w->dbg, addr);
+        w->seen_serial = 0; /* redraw the marker immediately */
+    } else {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "No such symbol or address: %s", text);
+        gtk_label_set_text(w->status, msg);
+    }
+}
 
 static void on_cards_page(GtkButton *btn, gpointer user_data)
 {
@@ -355,6 +465,17 @@ static void load_symbols_done(GObject *source, GAsyncResult *result,
         gtk_label_set_text(w->status, "Could not open symbol file");
         return;
     }
+    /* Remember the directory (settings key "sym_dir") so re-opening the
+     * picker -- expected to happen often, since loading is always a manual
+     * step taken after CONFIG has already booted a cart, never automatic --
+     * starts back where the user just was. */
+    {
+        char dir[1024];
+        if (intvsym_dirname(path, dir, sizeof(dir)) > 0 && w->session) {
+            intvsession_set_str(w->session, "sym_dir", dir);
+            intvsession_settings_flush(w->session);
+        }
+    }
     w->seen_serial = 0;
 }
 
@@ -364,6 +485,9 @@ static void on_load_symbols(GtkButton *button, gpointer user_data)
     GtkFileDialog *dialog = gtk_file_dialog_new();
     GtkFileFilter *filter = gtk_file_filter_new();
     GListStore *filters = g_list_store_new(GTK_TYPE_FILE_FILTER);
+    const char *last_dir = w->session
+                              ? intvsession_get_str(w->session, "sym_dir", "")
+                              : "";
     (void)button;
 
     gtk_file_filter_set_name(filter, "as1600 symbol files");
@@ -372,6 +496,10 @@ static void on_load_symbols(GtkButton *button, gpointer user_data)
     g_list_store_append(filters, filter);
     gtk_file_dialog_set_title(dialog, "Load Symbols");
     gtk_file_dialog_set_filters(dialog, G_LIST_MODEL(filters));
+    if (last_dir[0]) {
+        g_autoptr(GFile) folder = g_file_new_for_path(last_dir);
+        gtk_file_dialog_set_initial_folder(dialog, folder);
+    }
     gtk_file_dialog_open(dialog, w->win, NULL, load_symbols_done, w);
     g_object_unref(filters);
     g_object_unref(dialog);
@@ -421,7 +549,9 @@ static void on_closed(GtkWindow *window, gpointer user_data)
     /* Releasing costs the machine nothing further (see intvdebug.h) and
      * leaving it engaged+paused would look like the emulator had hung. */
     intvdebug_set_engaged(w->dbg, 0);
-    intvsymtab_destroy(w->symtab);
+    /* w->symtab is intvsymtab_shared() -- process-wide, not owned by this
+     * window -- so it is deliberately NOT destroyed here; see this file's
+     * header comment. */
     g_free(w);
 }
 
@@ -480,9 +610,8 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     w = g_new0(DbgWin, 1);
     w->session = session;
     w->dbg = intvdebug_get();
-    w->symtab = intvsymtab_create();
+    w->symtab = intvsymtab_shared();
     w->mem_view_addr = 0x0000;
-    (void)session;
 
     w->win = GTK_WINDOW(adw_window_new());
     singleton = w->win;
@@ -518,6 +647,14 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
                    tool_button("_Clear Breakpoints",
                                "Remove every breakpoint",
                                G_CALLBACK(on_clear_bp), w));
+    gtk_box_append(GTK_BOX(bar), gtk_label_new("Break at:"));
+    w->break_addr = GTK_ENTRY(gtk_entry_new());
+    gtk_widget_set_tooltip_text(GTK_WIDGET(w->break_addr),
+                                "Symbol name or hex address, then Enter");
+    gtk_editable_set_width_chars(GTK_EDITABLE(w->break_addr), 12);
+    g_signal_connect(w->break_addr, "activate",
+                     G_CALLBACK(on_break_addr_activate), w);
+    gtk_box_append(GTK_BOX(bar), GTK_WIDGET(w->break_addr));
     gtk_box_append(GTK_BOX(bar),
                    tool_button("Load _Symbols…",
                                "Load an as1600 -s symbol file",
@@ -655,6 +792,38 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
                                       stic_grid);
         gtk_notebook_append_page(GTK_NOTEBOOK(notebook), outer_scroll,
                                  gtk_label_new("STIC"));
+    }
+    {
+        GtkWidget *sym_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+        GtkWidget *sym_filter_bar =
+            gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        GtkWidget *sym_scroll = gtk_scrolled_window_new();
+
+        gtk_widget_set_margin_top(sym_box, 6);
+        gtk_widget_set_margin_bottom(sym_box, 6);
+        gtk_widget_set_margin_start(sym_box, 6);
+        gtk_widget_set_margin_end(sym_box, 6);
+
+        gtk_box_append(GTK_BOX(sym_filter_bar), gtk_label_new("Filter:"));
+        w->sym_filter = GTK_ENTRY(gtk_entry_new());
+        g_signal_connect(w->sym_filter, "changed",
+                         G_CALLBACK(on_sym_filter_changed), w);
+        gtk_box_append(GTK_BOX(sym_filter_bar), GTK_WIDGET(w->sym_filter));
+        w->sym_count = GTK_LABEL(gtk_label_new(""));
+        gtk_box_append(GTK_BOX(sym_filter_bar), GTK_WIDGET(w->sym_count));
+
+        w->symlist = GTK_LIST_BOX(gtk_list_box_new());
+        gtk_list_box_set_selection_mode(w->symlist, GTK_SELECTION_NONE);
+        g_signal_connect(w->symlist, "row-activated",
+                         G_CALLBACK(on_sym_row_activated), w);
+        gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sym_scroll),
+                                      GTK_WIDGET(w->symlist));
+        gtk_widget_set_vexpand(sym_scroll, TRUE);
+
+        gtk_box_append(GTK_BOX(sym_box), sym_filter_bar);
+        gtk_box_append(GTK_BOX(sym_box), sym_scroll);
+        gtk_notebook_append_page(GTK_NOTEBOOK(notebook), sym_box,
+                                 gtk_label_new("Symbols"));
     }
 
     box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);

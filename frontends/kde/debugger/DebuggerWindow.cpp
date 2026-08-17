@@ -13,12 +13,15 @@
  * instead. Same reasoning the GNOME port's own header documents.
  *
  * The symbol table (core/debugger/symbols.h) is not owned by intvdebug --
- * unlike msxdebug's own -- so this window creates and owns its own
- * intvsymtab instance purely for disassembly/memory annotation, destroyed
- * when the window closes. It ships pre-seeded with EXEC ROM/RAM and cart-
- * header symbols (see symbols.c); "Load Symbols..." on the toolbar loads a
- * per-game as1600 .sym file on top (e.g. one of the FujiNet Intellivision
- * ports' build/GAME_net.sym), matching the GNOME port's own UI.
+ * unlike msxdebug's own -- so this window uses the process-wide
+ * intvsymtab_shared() instead of its own instance: a cart arrives through
+ * FujiNet CONFIG with no path a .sym could ever be derived from, so a user
+ * loading one by hand is the only way symbols get here at all, and that
+ * work should survive closing this window, not be thrown away with it. It
+ * ships pre-seeded with EXEC ROM/RAM and cart-header symbols (see
+ * symbols.c); "Load Symbols..." on the toolbar loads a per-game as1600
+ * .sym file on top (e.g. one of the FujiNet Intellivision ports'
+ * build/GAME_net.sym), matching the GNOME port's own UI.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -34,6 +37,7 @@
 #include <QImage>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QMessageBox>
 #include <QPixmap>
 #include <QPlainTextEdit>
@@ -105,9 +109,8 @@ void DebuggerWindow::showFor(QWidget *parent, intvsession *session)
 DebuggerWindow::DebuggerWindow(QWidget *parent, intvsession *session)
     : QMainWindow(parent), m_session(session)
 {
-    (void)m_session;
     m_dbg = intvdebug_get();
-    m_symtab = intvsymtab_create();
+    m_symtab = intvsymtab_shared();
     setWindowFlag(Qt::Window);
     setAttribute(Qt::WA_DeleteOnClose);
     setWindowTitle(QStringLiteral("Intellivision Debugger"));
@@ -138,7 +141,9 @@ DebuggerWindow::~DebuggerWindow()
     /* Releasing costs the machine nothing further (see intvdebug.h) and
      * leaving it engaged+paused would look like the emulator had hung. */
     intvdebug_set_engaged(m_dbg, 0);
-    intvsymtab_destroy(m_symtab);
+    /* m_symtab is intvsymtab_shared() -- process-wide, not owned by this
+     * window -- so it is deliberately NOT destroyed here; see this file's
+     * header comment. */
 }
 
 void DebuggerWindow::buildUi()
@@ -169,6 +174,15 @@ void DebuggerWindow::buildUi()
         m_seenSerial = 0;
     });
     tb->addWidget(clearBp);
+
+    tb->addWidget(new QLabel(QStringLiteral("Break at:")));
+    m_breakAddr = new QLineEdit;
+    m_breakAddr->setMaximumWidth(120);
+    m_breakAddr->setToolTip(
+        QStringLiteral("Symbol name or hex address, then Enter"));
+    connect(m_breakAddr, &QLineEdit::returnPressed, this,
+            &DebuggerWindow::breakAtAddr);
+    tb->addWidget(m_breakAddr);
 
     auto *loadSyms = new QPushButton(QStringLiteral("Load Symbols…"));
     connect(loadSyms, &QPushButton::clicked, this,
@@ -238,14 +252,8 @@ void DebuggerWindow::buildUi()
     auto *memLayout = new QVBoxLayout(memBox);
     m_memAddr = new QLineEdit;
     m_memAddr->setText(QStringLiteral("0000"));
-    connect(m_memAddr, &QLineEdit::returnPressed, this, [this] {
-        bool ok = false;
-        const uint16_t addr = uint16_t(m_memAddr->text().toUInt(&ok, 16));
-        if (ok) {
-            m_memBase = addr;
-            m_seenSerial = 0;
-        }
-    });
+    connect(m_memAddr, &QLineEdit::returnPressed, this,
+            &DebuggerWindow::goToAddr);
     memLayout->addWidget(m_memAddr);
     m_memView = monoView();
     memLayout->addWidget(m_memView);
@@ -320,12 +328,125 @@ void DebuggerWindow::buildUi()
     sticScroll->setWidgetResizable(true);
     sticScroll->setWidget(stic);
     tabs->addTab(sticScroll, QStringLiteral("STIC"));
+
+    /* ---- Symbols tab ---- */
+    auto *symTab = new QWidget;
+    auto *symLayout = new QVBoxLayout(symTab);
+    auto *symFilterBar = new QHBoxLayout;
+    symFilterBar->addWidget(new QLabel(QStringLiteral("Filter:")));
+    m_symFilter = new QLineEdit;
+    connect(m_symFilter, &QLineEdit::textChanged, this,
+            &DebuggerWindow::refreshSymbols);
+    symFilterBar->addWidget(m_symFilter);
+    m_symCount = new QLabel;
+    symFilterBar->addWidget(m_symCount);
+    symLayout->addLayout(symFilterBar);
+
+    m_symList = new QListWidget;
+    QFont symFont = m_symList->font();
+    symFont.setFamily(QStringLiteral("monospace"));
+    symFont.setStyleHint(QFont::TypeWriter);
+    m_symList->setFont(symFont);
+    connect(m_symList, &QListWidget::itemActivated, this,
+            [this](QListWidgetItem *item) {
+                m_memBase = uint16_t(item->data(Qt::UserRole).toUInt());
+                m_memAddr->clear();
+                m_seenSerial = 0;
+                if (intvdebug_is_paused(m_dbg))
+                    refreshMem();
+            });
+    symLayout->addWidget(m_symList, 1);
+
+    tabs->addTab(symTab, QStringLiteral("Symbols"));
+}
+
+void DebuggerWindow::goToAddr()
+{
+    uint16_t addr;
+    if (intvsym_parse_addr(m_symtab, m_memAddr->text().toUtf8().constData(),
+                           &addr)) {
+        m_memBase = addr;
+        m_seenSerial = 0;
+    } else {
+        m_status->setText(
+            QStringLiteral("No such symbol or address: %1").arg(m_memAddr->text()));
+    }
+}
+
+void DebuggerWindow::breakAtAddr()
+{
+    uint16_t addr;
+    if (intvsym_parse_addr(m_symtab, m_breakAddr->text().toUtf8().constData(),
+                           &addr)) {
+        intvdebug_breakpoint_toggle(m_dbg, addr);
+        m_seenSerial = 0; /* redraw the marker immediately */
+    } else {
+        m_status->setText(QStringLiteral("No such symbol or address: %1")
+                              .arg(m_breakAddr->text()));
+    }
+}
+
+/* Only rebuilds the list when the table's generation or the filter text has
+ * changed since the last call -- a real game .sym can be a few hundred
+ * entries, no reason to re-walk and re-widget it on every timer tick. */
+void DebuggerWindow::refreshSymbols()
+{
+    const unsigned gen = intvsymtab_generation(m_symtab);
+    const QString filter = m_symFilter->text();
+    if (gen == m_symSeenGen && filter == m_symFilterText)
+        return;
+    m_symSeenGen = gen;
+    m_symFilterText = filter;
+
+    m_symList->clear();
+    const int n = intvsymtab_count(m_symtab);
+    int shown = 0;
+    for (int i = 0; i < n; i++) {
+        uint16_t addr;
+        char name[64], note[64];
+        if (!intvsymtab_enum(m_symtab, i, &addr, name, sizeof(name), note,
+                             sizeof(note)))
+            continue;
+        const QString qname = QString::fromUtf8(name);
+        if (!filter.isEmpty() &&
+            !qname.contains(filter, Qt::CaseInsensitive))
+            continue;
+        /* Only the address is uppercased -- as1600 symbol names are
+         * case-sensitive (see symbols.h), so unlike refreshDisasm's whole-
+         * string .toUpper() (which only ever uppercases its own hex/
+         * mnemonic text), the name/note here must be left exactly as
+         * loaded. */
+        QString text =
+            QStringLiteral("%1  %2")
+                .arg(QStringLiteral("%1").arg(addr, 4, 16, QLatin1Char('0'))
+                        .toUpper())
+                .arg(qname.leftJustified(24));
+        if (note[0])
+            text += QStringLiteral("  ; %1").arg(QString::fromUtf8(note));
+        auto *item = new QListWidgetItem(text);
+        item->setData(Qt::UserRole, addr);
+        m_symList->addItem(item);
+        shown++;
+    }
+    m_symCount->setText(QStringLiteral("%1 symbol%2%3")
+                            .arg(shown)
+                            .arg(shown == 1 ? QString() : QStringLiteral("s"))
+                            .arg(filter.isEmpty() ? QString()
+                                                  : QStringLiteral(" (filtered)")));
 }
 
 void DebuggerWindow::loadSymbols()
 {
+    /* Remember the directory (settings key "sym_dir") so re-opening the
+     * picker -- expected to happen often, since loading is always a manual
+     * step taken after CONFIG has already booted a cart, never automatic --
+     * starts back where the user just was. */
+    const QString lastDir = m_session
+                                ? QString::fromUtf8(
+                                      intvsession_get_str(m_session, "sym_dir", ""))
+                                : QString();
     const QString path = QFileDialog::getOpenFileName(
-        this, QStringLiteral("Load Symbols"), QString(),
+        this, QStringLiteral("Load Symbols"), lastDir,
         QStringLiteral("as1600 symbol files (*.sym);;All files (*)"));
     if (path.isEmpty())
         return;
@@ -334,6 +455,13 @@ void DebuggerWindow::loadSymbols()
         QMessageBox::warning(this, QStringLiteral("Load Symbols"),
                              QStringLiteral("Could not open %1").arg(path));
         return;
+    }
+    if (m_session) {
+        char dir[1024];
+        if (intvsym_dirname(path.toUtf8().constData(), dir, sizeof(dir)) > 0) {
+            intvsession_set_str(m_session, "sym_dir", dir);
+            intvsession_settings_flush(m_session);
+        }
     }
     m_seenSerial = 0; /* force a redraw with the new symbols applied */
     if (intvdebug_is_paused(m_dbg))
@@ -526,5 +654,9 @@ void DebuggerWindow::refreshAll()
         m_disasm->setPlainText(QString());
         m_memView->setPlainText(QString());
     }
+    /* Independent of run/pause -- the symbol list reflects what's loaded,
+     * not machine state, and is cheap to skip when nothing changed (see
+     * refreshSymbols's own comment). */
+    refreshSymbols();
     m_wasPaused = paused;
 }

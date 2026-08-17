@@ -50,6 +50,20 @@ struct intvsymtab {
     int count;
     int cap;
     int builtin_count; /* entries[0..builtin_count) survive clear_user */
+
+    /* entries[] indices sorted ascending by (addr, entry index) -- built
+     * lazily by ensure_index() and invalidated (index_dirty = 1) by any
+     * mutation, rather than kept incrementally up to date, since the only
+     * mutations that matter in practice are one intvsymtab_load() of many
+     * entries at once, not one intvsymtab_add() at a time. Lets
+     * lookup_addr/lookup_nearest binary-search a large loaded .sym instead
+     * of the O(n) reverse scan every disassembly line and operand used to
+     * pay for. */
+    int *index;
+    int index_cap;
+    int index_dirty;
+
+    unsigned generation; /* bumped by add/load/clear_user; see symbols.h */
 };
 
 /* EXEC ROM entry points ($1000-$1FFF) and system RAM cells the EXEC owns,
@@ -187,7 +201,16 @@ intvsymtab *intvsymtab_create(void)
     }
     t->count = K_BUILTIN_COUNT;
     t->builtin_count = K_BUILTIN_COUNT;
+    t->index_dirty = 1;
     return t;
+}
+
+intvsymtab *intvsymtab_shared(void)
+{
+    static intvsymtab *shared;
+    if (!shared)
+        shared = intvsymtab_create();
+    return shared;
 }
 
 void intvsymtab_destroy(intvsymtab *t)
@@ -195,6 +218,7 @@ void intvsymtab_destroy(intvsymtab *t)
     if (!t)
         return;
     free(t->entries);
+    free(t->index);
     free(t);
 }
 
@@ -208,6 +232,8 @@ int intvsymtab_add(intvsymtab *t, uint16_t addr, const char *name)
     snprintf(t->entries[t->count].name, SYM_NAME_MAX, "%s", name);
     t->entries[t->count].note[0] = 0; /* notes are a built-in-only detail */
     t->count++;
+    t->index_dirty = 1;
+    t->generation++;
     return 1;
 }
 
@@ -216,22 +242,109 @@ void intvsymtab_clear_user(intvsymtab *t)
     if (!t)
         return;
     t->count = t->builtin_count;
+    t->index_dirty = 1;
+    t->generation++;
+}
+
+/* < 0 if entry ia sorts before ib: by addr, ties broken by entry index (so
+ * the sort is well defined without relying on qsort's stability, which
+ * isn't portable across libcs anyway -- see ensure_index below). */
+static int index_before(const intvsymtab *t, int ia, int ib)
+{
+    uint16_t aa = t->entries[ia].addr, ab = t->entries[ib].addr;
+    if (aa != ab)
+        return aa < ab;
+    return ia < ib;
+}
+
+/* Small insertion sort rather than qsort_r (whose comparator argument order
+ * differs between glibc and BSD/macOS, and isn't worth working around here):
+ * table sizes are a game's worth of symbols (hundreds, not millions), and
+ * this only runs once per load, not per lookup. */
+static void ensure_index(intvsymtab *t)
+{
+    int i, j;
+    if (!t->index_dirty && t->index)
+        return;
+    if (t->index_cap < t->count) {
+        int *grown = realloc(t->index, (size_t)t->count * sizeof(int));
+        if (!grown)
+            return; /* leave stale/absent index; callers fall back to scans */
+        t->index = grown;
+        t->index_cap = t->count;
+    }
+    for (i = 0; i < t->count; i++)
+        t->index[i] = i;
+    for (i = 1; i < t->count; i++) {
+        int key = t->index[i];
+        j = i - 1;
+        while (j >= 0 && index_before(t, key, t->index[j])) {
+            t->index[j + 1] = t->index[j];
+            j--;
+        }
+        t->index[j + 1] = key;
+    }
+    t->index_dirty = 0;
+}
+
+/* First index into t->index[] whose entry address is >= addr (lower
+ * bound). Returns t->count if every entry is < addr. */
+static int index_lower_bound(const intvsymtab *t, uint16_t addr)
+{
+    int lo = 0, hi = t->count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (t->entries[t->index[mid]].addr < addr)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+/* Shared by lookup_addr/lookup_nearest: newest-wins entry index at addr, or
+ * -1. Uses the sort index when one is present and current (built by
+ * intvsymtab_load -- see that function), otherwise the same reverse-linear
+ * scan this whole table used before the index existed. Deliberately never
+ * builds/repairs the index itself (that mutates t->index), so this can stay
+ * callable on a const intvsymtab -- a stale index just means an O(n) scan
+ * until the next intvsymtab_load rebuilds it. */
+static int index_find_exact(const intvsymtab *t, uint16_t addr)
+{
+    if (t->index && !t->index_dirty) {
+        int lo = index_lower_bound(t, addr);
+        if (lo < t->count && t->entries[t->index[lo]].addr == addr) {
+            /* index is sorted oldest-first within a tie; the run of equal
+             * addresses continues rightward, so its last member is the
+             * newest (highest entry index) one -- newest wins. */
+            int hi = lo;
+            while (hi + 1 < t->count && t->entries[t->index[hi + 1]].addr == addr)
+                hi++;
+            return t->index[hi];
+        }
+        return -1;
+    }
+    {
+        int i;
+        for (i = t->count - 1; i >= 0; i--)
+            if (t->entries[i].addr == addr)
+                return i;
+    }
+    return -1;
 }
 
 int intvsymtab_lookup_addr(const intvsymtab *t, uint16_t addr, char *dst,
                            int dstsz)
 {
-    int i;
+    int idx;
     if (!t)
         return 0;
-    for (i = t->count - 1; i >= 0; i--) {
-        if (t->entries[i].addr == addr) {
-            if (dst && dstsz > 0)
-                snprintf(dst, (size_t)dstsz, "%s", t->entries[i].name);
-            return 1;
-        }
-    }
-    return 0;
+    idx = index_find_exact(t, addr);
+    if (idx < 0)
+        return 0;
+    if (dst && dstsz > 0)
+        snprintf(dst, (size_t)dstsz, "%s", t->entries[idx].name);
+    return 1;
 }
 
 int intvsymtab_lookup_name(const intvsymtab *t, const char *name,
@@ -281,32 +394,73 @@ int intvsymtab_load(intvsymtab *t, const char *path)
     }
 
     fclose(f);
+    /* Build the sort index once for the whole file rather than leaving it
+     * dirty for the first lookup to discover -- a .sym can be hundreds of
+     * entries, and the very next thing a caller does is usually redraw the
+     * disassembly, which runs a lookup per line. */
+    ensure_index(t);
     return added;
+}
+
+/* First index into t->index[] whose entry address is > addr (upper
+ * bound). Returns t->count if every entry is <= addr. Only ever called
+ * with an already-current index -- see intvsymtab_lookup_nearest. */
+static int index_upper_bound(const intvsymtab *t, uint16_t addr)
+{
+    int lo = 0, hi = t->count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (t->entries[t->index[mid]].addr <= addr)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
 }
 
 int intvsymtab_lookup_nearest(const intvsymtab *t, uint16_t addr, int window,
                               char *dst, int dstsz, int *delta)
 {
-    int i;
     int best_idx = -1;
     int best_delta = 0;
 
     if (!t)
         return 0;
-    for (i = t->count - 1; i >= 0; i--) {
-        int d = (int)addr - (int)t->entries[i].addr;
-        if (d < 0 || d > window)
-            continue;
-        /* Newest-first scan: first candidate found at the smallest delta
-         * wins ties the same way intvsymtab_lookup_addr does. Prefer a
-         * strictly closer symbol over one merely found first. */
-        if (best_idx < 0 || d < best_delta) {
-            best_idx = i;
-            best_delta = d;
-            if (d == 0)
-                break; /* exact match, can't do better */
+
+    if (t->index && !t->index_dirty) {
+        /* entries with addr' <= addr are index[0 .. hi), sorted ascending;
+         * the closest one at or below addr is index[hi - 1], and because
+         * ties on one address are stored oldest-first, that slot already
+         * holds the newest of any tied group -- same "newest wins" rule
+         * lookup_addr uses, for free from the sort order. */
+        int hi = index_upper_bound(t, addr);
+        if (hi > 0) {
+            int idx = t->index[hi - 1];
+            int d = (int)addr - (int)t->entries[idx].addr;
+            if (d >= 0 && d <= window) {
+                best_idx = idx;
+                best_delta = d;
+            }
+        }
+    } else {
+        int i;
+        for (i = t->count - 1; i >= 0; i--) {
+            int d = (int)addr - (int)t->entries[i].addr;
+            if (d < 0 || d > window)
+                continue;
+            /* Newest-first scan: first candidate found at the smallest
+             * delta wins ties the same way intvsymtab_lookup_addr does.
+             * Prefer a strictly closer symbol over one merely found
+             * first. */
+            if (best_idx < 0 || d < best_delta) {
+                best_idx = i;
+                best_delta = d;
+                if (d == 0)
+                    break; /* exact match, can't do better */
+            }
         }
     }
+
     if (best_idx < 0)
         return 0;
     if (dst && dstsz > 0)
@@ -427,4 +581,95 @@ int intvsym_annotate_line(const intvsymtab *t, const intvdebug_dasm_line *l,
     if (have_own)
         return snprintf(dst, (size_t)dstsz, "   ; %s", own);
     return snprintf(dst, (size_t)dstsz, "   ; %s", operand);
+}
+
+int intvsym_parse_addr(const intvsymtab *t, const char *text,
+                       uint16_t *addr_out)
+{
+    char trimmed[SYM_NAME_MAX];
+    const char *hex;
+    char *end;
+    unsigned long v;
+    int len;
+
+    if (!text)
+        return 0;
+    while (isspace((unsigned char)*text))
+        text++;
+    len = (int)strlen(text);
+    while (len > 0 && isspace((unsigned char)text[len - 1]))
+        len--;
+    if (len <= 0)
+        return 0;
+    if (len >= (int)sizeof(trimmed))
+        len = (int)sizeof(trimmed) - 1;
+    memcpy(trimmed, text, (size_t)len);
+    trimmed[len] = 0;
+
+    /* Name first: a symbol literally named "1000" should resolve as that
+     * symbol, not be shadowed by the hex parse below. */
+    if (t && intvsymtab_lookup_name(t, trimmed, addr_out))
+        return 1;
+
+    hex = trimmed;
+    if (hex[0] == '$') {
+        hex++;
+    } else if (hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) {
+        hex += 2;
+    }
+    if (!isxdigit((unsigned char)hex[0]))
+        return 0;
+    v = strtoul(hex, &end, 16);
+    if (*end != 0 || v > 0xFFFF)
+        return 0;
+    if (addr_out)
+        *addr_out = (uint16_t)v;
+    return 1;
+}
+
+int intvsym_dirname(const char *path, char *dst, int dstsz)
+{
+    const char *slash, *bslash, *cut;
+    if (!dst || dstsz <= 0)
+        return 0;
+    dst[0] = 0;
+    if (!path)
+        return 0;
+    slash = strrchr(path, '/');
+    bslash = strrchr(path, '\\');
+    cut = (slash && bslash) ? (slash > bslash ? slash : bslash)
+        : (slash ? slash : bslash);
+    if (!cut)
+        return 0;
+    return snprintf(dst, (size_t)dstsz, "%.*s", (int)(cut - path), path);
+}
+
+int intvsymtab_count(const intvsymtab *t)
+{
+    return t ? t->count : 0;
+}
+
+int intvsymtab_enum(intvsymtab *t, int idx, uint16_t *addr, char *name,
+                    int namesz, char *note, int notesz)
+{
+    int i;
+    if (!t || idx < 0 || idx >= t->count)
+        return 0;
+    ensure_index(t);
+    /* Falls back to entries[] order (built-ins, then load order) if the
+     * index couldn't be (re)built -- e.g. out of memory -- rather than
+     * refusing to enumerate at all. */
+    i = t->index ? t->index[idx] : idx;
+    if (addr)
+        *addr = t->entries[i].addr;
+    if (name && namesz > 0)
+        snprintf(name, (size_t)namesz, "%s", t->entries[i].name);
+    if (note && notesz > 0)
+        snprintf(note, (size_t)notesz, "%s", t->entries[i].note);
+    return 1;
+}
+
+unsigned intvsymtab_generation(const intvsymtab *t)
+{
+    return t ? t->generation : 0;
 }

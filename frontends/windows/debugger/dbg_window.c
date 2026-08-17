@@ -21,12 +21,15 @@
  * from their own core.
  *
  * The symbol table (core/debugger/symbols.h) is not owned by intvdebug --
- * unlike msxdebug's own -- so this window creates and owns its own
- * intvsymtab instance purely for disassembly/memory annotation, destroyed
- * when the window closes. It ships pre-seeded with EXEC ROM/RAM and cart-
- * header symbols (see symbols.c); "Load Symbols..." loads a per-game
- * as1600 .sym file on top, matching the GNOME/KDE ports' own UI. No
- * register/memory editing either: intvdebug has no register-write call.
+ * unlike msxdebug's own -- so this window uses the process-wide
+ * intvsymtab_shared() instead of its own instance: a cart arrives through
+ * FujiNet CONFIG with no path a .sym could ever be derived from, so a user
+ * loading one by hand is the only way symbols get here at all, and that
+ * work should survive closing this window, not be thrown away with it. It
+ * ships pre-seeded with EXEC ROM/RAM and cart-header symbols (see
+ * symbols.c); "Load Symbols..." loads a per-game as1600 .sym file on top,
+ * matching the GNOME/KDE ports' own UI. No register/memory editing
+ * either: intvdebug has no register-write call.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -55,6 +58,7 @@
 
 #define PAGE_CPU 0
 #define PAGE_STIC 1
+#define PAGE_SYMBOLS 2
 
 enum {
     IDC_PAUSE = 1000, IDC_STEP, IDC_STEP_OVER, IDC_STEP_OUT, IDC_CLEAR_BP,
@@ -62,8 +66,10 @@ enum {
     IDC_STATUS, IDC_TABS,
     IDC_DISASM, IDC_FLAGS,
     IDC_MEM_ADDR, IDC_MEM_VIEW,
+    IDC_BREAK_ADDR,
     IDC_BACKTAB, IDC_MOB0, IDC_MOB_LAST = IDC_MOB0 + 7, IDC_MOB_INFO,
     IDC_CARDS, IDC_CARDS_PREV, IDC_CARDS_NEXT, IDC_PALETTE, IDC_STIC_STATE,
+    IDC_SYM_FILTER, IDC_SYM_LIST, IDC_SYM_COUNT,
     IDC_REG0, IDC_REG_LAST = IDC_REG0 + 7,
     IDC_LABEL_FIRST
 };
@@ -83,12 +89,18 @@ typedef struct {
     HWND disasm;
     HWND reg_label[8], reg_edit[8], flags;
     HWND mem_label, mem_addr, mem_view;
+    HWND break_label, break_addr;
+    uint16_t mem_base;
 
     HWND backtab_label, backtab_view;
     HWND mob_label, mob_view[INTVSTIC_MOB_COUNT], mob_info;
     HWND cards_label, cards_view, cards_prev, cards_next, cards_range;
     HWND pal_label, pal_view;
     HWND state_label, stic_state;
+
+    HWND sym_filter_label, sym_filter, sym_list, sym_count;
+    unsigned sym_seen_gen;
+    char sym_filter_text[64];
 
     pixel_view backtab_pv, mob_pv[INTVSTIC_MOB_COUNT], cards_pv, pal_pv;
     uint8_t backtab_bgrx[INTVSTIC_BACKTAB_W * INTVSTIC_BACKTAB_H * 4];
@@ -168,6 +180,7 @@ static LRESULT CALLBACK pixels_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 static WNDPROC g_edit_proc;
 static WNDPROC g_disasm_proc;
+static WNDPROC g_sym_list_proc;
 
 static LRESULT CALLBACK edit_subclass(HWND hwnd, UINT msg, WPARAM wp,
                                       LPARAM lp)
@@ -203,6 +216,45 @@ static LRESULT CALLBACK disasm_subclass(HWND hwnd, UINT msg, WPARAM wp,
         }
     }
     return CallWindowProcA(g_disasm_proc, hwnd, msg, wp, lp);
+}
+
+/* Forward declarations: show_page/refresh_mem are defined later (layout and
+ * refreshers, respectively), but sym_list_subclass -- grouped here with the
+ * other subclass procs, same as disasm_subclass above -- needs to call
+ * both when a symbol row is clicked. */
+static void show_page(debugger *d, int page);
+static void refresh_mem(debugger *d);
+
+/* Symbols page list: a click jumps the memory view to the clicked line's
+ * address, the first 4 hex characters of each line (refresh_symbols'
+ * "%04X  NAME  ; note" format) -- same click-parses-the-line-prefix idiom
+ * as disasm_subclass above, just column 0 instead of 2, and it also
+ * switches the visible page to CPU so the jump is actually visible. */
+static LRESULT CALLBACK sym_list_subclass(HWND hwnd, UINT msg, WPARAM wp,
+                                          LPARAM lp)
+{
+    if (msg == WM_LBUTTONDOWN && g_dbg) {
+        LRESULT pos = SendMessageA(hwnd, EM_CHARFROMPOS, 0, lp);
+        int line = HIWORD(pos);
+        char buf[256];
+        unsigned addr;
+        int n;
+
+        *(WORD *)buf = (WORD)(sizeof(buf) - 1);
+        n = (int)SendMessageA(hwnd, EM_GETLINE, (WPARAM)line, (LPARAM)buf);
+        if (n >= 4) {
+            buf[n] = '\0';
+            if (sscanf(buf, "%4X", &addr) == 1 && addr <= 0xFFFF) {
+                g_dbg->mem_base = (uint16_t)addr;
+                g_dbg->seen_serial = 0;
+                SendMessageA(g_dbg->tabs, TCM_SETCURSEL, PAGE_CPU, 0);
+                show_page(g_dbg, PAGE_CPU);
+                if (intvdebug_is_paused(g_dbg->dbg))
+                    refresh_mem(g_dbg);
+            }
+        }
+    }
+    return CallWindowProcA(g_sym_list_proc, hwnd, msg, wp, lp);
 }
 
 /* ---- construction ----------------------------------------------------------- */
@@ -264,6 +316,8 @@ static void build_controls(debugger *d)
     SendMessageA(d->tabs, TCM_INSERTITEMA, 0, (LPARAM)&item);
     item.pszText = (char *)"STIC";
     SendMessageA(d->tabs, TCM_INSERTITEMA, 1, (LPARAM)&item);
+    item.pszText = (char *)"Symbols";
+    SendMessageA(d->tabs, TCM_INSERTITEMA, 2, (LPARAM)&item);
 
     d->pause_btn = child(d, "BUTTON", "Pause (F5)",
                         WS_VISIBLE | BS_PUSHBUTTON, IDC_PAUSE);
@@ -296,6 +350,8 @@ static void build_controls(debugger *d)
     d->mem_addr = field(d, IDC_MEM_ADDR);
     SetWindowTextA(d->mem_addr, "0000");
     d->mem_view = mono_view(d, IDC_MEM_VIEW);
+    d->break_label = label(d, "Break at:");
+    d->break_addr = field(d, IDC_BREAK_ADDR);
 
     /* STIC page */
     d->backtab_label = label(d, "BACKTAB");
@@ -319,6 +375,14 @@ static void build_controls(debugger *d)
                         INTVSTIC_PAL_CELL * 16, INTVSTIC_PAL_CELL);
     d->state_label = label(d, "Registers & mode");
     d->stic_state = mono_view(d, IDC_STIC_STATE);
+
+    /* Symbols page */
+    d->sym_filter_label = label(d, "Filter:");
+    d->sym_filter = field(d, IDC_SYM_FILTER);
+    d->sym_count = label(d, "");
+    d->sym_list = mono_view(d, IDC_SYM_LIST);
+    g_sym_list_proc = (WNDPROC)SetWindowLongPtrA(d->sym_list, GWLP_WNDPROC,
+                                                 (LONG_PTR)sym_list_subclass);
 }
 
 /* ---- layout ------------------------------------------------------------------
@@ -339,6 +403,8 @@ static void show_page(debugger *d, int page)
     ShowWindow(d->mem_label, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
     ShowWindow(d->mem_addr, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
     ShowWindow(d->mem_view, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->break_label, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->break_addr, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
 
     ShowWindow(d->backtab_label, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
     ShowWindow(d->backtab_view, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
@@ -355,6 +421,11 @@ static void show_page(debugger *d, int page)
     ShowWindow(d->pal_view, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
     ShowWindow(d->state_label, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
     ShowWindow(d->stic_state, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
+
+    ShowWindow(d->sym_filter_label, page == PAGE_SYMBOLS ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->sym_filter, page == PAGE_SYMBOLS ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->sym_count, page == PAGE_SYMBOLS ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->sym_list, page == PAGE_SYMBOLS ? SW_SHOW : SW_HIDE);
 }
 
 static void layout(debugger *d)
@@ -400,8 +471,21 @@ static void layout(debugger *d)
         ry += 20;
         MoveWindow(d->mem_addr, x, ry, 100, 22, TRUE);
         ry += 26;
-        MoveWindow(d->mem_view, x, ry, page.right - x - 8,
-                  page.bottom - ry - 4, TRUE);
+        {
+            /* Reserve a fixed footer below the memory view for the "Break
+             * at" row rather than a second absolute position from
+             * page.bottom -- keeps this the same style of cumulative-ry
+             * layout as the rest of the function. */
+            const int break_footer = 18 + 4 + 22;
+            int mem_h = page.bottom - ry - 4 - break_footer;
+            if (mem_h < 40)
+                mem_h = 40;
+            MoveWindow(d->mem_view, x, ry, page.right - x - 8, mem_h, TRUE);
+            ry += mem_h + 4;
+            MoveWindow(d->break_label, x, ry, 100, 18, TRUE);
+            ry += 20;
+            MoveWindow(d->break_addr, x, ry, page.right - x - 8, 22, TRUE);
+        }
     }
 
     /* STIC page */
@@ -436,6 +520,17 @@ static void layout(debugger *d)
         MoveWindow(d->state_label, sx, cy + 200, 200, 18, TRUE);
         MoveWindow(d->stic_state, sx, cy + 220, page.right - sx - 8,
                   page.bottom - (cy + 220) - 4, TRUE);
+    }
+
+    /* Symbols page */
+    {
+        int sy = page.top;
+        MoveWindow(d->sym_filter_label, page.left, sy, 50, 22, TRUE);
+        MoveWindow(d->sym_filter, page.left + 54, sy, 220, 22, TRUE);
+        MoveWindow(d->sym_count, page.left + 282, sy, 200, 22, TRUE);
+        sy += 28;
+        MoveWindow(d->sym_list, page.left, sy, page.right - page.left - 8,
+                  page.bottom - sy - 4, TRUE);
     }
 }
 
@@ -491,21 +586,15 @@ static void refresh_regs(debugger *d)
 
 static void refresh_mem(debugger *d)
 {
-    uint16_t addr = 0;
     uint16_t words[MEM_WORDS_PER_ROW * MEM_ROWS];
     char text[8192];
     int n, row, col, len = 0;
 
-    {
-        char buf[16];
-        GetWindowTextA(d->mem_addr, buf, sizeof(buf));
-        sscanf(buf, "%4hX", &addr);
-    }
-    n = intvdebug_read(d->dbg, addr, words, MEM_WORDS_PER_ROW * MEM_ROWS);
+    n = intvdebug_read(d->dbg, d->mem_base, words, MEM_WORDS_PER_ROW * MEM_ROWS);
     {
         const char *last_region = NULL;
         for (row = 0; row * MEM_WORDS_PER_ROW < n; row++) {
-            uint16_t row_addr = (uint16_t)(addr + row * MEM_WORDS_PER_ROW);
+            uint16_t row_addr = (uint16_t)(d->mem_base + row * MEM_WORDS_PER_ROW);
             const char *region = intvsym_region(row_addr);
 
             len += snprintf(text + len, sizeof(text) - (size_t)len, "%04X ",
@@ -607,6 +696,60 @@ static void refresh_stic(debugger *d)
     SetWindowTextA(d->stic_state, text);
 }
 
+/* Case-insensitive substring test -- MinGW does not reliably provide
+ * strcasestr (it's a glibc/BSD extension, not standard C), and matching
+ * the GNOME/KDE/macOS frontends' filter behaviour (all case-insensitive) is
+ * worth a small local helper rather than special-casing this one port. */
+static int contains_ci(const char *hay, const char *needle)
+{
+    size_t hlen = strlen(hay), nlen = strlen(needle), i;
+    if (nlen == 0)
+        return 1;
+    if (nlen > hlen)
+        return 0;
+    for (i = 0; i + nlen <= hlen; i++)
+        if (_strnicmp(hay + i, needle, nlen) == 0)
+            return 1;
+    return 0;
+}
+
+/* Only rebuilds the list when the table's generation or the filter text has
+ * changed since the last call -- a real game .sym can be a few hundred
+ * entries, no reason to re-render it on every 100ms timer tick. */
+static void refresh_symbols(debugger *d)
+{
+    char filter[64];
+    char text[16384];
+    int n, i, len = 0, shown = 0;
+    unsigned gen = intvsymtab_generation(d->symtab);
+    char countbuf[64];
+
+    GetWindowTextA(d->sym_filter, filter, sizeof(filter));
+    if (gen == d->sym_seen_gen && strcmp(filter, d->sym_filter_text) == 0)
+        return;
+    d->sym_seen_gen = gen;
+    snprintf(d->sym_filter_text, sizeof(d->sym_filter_text), "%s", filter);
+
+    n = intvsymtab_count(d->symtab);
+    for (i = 0; i < n && len < (int)sizeof(text) - 128; i++) {
+        uint16_t addr;
+        char name[64], note[64];
+        if (!intvsymtab_enum(d->symtab, i, &addr, name, sizeof(name), note,
+                             sizeof(note)))
+            continue;
+        if (filter[0] && !contains_ci(name, filter))
+            continue;
+        len += snprintf(text + len, sizeof(text) - (size_t)len,
+                       "%04X  %-24s%s%s\r\n", addr, name,
+                       note[0] ? "  ; " : "", note);
+        shown++;
+    }
+    SetWindowTextA(d->sym_list, text);
+    snprintf(countbuf, sizeof(countbuf), "%d symbol%s%s", shown,
+            shown == 1 ? "" : "s", filter[0] ? " (filtered)" : "");
+    SetWindowTextA(d->sym_count, countbuf);
+}
+
 static void refresh_all(debugger *d)
 {
     int paused = intvdebug_is_paused(d->dbg);
@@ -625,6 +768,10 @@ static void refresh_all(debugger *d)
         SetWindowTextA(d->disasm, "");
         SetWindowTextA(d->mem_view, "");
     }
+    /* Independent of run/pause -- the symbol list reflects what's loaded,
+     * not machine state, and is cheap to skip when nothing changed (see
+     * refresh_symbols's own comment). */
+    refresh_symbols(d);
     d->was_paused = paused;
 }
 
@@ -655,8 +802,39 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     case WM_DBG_ACCEPT:
-        if (d && wp == IDC_MEM_ADDR) {
-            d->seen_serial = 0;
+        if (!d)
+            return 0;
+        if (wp == IDC_MEM_ADDR) {
+            char buf[64];
+            uint16_t addr;
+            GetWindowTextA(d->mem_addr, buf, sizeof(buf));
+            if (intvsym_parse_addr(d->symtab, buf, &addr)) {
+                d->mem_base = addr;
+                d->seen_serial = 0;
+            } else {
+                char msg[96];
+                snprintf(msg, sizeof(msg), "No such symbol or address: %s",
+                        buf);
+                SetWindowTextA(d->status, msg);
+            }
+        } else if (wp == IDC_BREAK_ADDR) {
+            char buf[64];
+            uint16_t addr;
+            GetWindowTextA(d->break_addr, buf, sizeof(buf));
+            if (intvsym_parse_addr(d->symtab, buf, &addr)) {
+                intvdebug_breakpoint_toggle(d->dbg, addr);
+                d->seen_serial = 0; /* redraw the marker immediately */
+            } else {
+                char msg[96];
+                snprintf(msg, sizeof(msg), "No such symbol or address: %s",
+                        buf);
+                SetWindowTextA(d->status, msg);
+            }
+        } else if (wp == IDC_SYM_FILTER) {
+            /* refresh_symbols itself detects the text change; nothing to
+             * store here -- this just gives the filter box the same
+             * Enter-to-apply convention as mem_addr/break_addr above. */
+            refresh_symbols(d);
         }
         return 0;
     case WM_COMMAND:
@@ -678,6 +856,7 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         case IDC_LOAD_SYMS: {
             char path[MAX_PATH] = "";
+            char last_dir[1024] = "";
             OPENFILENAMEA ofn;
             memset(&ofn, 0, sizeof(ofn));
             ofn.lStructSize = sizeof(ofn);
@@ -687,7 +866,26 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             ofn.lpstrFile = path;
             ofn.nMaxFile = sizeof(path);
             ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+            /* Remember the directory (settings key "sym_dir") so re-opening
+             * the picker -- expected to happen often, since loading is
+             * always a manual step taken after CONFIG has already booted a
+             * cart, never automatic -- starts back where the user just
+             * was. */
+            if (d->session) {
+                const char *dir = intvsession_get_str(d->session, "sym_dir", "");
+                if (dir[0]) {
+                    snprintf(last_dir, sizeof(last_dir), "%s", dir);
+                    ofn.lpstrInitialDir = last_dir;
+                }
+            }
             if (GetOpenFileNameA(&ofn) && intvsymtab_load(d->symtab, path) >= 0) {
+                if (d->session) {
+                    char dir[1024];
+                    if (intvsym_dirname(path, dir, sizeof(dir)) > 0) {
+                        intvsession_set_str(d->session, "sym_dir", dir);
+                        intvsession_settings_flush(d->session);
+                    }
+                }
                 d->seen_serial = 0;
                 if (intvdebug_is_paused(d->dbg)) refresh_all(d);
             }
@@ -731,7 +929,9 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
              * intvdebug.h) and leaving it engaged+paused would look like
              * the emulator had hung. */
             intvdebug_set_engaged(d->dbg, 0);
-            intvsymtab_destroy(d->symtab);
+            /* d->symtab is intvsymtab_shared() -- process-wide, not owned
+             * by this window -- so it is deliberately NOT destroyed here;
+             * see this file's header comment. */
             DeleteObject(d->mono);
             g_dbg = NULL;
             free(d);
@@ -802,7 +1002,7 @@ void intv_debugger_show(HWND parent, intvsession *session)
     d = (debugger *)calloc(1, sizeof(*d));
     d->session = session;
     d->dbg = intvdebug_get();
-    d->symtab = intvsymtab_create();
+    d->symtab = intvsymtab_shared();
     d->mono = CreateFontA(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                           ANSI_CHARSET, OUT_DEFAULT_PRECIS,
                           CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,

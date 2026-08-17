@@ -15,6 +15,8 @@ struct intvsymtab;
 
 class QLabel;
 class QLineEdit;
+class QListWidget;
+class QListWidgetItem;
 class QPlainTextEdit;
 class QPushButton;
 class QTimer;
@@ -39,6 +41,9 @@ private:
     void cardsPage(int delta);
     void loadSymbols();
     void clearSymbols();
+    void goToAddr();
+    void breakAtAddr();
+    void refreshSymbols();
 
     intvsession *m_session;
     intvdebug *m_dbg;
@@ -54,6 +59,13 @@ private:
     QLineEdit *m_memAddr;
     QPlainTextEdit *m_memView;
     uint16_t m_memBase = 0;
+    QLineEdit *m_breakAddr;
+
+    QListWidget *m_symList;
+    QLineEdit *m_symFilter;
+    QLabel *m_symCount;
+    unsigned m_symSeenGen = 0;
+    QString m_symFilterText;
 
     QLabel *m_backtab, *m_mob[INTVSTIC_MOB_COUNT], *m_cards, *m_palette;
     QLabel *m_cardsRange;

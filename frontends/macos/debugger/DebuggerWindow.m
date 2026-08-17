@@ -16,13 +16,15 @@
  * windows document.
  *
  * The symbol table (core/debugger/symbols.h) is not owned by intvdebug --
- * unlike msxdebug's own -- so this window creates and owns its own
- * intvsymtab instance purely for disassembly/memory annotation, destroyed
- * when the window closes. It ships pre-seeded with EXEC ROM/RAM and cart-
- * header symbols (see symbols.c); "Load Symbols..." loads a per-game
- * as1600 .sym file on top via NSOpenPanel, matching the GNOME/KDE/Windows
- * ports' own UI. No register/memory editing either: intvdebug has no
- * register-write call.
+ * unlike msxdebug's own -- so this window uses the process-wide
+ * intvsymtab_shared() instead of its own instance: a cart arrives through
+ * FujiNet CONFIG with no path a .sym could ever be derived from, so a user
+ * loading one by hand is the only way symbols get here at all, and that
+ * work should survive closing this window, not be thrown away with it. It
+ * ships pre-seeded with EXEC ROM/RAM and cart-header symbols (see
+ * symbols.c); "Load Symbols..." loads a per-game as1600 .sym file on top
+ * via NSOpenPanel, matching the GNOME/KDE/Windows ports' own UI. No
+ * register/memory editing either: intvdebug has no register-write call.
  *
  * NOT BUILT OR RUN-VERIFIED -- see ../main.m's file header.
  *
@@ -84,6 +86,34 @@ static DebuggerWindow *g_debugger;
 }
 @end
 
+/* Symbols tab text view: a click jumps the memory view to the clicked
+ * row's address, which is the first 4 hex characters of each line
+ * (refreshSymbols' "%04X  NAME  ; note" format) -- same click-parses-the-
+ * line-prefix idiom as DasmTextView above, just column 0 instead of 2. */
+@interface SymTextView : NSTextView
+@property(nonatomic, copy) void (^onJumpAddr)(uint16_t addr);
+@end
+
+@implementation SymTextView
+- (void)mouseDown:(NSEvent *)event
+{
+    NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+    NSUInteger idx = [self characterIndexForInsertionAtPoint:p];
+    NSString *text = self.string;
+    if (idx > text.length)
+        idx = text.length;
+    NSUInteger start = [text lineRangeForRange:NSMakeRange(idx, 0)].location;
+    NSString *line = [text substringFromIndex:start];
+    if (line.length >= 4) {
+        unsigned addr = 0;
+        NSScanner *scan = [NSScanner
+            scannerWithString:[line substringWithRange:NSMakeRange(0, 4)]];
+        if ([scan scanHexInt:&addr] && addr <= 0xFFFF && self.onJumpAddr)
+            self.onJumpAddr((uint16_t)addr);
+    }
+}
+@end
+
 @interface DebuggerWindow () <NSWindowDelegate>
 - (instancetype)initWithSession:(intvsession *)session;
 @end
@@ -102,6 +132,13 @@ static DebuggerWindow *g_debugger;
     NSTextField *_memAddr;
     NSTextView *_memView;
     uint16_t _memBase;
+    NSTextField *_breakAddr;
+
+    NSTextView *_symList;
+    NSTextField *_symFilter;
+    NSTextField *_symCount;
+    unsigned _symSeenGen;
+    NSString *_symFilterText;
 
     NSImageView *_backtabView;
     NSImageView *_mobView[INTVSTIC_MOB_COUNT];
@@ -162,7 +199,8 @@ static NSImage *imageFromRGBA(const uint8_t *rgba, int w, int h, BOOL hasAlpha)
         return nil;
     _session = session;
     _dbg = intvdebug_get();
-    _symtab = intvsymtab_create();
+    _symtab = intvsymtab_shared();
+    _symFilterText = @"";
     _scratch = calloc(1, STIC_SCRATCH_BYTES);
     [self buildWindow];
 
@@ -270,9 +308,18 @@ static NSTextView *monoView(NSScrollView **scrollOut)
     _memView = monoView(&memScroll);
     [memScroll.widthAnchor constraintEqualToConstant:260].active = YES;
 
+    _breakAddr = [[NSTextField alloc] init];
+    _breakAddr.placeholderString = @"Symbol or hex addr";
+    _breakAddr.target = self;
+    _breakAddr.action = @selector(breakAt:);
+    NSButton *breakGo = [self button:@"Break" action:@selector(breakAt:)];
+    NSStackView *breakRow =
+        [NSStackView stackViewWithViews:@[ _breakAddr, breakGo ]];
+    breakRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+
     NSStackView *side = [NSStackView stackViewWithViews:@[
         [self label:@"Registers"], regsScroll, [self label:@"Memory"], memRow,
-        memScroll
+        memScroll, [self label:@"Break at"], breakRow
     ]];
     side.orientation = NSUserInterfaceLayoutOrientationVertical;
     side.alignment = NSLayoutAttributeLeading;
@@ -376,6 +423,53 @@ static NSTextView *monoView(NSScrollView **scrollOut)
     return root;
 }
 
+- (NSView *)buildSymbolsTab
+{
+    /* Filters on Enter, like _memAddr/_breakAddr above -- matching this
+     * window's existing target/action convention rather than adding a
+     * QLineEdit::textChanged-style live filter via NSTextFieldDelegate. */
+    _symFilter = [[NSTextField alloc] init];
+    _symFilter.placeholderString = @"Filter (Enter to apply)";
+    _symFilter.target = self;
+    _symFilter.action = @selector(symFilterChanged:);
+    _symCount = [self label:@""];
+    NSStackView *filterRow =
+        [NSStackView stackViewWithViews:@[ _symFilter, _symCount ]];
+    filterRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+
+    NSScrollView *symScroll = [[NSScrollView alloc] init];
+    symScroll.hasVerticalScroller = YES;
+    _symList = [[SymTextView alloc] initWithFrame:NSMakeRect(0, 0, 560, 600)];
+    _symList.editable = NO;
+    _symList.richText = NO;
+    _symList.font = [NSFont monospacedSystemFontOfSize:11
+                                                weight:NSFontWeightRegular];
+    _symList.autoresizingMask = NSViewWidthSizable;
+    __weak DebuggerWindow *weakSelf = self;
+    _symList.onJumpAddr = ^(uint16_t addr) {
+        DebuggerWindow *s = weakSelf;
+        if (!s)
+            return;
+        s->_memBase = addr;
+        s->_memAddr.stringValue = @"";
+        s->_seenSerial = 0;
+        if (intvdebug_is_paused(s->_dbg))
+            [s refreshMem];
+    };
+    symScroll.documentView = _symList;
+
+    NSStackView *root =
+        [NSStackView stackViewWithViews:@[ filterRow, symScroll ]];
+    root.orientation = NSUserInterfaceLayoutOrientationVertical;
+    root.alignment = NSLayoutAttributeLeading;
+    root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
+    [filterRow.widthAnchor constraintEqualToAnchor:root.widthAnchor
+                                          constant:-16].active = YES;
+    [symScroll.widthAnchor constraintEqualToAnchor:root.widthAnchor
+                                          constant:-16].active = YES;
+    return root;
+}
+
 - (void)buildWindow
 {
     _window = [[NSWindow alloc]
@@ -427,8 +521,13 @@ static NSTextView *monoView(NSScrollView **scrollOut)
         [[NSTabViewItem alloc] initWithIdentifier:@"stic"];
     sticTab.label = @"STIC";
     sticTab.view = [self buildSticTab];
+    NSTabViewItem *symTab =
+        [[NSTabViewItem alloc] initWithIdentifier:@"symbols"];
+    symTab.label = @"Symbols";
+    symTab.view = [self buildSymbolsTab];
     [tabs addTabViewItem:cpuTab];
     [tabs addTabViewItem:sticTab];
+    [tabs addTabViewItem:symTab];
 
     NSStackView *root = [NSStackView stackViewWithViews:@[ toolbar, tabs ]];
     root.orientation = NSUserInterfaceLayoutOrientationVertical;
@@ -488,6 +587,17 @@ static NSTextView *monoView(NSScrollView **scrollOut)
     NSOpenPanel *panel = [NSOpenPanel openPanel];
     panel.allowedFileTypes = @[ @"sym" ];
     panel.allowsMultipleSelection = NO;
+    /* Remember the directory (settings key "sym_dir") so re-opening the
+     * panel -- expected to happen often, since loading is always a manual
+     * step taken after CONFIG has already booted a cart, never automatic --
+     * starts back where the user just was. */
+    if (_session) {
+        const char *lastDir = intvsession_get_str(_session, "sym_dir", "");
+        if (lastDir[0])
+            panel.directoryURL =
+                [NSURL fileURLWithPath:[NSString stringWithUTF8String:lastDir]
+                            isDirectory:YES];
+    }
     __weak DebuggerWindow *weakSelf = self;
     [panel beginWithCompletionHandler:^(NSModalResponse result) {
         DebuggerWindow *s = weakSelf;
@@ -497,6 +607,14 @@ static NSTextView *monoView(NSScrollView **scrollOut)
         if (!url)
             return;
         if (intvsymtab_load(s->_symtab, url.fileSystemRepresentation) >= 0) {
+            if (s->_session) {
+                char dir[1024];
+                if (intvsym_dirname(url.fileSystemRepresentation, dir,
+                                    sizeof(dir)) > 0) {
+                    intvsession_set_str(s->_session, "sym_dir", dir);
+                    intvsession_settings_flush(s->_session);
+                }
+            }
             s->_seenSerial = 0;
             if (intvdebug_is_paused(s->_dbg))
                 [s refreshAll:YES];
@@ -541,15 +659,36 @@ static NSTextView *monoView(NSScrollView **scrollOut)
 - (void)gotoMem:(id)sender
 {
     (void)sender;
-    NSString *t = [_memAddr.stringValue
-        stringByTrimmingCharactersInSet:[NSCharacterSet
-                                             whitespaceCharacterSet]];
-    unsigned v = 0;
-    NSScanner *scan = [NSScanner scannerWithString:t];
-    if ([scan scanHexInt:&v] && v <= 0xFFFF) {
-        _memBase = (uint16_t)v;
+    uint16_t addr;
+    if (intvsym_parse_addr(_symtab, _memAddr.stringValue.UTF8String, &addr)) {
+        _memBase = addr;
         _seenSerial = 0;
+    } else {
+        _status.stringValue = [NSString
+            stringWithFormat:@"No such symbol or address: %@",
+                            _memAddr.stringValue];
     }
+}
+
+- (void)breakAt:(id)sender
+{
+    (void)sender;
+    uint16_t addr;
+    if (intvsym_parse_addr(_symtab, _breakAddr.stringValue.UTF8String,
+                           &addr)) {
+        intvdebug_breakpoint_toggle(_dbg, addr);
+        _seenSerial = 0; /* redraw the marker immediately */
+    } else {
+        _status.stringValue = [NSString
+            stringWithFormat:@"No such symbol or address: %@",
+                            _breakAddr.stringValue];
+    }
+}
+
+- (void)symFilterChanged:(id)sender
+{
+    (void)sender;
+    [self refreshSymbols];
 }
 
 /* windowShouldClose: fires whenever the window's close control (or Window >
@@ -583,6 +722,47 @@ static NSTextView *monoView(NSScrollView **scrollOut)
         _regs.string = @"";
         _memView.string = @"";
     }
+    /* Independent of run/pause -- the symbol list reflects what's loaded,
+     * not machine state, and is cheap to skip when nothing changed (see
+     * refreshSymbols's own comment). */
+    [self refreshSymbols];
+}
+
+/* Only rebuilds the list when the table's generation or the filter text has
+ * changed since the last call -- a real game .sym can be a few hundred
+ * entries, no reason to re-render it on every 0.1s tick. */
+- (void)refreshSymbols
+{
+    unsigned gen = intvsymtab_generation(_symtab);
+    NSString *filter = _symFilter.stringValue ?: @"";
+    if (gen == _symSeenGen && [filter isEqualToString:_symFilterText])
+        return;
+    _symSeenGen = gen;
+    _symFilterText = filter;
+
+    NSMutableString *text = [NSMutableString string];
+    int n = intvsymtab_count(_symtab);
+    int shown = 0;
+    for (int i = 0; i < n; i++) {
+        uint16_t addr;
+        char name[64], note[64];
+        if (!intvsymtab_enum(_symtab, i, &addr, name, sizeof(name), note,
+                             sizeof(note)))
+            continue;
+        NSString *nsname = [NSString stringWithUTF8String:name];
+        if (filter.length > 0 &&
+            [nsname rangeOfString:filter
+                          options:NSCaseInsensitiveSearch].location ==
+                NSNotFound)
+            continue;
+        [text appendFormat:@"%04X  %-24s%s%s\n", addr, name,
+                           note[0] ? "  ; " : "", note];
+        shown++;
+    }
+    _symList.string = text;
+    _symCount.stringValue = [NSString
+        stringWithFormat:@"%d symbol%s%s", shown, shown == 1 ? "" : "s",
+                        filter.length > 0 ? " (filtered)" : ""];
 }
 
 - (void)refreshDisasm

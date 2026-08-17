@@ -2,7 +2,8 @@
  * symtab_test -- pure function test, no emulator boot needed: built-in
  * entries, add/lookup both directions, loading a real as1600-format .sym
  * file (including its undefined-symbol and out-of-range skip rules), tie-
- * breaking (newest wins), and clear_user leaving the built-ins alone.
+ * breaking (newest wins), clear_user leaving the built-ins alone, the
+ * region map, nearest-symbol lookup, and disassembly-line annotation.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -27,7 +28,7 @@ int main(void)
     intvsymtab *t = intvsymtab_create();
     check("create", t != NULL);
 
-    /* ---- built-ins (see symbols.c's header for why these two exactly) */
+    /* ---- built-ins (spot-check; see symbols.c's header for provenance) */
     char name[64];
     check("builtin EXEC_ENTRY",
           intvsymtab_lookup_addr(t, 0x1000, name, sizeof(name)) == 1 &&
@@ -35,8 +36,90 @@ int main(void)
     check("builtin FUJINET_MAILBOX",
           intvsymtab_lookup_addr(t, 0x9C00, name, sizeof(name)) == 1 &&
           strcmp(name, "FUJINET_MAILBOX") == 0);
+    check("builtin X_MAIN_LOOP",
+          intvsymtab_lookup_addr(t, 0x108F, name, sizeof(name)) == 1 &&
+          strcmp(name, "X_MAIN_LOOP") == 0);
+    check("builtin X_RAND2",
+          intvsymtab_lookup_addr(t, 0x169E, name, sizeof(name)) == 1 &&
+          strcmp(name, "X_RAND2") == 0);
+    check("builtin EXEC_HTBL",
+          intvsymtab_lookup_addr(t, 0x035D, name, sizeof(name)) == 1 &&
+          strcmp(name, "EXEC_HTBL") == 0);
+    check("builtin CART_DISP_MODE",
+          intvsymtab_lookup_addr(t, 0x500E, name, sizeof(name)) == 1 &&
+          strcmp(name, "CART_DISP_MODE") == 0);
     check("no symbol at an untouched address",
           intvsymtab_lookup_addr(t, 0x2222, name, sizeof(name)) == 0);
+
+    /* ---- region map ---- */
+    check("region STIC", intvsym_region(0x0000) != NULL &&
+          strcmp(intvsym_region(0x0000), "STIC") == 0);
+    check("region STIC upper bound", intvsym_region(0x003F) != NULL &&
+          strcmp(intvsym_region(0x003F), "STIC") == 0);
+    check("no region just past STIC", intvsym_region(0x0040) == NULL);
+    check("region PSG lower bound", intvsym_region(0x01F0) != NULL &&
+          strcmp(intvsym_region(0x01F0), "PSG") == 0);
+    check("region BACKTAB just after PSG", intvsym_region(0x0200) != NULL &&
+          strcmp(intvsym_region(0x0200), "BACKTAB") == 0);
+    check("region EXEC object table lower bound",
+          intvsym_region(0x031D) != NULL &&
+          strcmp(intvsym_region(0x031D), "EXEC object table") == 0);
+    check("region EXEC globals right after object table",
+          intvsym_region(0x035D) != NULL &&
+          strcmp(intvsym_region(0x035D), "EXEC globals") == 0);
+    check("region STIC alias at $8000", intvsym_region(0x8000) != NULL &&
+          strcmp(intvsym_region(0x8000), "STIC alias") == 0);
+    check("no region in the gap above STIC alias",
+          intvsym_region(0x8001) == NULL);
+
+    /* ---- nearest-symbol lookup ---- */
+    int delta = -1;
+    check("nearest exact match",
+          intvsymtab_lookup_nearest(t, 0x169E, 64, name, sizeof(name),
+                                    &delta) == 1 &&
+          strcmp(name, "X_RAND2") == 0 && delta == 0);
+    check("nearest within window",
+          intvsymtab_lookup_nearest(t, 0x169E + 3, 64, name, sizeof(name),
+                                    &delta) == 1 &&
+          strcmp(name, "X_RAND2") == 0 && delta == 3);
+    check("nearest outside window misses",
+          intvsymtab_lookup_nearest(t, 0x169E + 100, 64, name, sizeof(name),
+                                    &delta) == 0);
+    check("nearest finds the closest symbol at or below addr",
+          intvsymtab_lookup_nearest(t, 0x169D, 64, name, sizeof(name),
+                                    &delta) == 1 &&
+          strcmp(name, "X_RAND1") == 0 && delta == (0x169D - 0x167D));
+
+    /* ---- disassembly-line annotation ---- */
+    {
+        intvdebug_dasm_line line;
+        char annot[96];
+
+        memset(&line, 0, sizeof(line));
+        line.addr = 0x109A; /* inside X_MAIN_LOOP, no exact symbol itself */
+        snprintf(line.text, sizeof(line.text), "JSR     R5,$169E");
+        check("annotate operand resolves to X_RAND2",
+              intvsym_annotate_line(t, &line, annot, sizeof(annot)) > 0 &&
+              strstr(annot, "X_RAND2") != NULL);
+
+        line.addr = 0x108F; /* exact hit on the line's own address */
+        snprintf(line.text, sizeof(line.text), "EIS");
+        check("annotate own address resolves to X_MAIN_LOOP",
+              intvsym_annotate_line(t, &line, annot, sizeof(annot)) > 0 &&
+              strstr(annot, "X_MAIN_LOOP") != NULL);
+
+        line.addr = 0x5100; /* no symbol here or nearby -- unlabeled */
+        snprintf(line.text, sizeof(line.text), "MVO     R1,$0201");
+        check("annotate operand falls back to region",
+              intvsym_annotate_line(t, &line, annot, sizeof(annot)) > 0 &&
+              strstr(annot, "BACKTAB") != NULL);
+
+        line.addr = 0x5100;
+        snprintf(line.text, sizeof(line.text), "MVI     R0,#5");
+        check("annotate with nothing to say writes empty string",
+              intvsym_annotate_line(t, &line, annot, sizeof(annot)) == 0 &&
+              annot[0] == 0);
+    }
 
     /* ---- direct add + both lookup directions ---- */
     check("add", intvsymtab_add(t, 0x5000, "MY_ROUTINE") == 1);

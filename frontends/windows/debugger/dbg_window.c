@@ -22,9 +22,11 @@
  *
  * The symbol table (core/debugger/symbols.h) is not owned by intvdebug --
  * unlike msxdebug's own -- so this window creates and owns its own
- * intvsymtab instance purely for disassembly annotation, destroyed when
- * the window closes. Matches the GNOME/KDE ports' own scope exactly (no
- * register/memory editing either: intvdebug has no register-write call).
+ * intvsymtab instance purely for disassembly/memory annotation, destroyed
+ * when the window closes. It ships pre-seeded with EXEC ROM/RAM and cart-
+ * header symbols (see symbols.c); "Load Symbols..." loads a per-game
+ * as1600 .sym file on top, matching the GNOME/KDE ports' own UI. No
+ * register/memory editing either: intvdebug has no register-write call.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -33,6 +35,7 @@
 #include "dbg_window.h"
 
 #include <commctrl.h>
+#include <commdlg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +58,7 @@
 
 enum {
     IDC_PAUSE = 1000, IDC_STEP, IDC_STEP_OVER, IDC_STEP_OUT, IDC_CLEAR_BP,
+    IDC_LOAD_SYMS, IDC_CLEAR_SYMS,
     IDC_STATUS, IDC_TABS,
     IDC_DISASM, IDC_FLAGS,
     IDC_MEM_ADDR, IDC_MEM_VIEW,
@@ -73,6 +77,7 @@ typedef struct {
     HWND hwnd;
     HWND tabs;
     HWND pause_btn, step_btn, step_over_btn, step_out_btn, clear_bp_btn;
+    HWND load_syms_btn, clear_syms_btn;
     HWND status;
 
     HWND disasm;
@@ -270,6 +275,10 @@ static void build_controls(debugger *d)
                            WS_VISIBLE | BS_PUSHBUTTON, IDC_STEP_OUT);
     d->clear_bp_btn = child(d, "BUTTON", "Clear Breakpoints",
                            WS_VISIBLE | BS_PUSHBUTTON, IDC_CLEAR_BP);
+    d->load_syms_btn = child(d, "BUTTON", "Load Symbols...",
+                             WS_VISIBLE | BS_PUSHBUTTON, IDC_LOAD_SYMS);
+    d->clear_syms_btn = child(d, "BUTTON", "Clear Symbols",
+                              WS_VISIBLE | BS_PUSHBUTTON, IDC_CLEAR_SYMS);
     d->status = child(d, "STATIC", "Running", WS_VISIBLE | SS_RIGHT,
                      IDC_STATUS);
 
@@ -361,6 +370,8 @@ static void layout(debugger *d)
     MoveWindow(d->step_over_btn, 212, y, 110, 26, TRUE);
     MoveWindow(d->step_out_btn, 326, y, 140, 26, TRUE);
     MoveWindow(d->clear_bp_btn, 470, y, 130, 26, TRUE);
+    MoveWindow(d->load_syms_btn, 604, y, 120, 26, TRUE);
+    MoveWindow(d->clear_syms_btn, 728, y, 110, 26, TRUE);
     MoveWindow(d->status, client.right - 210, y + 4, 200, 20, TRUE);
     y += 32;
 
@@ -443,11 +454,9 @@ static void refresh_disasm(debugger *d)
     }
     n = intvdebug_disassemble(d->dbg, r.pc, r.D, lines, DISASM_LINES);
     for (i = 0; i < n && len < (int)sizeof(text) - 128; i++) {
-        char symname[32];
-        char symsuffix[48] = "";
-        if (intvsymtab_lookup_addr(d->symtab, lines[i].addr, symname,
-                                   sizeof(symname)))
-            snprintf(symsuffix, sizeof(symsuffix), "   ; %s", symname);
+        char symsuffix[96];
+        intvsym_annotate_line(d->symtab, &lines[i], symsuffix,
+                              sizeof(symsuffix));
         len += snprintf(text + len, sizeof(text) - (size_t)len,
                        "%c%c%04X  %-24s%s\r\n",
                        lines[i].addr == r.pc ? '>' : ' ',
@@ -493,16 +502,29 @@ static void refresh_mem(debugger *d)
         sscanf(buf, "%4hX", &addr);
     }
     n = intvdebug_read(d->dbg, addr, words, MEM_WORDS_PER_ROW * MEM_ROWS);
-    for (row = 0; row * MEM_WORDS_PER_ROW < n; row++) {
-        len += snprintf(text + len, sizeof(text) - (size_t)len, "%04X ",
-                       (uint16_t)(addr + row * MEM_WORDS_PER_ROW));
-        for (col = 0; col < MEM_WORDS_PER_ROW; col++) {
-            int idx = row * MEM_WORDS_PER_ROW + col;
-            if (idx < n)
+    {
+        const char *last_region = NULL;
+        for (row = 0; row * MEM_WORDS_PER_ROW < n; row++) {
+            uint16_t row_addr = (uint16_t)(addr + row * MEM_WORDS_PER_ROW);
+            const char *region = intvsym_region(row_addr);
+
+            len += snprintf(text + len, sizeof(text) - (size_t)len, "%04X ",
+                           row_addr);
+            for (col = 0; col < MEM_WORDS_PER_ROW; col++) {
+                int idx = row * MEM_WORDS_PER_ROW + col;
+                if (idx < n)
+                    len += snprintf(text + len, sizeof(text) - (size_t)len,
+                                   " %04X", words[idx]);
+            }
+            /* Only label the first row of a run in the same region -- see
+             * symbols.c's k_regions and the GNOME frontend's own
+             * refresh_mem. */
+            if (region && region != last_region)
                 len += snprintf(text + len, sizeof(text) - (size_t)len,
-                               " %04X", words[idx]);
+                               "  ; %s", region);
+            last_region = region;
+            len += snprintf(text + len, sizeof(text) - (size_t)len, "\r\n");
         }
-        len += snprintf(text + len, sizeof(text) - (size_t)len, "\r\n");
     }
     SetWindowTextA(d->mem_view, text);
 }
@@ -653,6 +675,28 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_CLEAR_BP:
             intvdebug_breakpoint_clear_all(d->dbg);
             d->seen_serial = 0;
+            return 0;
+        case IDC_LOAD_SYMS: {
+            char path[MAX_PATH] = "";
+            OPENFILENAMEA ofn;
+            memset(&ofn, 0, sizeof(ofn));
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = hwnd;
+            ofn.lpstrFilter = "as1600 symbol files (*.sym)\0*.sym\0"
+                              "All files (*.*)\0*.*\0";
+            ofn.lpstrFile = path;
+            ofn.nMaxFile = sizeof(path);
+            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+            if (GetOpenFileNameA(&ofn) && intvsymtab_load(d->symtab, path) >= 0) {
+                d->seen_serial = 0;
+                if (intvdebug_is_paused(d->dbg)) refresh_all(d);
+            }
+            return 0;
+        }
+        case IDC_CLEAR_SYMS:
+            intvsymtab_clear_user(d->symtab);
+            d->seen_serial = 0;
+            if (intvdebug_is_paused(d->dbg)) refresh_all(d);
             return 0;
         case IDC_CARDS_PREV: {
             int page = INTVSTIC_CARDS_PER_ROW * CARD_ROWS_PER_PAGE;

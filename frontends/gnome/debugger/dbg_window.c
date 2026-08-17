@@ -128,14 +128,10 @@ static void refresh_disasm(DbgWin *w)
         const intvdebug_dasm_line *l = &lines[i];
         GtkWidget *row = gtk_list_box_row_new();
         GtkWidget *label = gtk_label_new(NULL);
-        char symname[32];
-        g_autofree char *symsuffix = NULL;
+        char symsuffix[96];
         g_autofree char *text = NULL;
 
-        symsuffix = intvsymtab_lookup_addr(w->symtab, l->addr, symname,
-                                           sizeof(symname))
-                       ? g_strdup_printf("   ; %s", symname)
-                       : g_strdup("");
+        intvsym_annotate_line(w->symtab, l, symsuffix, sizeof(symsuffix));
         text = g_strdup_printf(
             "%c%c %04X  %-24s%s", (l->addr == r.pc) ? '>' : ' ',
             intvdebug_breakpoint_is_set(w->dbg, l->addr) ? '*' : ' ',
@@ -155,18 +151,26 @@ static void refresh_mem(DbgWin *w)
     uint16_t words[MEM_WORDS_PER_ROW * MEM_ROWS];
     GString *text = g_string_new(NULL);
     int n, row, col;
+    const char *last_region = NULL;
 
     n = intvdebug_read(w->dbg, w->mem_view_addr, words,
                        MEM_WORDS_PER_ROW * MEM_ROWS);
     for (row = 0; row * MEM_WORDS_PER_ROW < n; row++) {
-        g_string_append_printf(
-            text, "%04X ",
-            (uint16_t)(w->mem_view_addr + row * MEM_WORDS_PER_ROW));
+        uint16_t row_addr = (uint16_t)(w->mem_view_addr + row * MEM_WORDS_PER_ROW);
+        const char *region = intvsym_region(row_addr);
+
+        g_string_append_printf(text, "%04X ", row_addr);
         for (col = 0; col < MEM_WORDS_PER_ROW; col++) {
             int idx = row * MEM_WORDS_PER_ROW + col;
             if (idx < n)
                 g_string_append_printf(text, " %04X", words[idx]);
         }
+        /* Only label the first row of a run in the same region -- repeating
+         * it on every row would just be noise (see PORTING.md's region
+         * map, symbols.c's k_regions). */
+        if (region && region != last_region)
+            g_string_append_printf(text, "  ; %s", region);
+        last_region = region;
         if ((row + 1) * MEM_WORDS_PER_ROW < n)
             g_string_append_c(text, '\n');
     }

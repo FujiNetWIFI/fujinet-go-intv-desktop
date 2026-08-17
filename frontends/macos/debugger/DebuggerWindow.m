@@ -17,11 +17,12 @@
  *
  * The symbol table (core/debugger/symbols.h) is not owned by intvdebug --
  * unlike msxdebug's own -- so this window creates and owns its own
- * intvsymtab instance purely for disassembly annotation, destroyed when
- * the window closes. Matches the GNOME/KDE/Windows ports' own scope
- * exactly (no register/memory editing either: intvdebug has no
- * register-write call; no Load Symbols UI, since none of the sibling
- * ports expose one for this engine).
+ * intvsymtab instance purely for disassembly/memory annotation, destroyed
+ * when the window closes. It ships pre-seeded with EXEC ROM/RAM and cart-
+ * header symbols (see symbols.c); "Load Symbols..." loads a per-game
+ * as1600 .sym file on top via NSOpenPanel, matching the GNOME/KDE/Windows
+ * ports' own UI. No register/memory editing either: intvdebug has no
+ * register-write call.
  *
  * NOT BUILT OR RUN-VERIFIED -- see ../main.m's file header.
  *
@@ -397,6 +398,10 @@ static NSTextView *monoView(NSScrollView **scrollOut)
                                  action:@selector(stepOut:)];
     NSButton *clearBpBtn = [self button:@"Clear Breakpoints"
                                  action:@selector(clearBreakpoints:)];
+    NSButton *loadSymsBtn = [self button:@"Load Symbols…"
+                                  action:@selector(loadSymbols:)];
+    NSButton *clearSymsBtn = [self button:@"Clear Symbols"
+                                   action:@selector(clearSymbols:)];
     _runBtn.keyEquivalent =
         [NSString stringWithFormat:@"%C", (unichar)NSF5FunctionKey];
     stepBtn.keyEquivalent =
@@ -408,7 +413,8 @@ static NSTextView *monoView(NSScrollView **scrollOut)
     _status.alignment = NSTextAlignmentRight;
 
     NSStackView *toolbar = [NSStackView stackViewWithViews:@[
-        _runBtn, stepBtn, stepOverBtn, stepOutBtn, clearBpBtn, _status
+        _runBtn, stepBtn, stepOverBtn, stepOutBtn, clearBpBtn, loadSymsBtn,
+        clearSymsBtn, _status
     ]];
     toolbar.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     toolbar.spacing = 8;
@@ -474,6 +480,37 @@ static NSTextView *monoView(NSScrollView **scrollOut)
     (void)sender;
     intvdebug_breakpoint_clear_all(_dbg);
     _seenSerial = 0;
+}
+
+- (void)loadSymbols:(id)sender
+{
+    (void)sender;
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.allowedFileTypes = @[ @"sym" ];
+    panel.allowsMultipleSelection = NO;
+    __weak DebuggerWindow *weakSelf = self;
+    [panel beginWithCompletionHandler:^(NSModalResponse result) {
+        DebuggerWindow *s = weakSelf;
+        if (!s || result != NSModalResponseOK)
+            return;
+        NSURL *url = panel.URLs.firstObject;
+        if (!url)
+            return;
+        if (intvsymtab_load(s->_symtab, url.fileSystemRepresentation) >= 0) {
+            s->_seenSerial = 0;
+            if (intvdebug_is_paused(s->_dbg))
+                [s refreshAll:YES];
+        }
+    }];
+}
+
+- (void)clearSymbols:(id)sender
+{
+    (void)sender;
+    intvsymtab_clear_user(_symtab);
+    _seenSerial = 0;
+    if (intvdebug_is_paused(_dbg))
+        [self refreshAll:YES];
 }
 
 - (void)cardsPrev:(id)sender
@@ -558,17 +595,15 @@ static NSTextView *monoView(NSScrollView **scrollOut)
     int n = intvdebug_disassemble(_dbg, r.pc, r.D, lines, DISASM_LINES);
     NSMutableString *text = [NSMutableString string];
     for (int i = 0; i < n; i++) {
-        char symname[32];
-        [text appendFormat:@"%c%c%04X  %-24s",
+        char symsuffix[96];
+        intvsym_annotate_line(_symtab, &lines[i], symsuffix,
+                              sizeof(symsuffix));
+        [text appendFormat:@"%c%c%04X  %-24s%s\n",
                            lines[i].addr == r.pc ? '>' : ' ',
                            intvdebug_breakpoint_is_set(_dbg, lines[i].addr)
                                ? '*'
                                : ' ',
-                           lines[i].addr, lines[i].text];
-        if (intvsymtab_lookup_addr(_symtab, lines[i].addr, symname,
-                                   sizeof(symname)))
-            [text appendFormat:@"   ; %s", symname];
-        [text appendString:@"\n"];
+                           lines[i].addr, lines[i].text, symsuffix];
     }
     _disasm.string = text;
 }
@@ -594,14 +629,23 @@ static NSTextView *monoView(NSScrollView **scrollOut)
     int n = intvdebug_read(_dbg, _memBase, words,
                            MEM_WORDS_PER_ROW * MEM_ROWS);
     NSMutableString *text = [NSMutableString string];
+    const char *lastRegion = NULL;
     for (int row = 0; row * MEM_WORDS_PER_ROW < n; row++) {
-        [text appendFormat:@"%04X ",
-                           (unsigned)(_memBase + row * MEM_WORDS_PER_ROW)];
+        uint16_t rowAddr = (uint16_t)(_memBase + row * MEM_WORDS_PER_ROW);
+        const char *region = intvsym_region(rowAddr);
+
+        [text appendFormat:@"%04X ", (unsigned)rowAddr];
         for (int col = 0; col < MEM_WORDS_PER_ROW; col++) {
             int idx = row * MEM_WORDS_PER_ROW + col;
             if (idx < n)
                 [text appendFormat:@" %04X", words[idx]];
         }
+        /* Only label the first row of a run in the same region -- see
+         * symbols.c's k_regions and the GNOME/Windows/KDE frontends' own
+         * refresh_mem/refreshMem. */
+        if (region && region != lastRegion)
+            [text appendFormat:@"  ; %s", region];
+        lastRegion = region;
         [text appendString:@"\n"];
     }
     _memView.string = text;

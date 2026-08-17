@@ -14,6 +14,8 @@
 
 #include <stdint.h>
 
+#include "intvdebug.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -54,6 +56,29 @@ int intvsymtab_lookup_addr(const intvsymtab *t, uint16_t addr, char *dst,
  * case-sensitive). Returns 1 and fills *addr_out on a hit. */
 int intvsymtab_lookup_name(const intvsymtab *t, const char *name,
                            uint16_t *addr_out);
+
+/* Nearest symbol at or below addr, within `window` words (addr - sym <=
+ * window). Fills *delta with addr - sym (0 on an exact hit). Returns 0 if
+ * nothing qualifies -- callers fall back to intvsym_region(). Scans
+ * newest-first like intvsymtab_lookup_addr, so a loaded symbol can shadow a
+ * closer built-in at the same address. */
+int intvsymtab_lookup_nearest(const intvsymtab *t, uint16_t addr, int window,
+                              char *dst, int dstsz, int *delta);
+
+/* Name of the hardware/EXEC region containing addr (e.g. "STIC", "PSG",
+ * "BACKTAB", "EXEC ROM"), or NULL if addr isn't in any named range. See
+ * symbols.c for the full map and its sources (PORTING.md Sections 5.4/7.1
+ * across the five FujiNet Intellivision ports). */
+const char *intvsym_region(uint16_t addr);
+
+/* Builds the trailing "   ; COMMENT" annotation for one disassembly line:
+ * the line's own address resolved to a label/region, then any operand
+ * ($XXXX token in l->text) resolved the same way. Writes "" (dst[0] = 0)
+ * when there is nothing to say. Returns the number of characters written
+ * (not counting the NUL), like snprintf. Shared by all four frontends so
+ * the annotation logic exists in exactly one place. */
+int intvsym_annotate_line(const intvsymtab *t, const intvdebug_dasm_line *l,
+                          char *dst, int dstsz);
 
 #ifdef __cplusplus
 }

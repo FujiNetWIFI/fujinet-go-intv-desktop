@@ -37,6 +37,8 @@ private:
     void refreshStic();
     void pauseContinue();
     void cardsPage(int delta);
+    void loadSymbols();
+    void clearSymbols();
 
     intvsession *m_session;
     intvdebug *m_dbg;

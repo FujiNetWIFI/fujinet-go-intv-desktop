@@ -14,10 +14,11 @@
  *
  * The symbol table (core/debugger/symbols.h) is not owned by intvdebug --
  * unlike msxdebug's own -- so this window creates and owns its own
- * intvsymtab instance purely for disassembly annotation, destroyed when
- * the window closes. (No "Load Symbols" UI yet -- the GNOME port's own has
- * one; porting it here is a straightforward follow-up, not done in this
- * pass to keep the KDE port's own scope matched to what's verified.)
+ * intvsymtab instance purely for disassembly/memory annotation, destroyed
+ * when the window closes. It ships pre-seeded with EXEC ROM/RAM and cart-
+ * header symbols (see symbols.c); "Load Symbols..." on the toolbar loads a
+ * per-game as1600 .sym file on top (e.g. one of the FujiNet Intellivision
+ * ports' build/GAME_net.sym), matching the GNOME port's own UI.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -26,12 +27,14 @@
 #include "DebuggerWindow.h"
 
 #include <QComboBox>
+#include <QFileDialog>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QImage>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QPixmap>
 #include <QPlainTextEdit>
 #include <QPointer>
@@ -166,6 +169,15 @@ void DebuggerWindow::buildUi()
         m_seenSerial = 0;
     });
     tb->addWidget(clearBp);
+
+    auto *loadSyms = new QPushButton(QStringLiteral("Load Symbols…"));
+    connect(loadSyms, &QPushButton::clicked, this,
+            &DebuggerWindow::loadSymbols);
+    tb->addWidget(loadSyms);
+    auto *clearSyms = new QPushButton(QStringLiteral("Clear Symbols"));
+    connect(clearSyms, &QPushButton::clicked, this,
+            &DebuggerWindow::clearSymbols);
+    tb->addWidget(clearSyms);
 
     m_status = new QLabel(QStringLiteral("Running"));
     m_status->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
@@ -310,6 +322,32 @@ void DebuggerWindow::buildUi()
     tabs->addTab(sticScroll, QStringLiteral("STIC"));
 }
 
+void DebuggerWindow::loadSymbols()
+{
+    const QString path = QFileDialog::getOpenFileName(
+        this, QStringLiteral("Load Symbols"), QString(),
+        QStringLiteral("as1600 symbol files (*.sym);;All files (*)"));
+    if (path.isEmpty())
+        return;
+    const int n = intvsymtab_load(m_symtab, path.toUtf8().constData());
+    if (n < 0) {
+        QMessageBox::warning(this, QStringLiteral("Load Symbols"),
+                             QStringLiteral("Could not open %1").arg(path));
+        return;
+    }
+    m_seenSerial = 0; /* force a redraw with the new symbols applied */
+    if (intvdebug_is_paused(m_dbg))
+        refreshAll();
+}
+
+void DebuggerWindow::clearSymbols()
+{
+    intvsymtab_clear_user(m_symtab);
+    m_seenSerial = 0;
+    if (intvdebug_is_paused(m_dbg))
+        refreshAll();
+}
+
 void DebuggerWindow::pauseContinue()
 {
     if (intvdebug_is_paused(m_dbg)) {
@@ -329,12 +367,9 @@ void DebuggerWindow::refreshDisasm()
     const int n = intvdebug_disassemble(m_dbg, r.pc, r.D, lines, kDisasmLines);
     QString text;
     for (int i = 0; i < n; i++) {
-        char symname[32];
-        QString symsuffix;
-        if (intvsymtab_lookup_addr(m_symtab, lines[i].addr, symname,
-                                   sizeof(symname)))
-            symsuffix = QStringLiteral("   ; %1").arg(
-                QString::fromUtf8(symname));
+        char symsuffix[96];
+        intvsym_annotate_line(m_symtab, &lines[i], symsuffix,
+                              sizeof(symsuffix));
         text += QStringLiteral("%1%2 %3  %4%5\n")
                     .arg(lines[i].addr == r.pc ? QLatin1Char('>')
                                                : QLatin1Char(' '))
@@ -343,7 +378,7 @@ void DebuggerWindow::refreshDisasm()
                              : QLatin1Char(' '))
                     .arg(lines[i].addr, 4, 16, QLatin1Char('0'))
                     .arg(QString::fromUtf8(lines[i].text), -24)
-                    .arg(symsuffix);
+                    .arg(QString::fromUtf8(symsuffix));
     }
     m_disasm->setPlainText(text.toUpper());
 }
@@ -375,16 +410,23 @@ void DebuggerWindow::refreshMem()
     const int n = intvdebug_read(m_dbg, m_memBase, words,
                                  kMemWordsPerRow * kMemRows);
     QString text;
+    const char *lastRegion = nullptr;
     for (int row = 0; row * kMemWordsPerRow < n; row++) {
-        text += QStringLiteral("%1 ").arg(
-            uint16_t(m_memBase + row * kMemWordsPerRow), 4, 16,
-            QLatin1Char('0')).toUpper();
+        const uint16_t rowAddr = uint16_t(m_memBase + row * kMemWordsPerRow);
+        text += QStringLiteral("%1 ").arg(rowAddr, 4, 16, QLatin1Char('0'))
+                    .toUpper();
         for (int col = 0; col < kMemWordsPerRow; col++) {
             const int idx = row * kMemWordsPerRow + col;
             if (idx < n)
                 text += QStringLiteral(" %1").arg(words[idx], 4, 16,
                                                   QLatin1Char('0')).toUpper();
         }
+        /* Only label the first row of a run in the same region -- see
+         * symbols.c's k_regions and the GNOME frontend's own refresh_mem. */
+        const char *region = intvsym_region(rowAddr);
+        if (region && region != lastRegion)
+            text += QStringLiteral("  ; %1").arg(QString::fromUtf8(region));
+        lastRegion = region;
         text += QLatin1Char('\n');
     }
     m_memView->setPlainText(text);

@@ -43,12 +43,12 @@ cmake -B build -DFRONTEND=none -DWITH_INTV_ROMS=OFF
 cmake -B build -DFRONTEND=gnome   # or kde, macos, windows
 ```
 
-`ctest` runs 14 suites covering the headless jzIntv core, ROM embedding, the
+`ctest` runs 15 suites covering the headless jzIntv core, ROM embedding, the
 frame/audio publish contract, pad and keyboard input mapping (including the
 ECS keyboard/second controller pair and the ECS/Intellivoice/PAL machine
-options), the public session API, the debugger's symbol table and STIC
-views, and (when `WITH_INTV_ROMS=OFF`) that no Mattel firmware bytes ended up
-in the shipped binary.
+options), the keypad disc's 16-way pointer geometry, the public session API,
+the debugger's symbol table and STIC views, and (when `WITH_INTV_ROMS=OFF`)
+that no Mattel firmware bytes ended up in the shipped binary.
 
 Set `INTV_OPEN_DEBUGGER=1` and/or `INTV_OPEN_KEYPAD=1` in the environment
 before launching a built frontend to have it open those windows on startup.

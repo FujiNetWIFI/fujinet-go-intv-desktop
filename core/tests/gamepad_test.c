@@ -47,9 +47,11 @@ int main(void)
           intv_disc_from_stick(-0.9659f, 0.2588f, 0.35f) == 8);
 
     /* No angle can produce an odd (half-step) code at all -- those are
-     * unreachable from the keyboard (intv_keymap.c's DIR_* enum only uses
-     * even indices) and analog/mouse input should never introduce one
-     * either. */
+     * unreachable from the keyboard too (intv_keymap.c's DIR_* enum only
+     * uses even indices). The keypad window's clickable disc DOES reach
+     * all 16 (intvsession_disc_from_point, disc_test.c): a pointer is
+     * exactly where its owner put it, whereas a stick has to survive the
+     * wobble reasoned about above. */
     {
         int all_even = 1;
         for (int deg = 0; deg < 360; deg += 3) {

@@ -11,20 +11,14 @@
  * hardware, held for as long as the finger is down, which is exactly what
  * those two signals give.
  *
- * The disc is a small custom QWidget (DiscWidget, local to this file) that
- * snaps to 8 positions (E/NE/N/NW/W/SW/S/SE) rather than the full 16 --
- * matching intv_disc_from_stick's own reasoning (core/src/gamepad_sdl.c):
- * the 8 odd half-step codes are unreachable from a keyboard and OR-combine
- * two adjacent cardinal bits, so a drag that clips one during a sweep
- * toward the intended direction can spuriously register a combined
- * reading. dy is negated before computing the angle because Qt widget
- * coordinates put y increasing DOWNWARD, while intv_host.h's disc_codes
- * numbering (0=E, 4=N, 8=W, 12=S) is defined in ordinary compass/math
- * terms where "up" is a lower y -- the same correction
- * frontends/gnome/keypad/keypad_window.c's direction_from_point applies,
- * and for the identical reason (an earlier version of that GTK file got
- * this backwards and sent north for a downward click; see that file's own
- * header for the story).
+ * The disc is a small custom QWidget (DiscWidget, local to this file)
+ * offering all 16 positions the hardware has, marking all 16 sectors, and
+ * lighting exactly the one under the pointer. Hit testing is
+ * intvsession_disc_from_point (core/src/disc_geom.c), shared with the
+ * GNOME, macOS and Windows keypad windows -- one definition of which
+ * sector a click belongs to, rather than the four subtly different private
+ * copies these files used to carry; the painting below follows the same
+ * step-by-step recipe they do, so the four discs look and behave alike.
  *
  * FOCUS: like the GNOME keypad window, this forwards keyboard events to
  * the session itself (see forwardKey) rather than trying to refuse focus
@@ -50,7 +44,7 @@
 #include <QLabel>
 #include <QMouseEvent>
 #include <QPainter>
-#include <QPainterPath>
+#include <QPolygonF>
 #include <QPointer>
 #include <QPushButton>
 #include <QVBoxLayout>
@@ -60,22 +54,18 @@
 namespace {
 
 constexpr int kDiscSize = 150;
-constexpr double kDeadzoneFrac = 0.22;
 
-/* See this file's header for the dy-negation and 8-way-snap reasoning. */
-int directionFromPoint(double dx, double dy, double radius)
+/* Segments the highlighted sector's arc edge is drawn with -- see
+ * paintEvent. */
+constexpr int kWedgeSteps = 6;
+
+/* Angles here are ordinary compass/math degrees (0 = East, growing
+ * counter-clockwise), converted to Qt's y-DOWN widget coordinates at the
+ * point of use: cos for x, MINUS sin for y. */
+QPointF discPoint(double cx, double cy, double radius, double deg)
 {
-    const double dist = std::sqrt(dx * dx + dy * dy);
-    if (dist < radius * kDeadzoneFrac)
-        return -1;
-
-    double angleDeg = std::atan2(-dy, dx) * 180.0 / M_PI;
-    if (angleDeg < 0)
-        angleDeg += 360.0;
-    int dir = int(std::floor(angleDeg / 45.0 + 0.5)) % 8;
-    if (dir < 0)
-        dir += 8;
-    return dir * 2;
+    const double a = deg * M_PI / 180.0;
+    return QPointF(cx + radius * std::cos(a), cy - radius * std::sin(a));
 }
 
 class DiscWidget : public QWidget {
@@ -85,7 +75,6 @@ public:
         : QWidget(parent), m_session(session), m_side(side)
     {
         setFixedSize(kDiscSize, kDiscSize);
-        setMouseTracking(true);
     }
 
 protected:
@@ -95,35 +84,53 @@ protected:
         p.setRenderHint(QPainter::Antialiasing);
         const double cx = width() / 2.0, cy = height() / 2.0;
         const double r = std::min(width(), height()) / 2.0 - 4;
+        const double hub = r * INTVSESSION_DISC_DEADZONE_FRAC;
 
         p.setBrush(QColor(38, 38, 43));
         p.setPen(Qt::NoPen);
         p.drawEllipse(QPointF(cx, cy), r, r);
 
+        /* The held sector: exactly the 22.5 degrees centred on the
+         * direction intvsession_disc_from_point returned, so the lit wedge
+         * is always the one bounded by the two spokes the pointer is
+         * between -- never wider, never mirrored.
+         *
+         * Drawn as a filled polygon sampled along the arc rather than with
+         * QPainterPath::arcTo: every toolkit in this project has its own
+         * answer to which way an arc sweeps in a y-down surface, and each
+         * of those answers has been wrong in one of these four files at
+         * some point. A polygon has no such convention. At r ~= 71px a
+         * 3.75-degree chord bulges 0.04px inside the true arc. */
         if (m_direction >= 0) {
-            /* Qt's arcTo(rect, startAngle, sweepLength) already matches
-             * directionFromPoint's own angle convention exactly: degrees,
-             * 0 = East (3 o'clock), positive = counter-clockwise. No unit
-             * conversion or sign flip needed here. */
-            const double a0Deg = m_direction * 22.5 - 22.5;
-            const double sweepDeg = 45.0;
-            QPainterPath wedge(QPointF(cx, cy));
-            wedge.arcTo(QRectF(cx - r, cy - r, 2 * r, 2 * r), a0Deg, sweepDeg);
-            wedge.closeSubpath();
+            const double centreDeg =
+                m_direction * INTVSESSION_DISC_SECTOR_DEG;
+            QPolygonF wedge;
+            wedge << QPointF(cx, cy);
+            for (int i = 0; i <= kWedgeSteps; i++) {
+                const double a = centreDeg -
+                                 INTVSESSION_DISC_SECTOR_DEG / 2.0 +
+                                 INTVSESSION_DISC_SECTOR_DEG * i / kWedgeSteps;
+                wedge << discPoint(cx, cy, r, a);
+            }
             p.setBrush(QColor(77, 140, 230));
-            p.drawPath(wedge);
+            p.drawPolygon(wedge);
         }
 
+        /* One spoke per sector boundary -- 16 of them, at the half-way
+         * angles BETWEEN the 16 positions, so each position gets a visible
+         * sector of its own to aim at. */
         p.setPen(QPen(QColor(115, 115, 128), 1.5));
-        for (int i = 0; i < 8; i++) {
-            const double a = (i * 45.0 - 22.5) * M_PI / 180.0;
-            p.drawLine(QPointF(cx, cy),
-                      QPointF(cx + r * std::cos(a), cy - r * std::sin(a)));
+        p.setBrush(Qt::NoBrush);
+        for (int i = 0; i < INTVSESSION_DISC_POSITIONS; i++) {
+            const double a = i * INTVSESSION_DISC_SECTOR_DEG -
+                             INTVSESSION_DISC_SECTOR_DEG / 2.0;
+            p.drawLine(discPoint(cx, cy, hub, a), discPoint(cx, cy, r, a));
         }
         p.drawEllipse(QPointF(cx, cy), r, r);
 
+        p.setPen(Qt::NoPen);
         p.setBrush(QColor(64, 64, 71));
-        p.drawEllipse(QPointF(cx, cy), r * kDeadzoneFrac, r * kDeadzoneFrac);
+        p.drawEllipse(QPointF(cx, cy), hub, hub);
     }
 
     void mousePressEvent(QMouseEvent *event) override
@@ -148,7 +155,8 @@ private:
     void updateDirection(QPointF pos)
     {
         const double r = kDiscSize / 2.0;
-        setDirection(directionFromPoint(pos.x() - r, pos.y() - r, r));
+        setDirection(
+            intvsession_disc_from_point(pos.x() - r, pos.y() - r, r));
     }
 
     void setDirection(int dir)

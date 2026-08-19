@@ -11,6 +11,12 @@
  * GtkEventControllerMotion so dragging around it while held recomputes the
  * direction continuously, the way rolling a thumb around a real disc does.
  *
+ * The disc offers all 16 positions the hardware has, marks all 16 sectors,
+ * and lights exactly the one under the pointer. Hit testing is
+ * intvsession_disc_from_point (core/src/disc_geom.c), shared with the KDE,
+ * macOS and Windows keypad windows; the drawing below follows the same
+ * step-by-step recipe they do, so the four discs look and behave alike.
+ *
  * FOCUS: this window forwards keyboard events to the session exactly like
  * the main window does (see forward_key below), rather than trying to
  * refuse focus outright -- GTK4 gives an application no reliable
@@ -30,7 +36,10 @@
 #include "../keysym_map.h"
 
 #define DISC_SIZE 150
-#define DISC_DEADZONE_FRAC 0.22
+
+/* Segments the highlighted sector's arc edge is drawn with -- see
+ * disc_draw. */
+#define DISC_WEDGE_STEPS 6
 
 typedef struct {
     GtkWidget *area;
@@ -44,42 +53,23 @@ static GtkWindow *g_win;
 static intvsession *g_session;
 
 /* ---- disc ----------------------------------------------------------------
- * direction: matches intv_host.h's disc_codes numbering (0 = E, 4 = N,
- * 8 = W, 12 = S -- verified against the staged jzIntv tree's own
- * mapping.c, where the UP/DOWN/LEFT/RIGHT keys bind to PD0L_D_N/_S/_W/_E
- * respectively at exactly those indices).
+ * Hit testing lives in the core (intvsession_disc_from_point) so all four
+ * frontends' discs agree on which sector a click belongs to, down to the
+ * boundary; this file only has to hand it a screen-space offset from the
+ * disc's centre and draw the answer. See intvsession.h for the numbering
+ * (0 = E, 4 = N, 8 = W, 12 = S, odd codes the half-steps between) and for
+ * why the pointer resolves all 16 positions where an analog stick resolves
+ * only 8.
  *
- * dy comes in as a screen-space delta (y increasing DOWNWARD), so a click
- * straight below centre has dy > 0. Standard atan2(dy,dx) treats increasing
- * y as counter-clockwise-toward-90-degrees in ordinary math convention,
- * which would place a downward click at the same angle a MATH-convention
- * upward click gets -- i.e. it comes out as North (index 4) instead of
- * South (index 12). Negating dy first (atan2(-dy,dx)) corrects for the
- * screen's flipped y-axis so a downward click actually yields South.
- *
- * Only ever returns one of the 8 EVEN positions (E/NE/N/NW/W/SW/S/SE),
- * matching intv_keymap.c's own DIR_* enum for the keyboard's arrow/IJKM
- * bindings and intv_disc_from_stick's own reasoning (core/src/
- * gamepad_sdl.c): the 8 odd half-step codes are unreachable from a
- * keyboard, and a mouse drag toward a cardinal direction sweeps through
- * several fine-grained angles on the way there, each of which used to be
- * written as its own disc position -- snapping to 8-way instead of 16-way
- * halves how many distinct (and spurious) positions a single drag can
- * pass through before settling. */
-static int direction_from_point(double dx, double dy, double radius)
+ * Angles below are ordinary compass/math degrees (0 = East, growing
+ * counter-clockwise) and are converted to this y-DOWN cairo surface at the
+ * point of use, by disc_point: cos for x, MINUS sin for y. */
+static void disc_point(double cx, double cy, double radius, double deg,
+                       double *x, double *y)
 {
-    double dist = sqrt(dx * dx + dy * dy);
-    double angle_deg;
-    int dir;
-
-    if (dist < radius * DISC_DEADZONE_FRAC)
-        return -1;
-
-    angle_deg = atan2(-dy, dx) * 180.0 / M_PI;
-    if (angle_deg < 0)
-        angle_deg += 360.0;
-    dir = (int)floor(angle_deg / 45.0 + 0.5) % 8;
-    return dir * 2;
+    const double a = deg * M_PI / 180.0;
+    *x = cx + radius * cos(a);
+    *y = cy - radius * sin(a);
 }
 
 static void disc_set_direction(DiscState *d, int dir)
@@ -99,7 +89,7 @@ static void disc_pressed(GtkGestureClick *g, int n_press, double x, double y,
     (void)g;
     (void)n_press;
     d->held = TRUE;
-    disc_set_direction(d, direction_from_point(x - r, y - r, r));
+    disc_set_direction(d, intvsession_disc_from_point(x - r, y - r, r));
 }
 
 static void disc_released(GtkGestureClick *g, int n_press, double x, double y,
@@ -122,7 +112,7 @@ static void disc_motion(GtkEventControllerMotion *c, double x, double y,
     (void)c;
     if (!d->held)
         return;
-    disc_set_direction(d, direction_from_point(x - r, y - r, r));
+    disc_set_direction(d, intvsession_disc_from_point(x - r, y - r, r));
 }
 
 static void disc_draw(GtkDrawingArea *area, cairo_t *cr, int w, int h,
@@ -130,6 +120,8 @@ static void disc_draw(GtkDrawingArea *area, cairo_t *cr, int w, int h,
 {
     DiscState *d = user_data;
     double cx = w / 2.0, cy = h / 2.0, r = (w < h ? w : h) / 2.0 - 4;
+    double hub = r * INTVSESSION_DISC_DEADZONE_FRAC;
+    double x, y;
     int i;
     (void)area;
 
@@ -137,40 +129,50 @@ static void disc_draw(GtkDrawingArea *area, cairo_t *cr, int w, int h,
     cairo_arc(cr, cx, cy, r, 0, 2 * M_PI);
     cairo_fill(cr);
 
-    /* 8 wedges, one per reachable direction code (0,2,4,...,14), each
-     * CENTERED on its compass direction and spanning exactly the 45-degree
-     * sector that direction_from_point maps to it. direction_from_point
-     * works in math convention (CCW, up = +90deg); cairo angles grow
-     * CLOCKWISE in this y-down surface, so math angle `a` corresponds to
-     * device angle `-a` here -- the radial endpoints are computed directly
-     * as (cx + r*cos(a), cy - r*sin(a)) rather than handed to cairo_arc,
-     * which would otherwise draw the mirror image. */
-    for (i = 0; i < 8; i++) {
-        int dir = i * 2;
-        double a0 = (i * 45.0 - 22.5) * M_PI / 180.0;
-        double a1 = (i * 45.0 + 22.5) * M_PI / 180.0;
-        if (dir == d->direction) {
-            cairo_set_source_rgb(cr, 0.30, 0.55, 0.90);
-            cairo_move_to(cr, cx, cy);
-            cairo_line_to(cr, cx + r * cos(a0), cy - r * sin(a0));
-            cairo_arc_negative(cr, cx, cy, r, -a0, -a1);
-            cairo_close_path(cr);
-            cairo_fill(cr);
+    /* The held sector: exactly the 22.5 degrees centred on the direction
+     * intvsession_disc_from_point returned, so the lit wedge is always the
+     * one bounded by the two spokes the pointer is between -- never wider,
+     * never mirrored.
+     *
+     * Drawn as a filled polygon sampled along the arc rather than with
+     * cairo_arc: every toolkit in this project has its own answer to which
+     * way an arc sweeps in a y-down surface (cairo's grows clockwise here,
+     * Qt's counter-clockwise, GDI's is a documentation argument), and each
+     * of those answers has been wrong in one of these four files at some
+     * point. A polygon has no such convention. At r ~= 71px a 3.75-degree
+     * chord bulges 0.04px inside the true arc -- invisible. */
+    if (d->direction >= 0) {
+        const double centre_deg = d->direction * INTVSESSION_DISC_SECTOR_DEG;
+        cairo_set_source_rgb(cr, 0.30, 0.55, 0.90);
+        cairo_move_to(cr, cx, cy);
+        for (i = 0; i <= DISC_WEDGE_STEPS; i++) {
+            double a = centre_deg - INTVSESSION_DISC_SECTOR_DEG / 2.0 +
+                       INTVSESSION_DISC_SECTOR_DEG * i / DISC_WEDGE_STEPS;
+            disc_point(cx, cy, r, a, &x, &y);
+            cairo_line_to(cr, x, y);
         }
+        cairo_close_path(cr);
+        cairo_fill(cr);
     }
 
+    /* One spoke per sector boundary -- 16 of them, at the half-way angles
+     * BETWEEN the 16 positions, so each position gets a visible sector of
+     * its own to aim at. */
     cairo_set_source_rgb(cr, 0.45, 0.45, 0.5);
     cairo_set_line_width(cr, 1.5);
-    for (i = 0; i < 8; i++) {
-        double a = (i * 45.0 - 22.5) * M_PI / 180.0;
-        cairo_move_to(cr, cx, cy);
-        cairo_line_to(cr, cx + r * cos(a), cy - r * sin(a));
+    for (i = 0; i < INTVSESSION_DISC_POSITIONS; i++) {
+        double a = i * INTVSESSION_DISC_SECTOR_DEG -
+                   INTVSESSION_DISC_SECTOR_DEG / 2.0;
+        disc_point(cx, cy, hub, a, &x, &y);
+        cairo_move_to(cr, x, y);
+        disc_point(cx, cy, r, a, &x, &y);
+        cairo_line_to(cr, x, y);
         cairo_stroke(cr);
     }
     cairo_arc(cr, cx, cy, r, 0, 2 * M_PI);
     cairo_stroke(cr);
 
-    cairo_arc(cr, cx, cy, r * DISC_DEADZONE_FRAC, 0, 2 * M_PI);
+    cairo_arc(cr, cx, cy, hub, 0, 2 * M_PI);
     cairo_set_source_rgb(cr, 0.25, 0.25, 0.28);
     cairo_fill(cr);
 }

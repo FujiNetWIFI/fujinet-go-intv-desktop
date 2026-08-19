@@ -12,14 +12,13 @@
  * for the same reason, just through GtkGestureClick/QAbstractButton's own
  * pressed()/released() signals instead.
  *
- * The disc is a small custom window class ("IntvDiscWidget") snapping to 8
- * positions, matching the fix already made to the GNOME port's own disc
- * and to intv_disc_from_stick (core/src/gamepad_sdl.c): dy is negated
- * before computing the angle because Win32 client coordinates put y
- * increasing DOWNWARD, while intv_host.h's disc_codes numbering (0=E,
- * 4=N, 8=W, 12=S) is defined in ordinary compass/math terms where "up" is
- * a lower y. SetCapture/ReleaseCapture keep receiving mouse-move messages
- * while dragging outside the widget's own bounds.
+ * The disc is a small custom window class ("IntvDiscWidget") offering all
+ * 16 positions the hardware has, marking all 16 sectors, and lighting
+ * exactly the one under the pointer. Hit testing is
+ * intvsession_disc_from_point (core/src/disc_geom.c), shared with the
+ * GNOME/KDE/macOS keypad windows, and the painting follows the same
+ * step-by-step recipe they do. SetCapture/ReleaseCapture keep receiving
+ * mouse-move messages while dragging outside the widget's own bounds.
  *
  * FOCUS: like the GNOME/KDE keypad windows, this one forwards keyboard
  * input to the session rather than letting it fall on the floor. Win32
@@ -43,7 +42,11 @@
 #include <string.h>
 
 #define DISC_SIZE 150
-#define DISC_DEADZONE_FRAC 0.22
+#define DISC_PI 3.14159265358979323846
+
+/* Segments the highlighted sector's arc edge is drawn with -- see
+ * disc_paint. */
+#define DISC_WEDGE_STEPS 6
 
 /* Column width every row in build_controller() is centered within (the
  * title label and the disc already span it) -- matches the GNOME port's
@@ -67,28 +70,18 @@ typedef struct {
 
 static HWND g_win;
 
-/* See this file's header for the dy-negation and 8-way-snap reasoning --
- * identical to frontends/gnome/keypad/keypad_window.c's own
- * direction_from_point after its own fix. */
-static int direction_from_point(double dx, double dy, double radius)
+/* ---- disc window class -------------------------------------------------
+ * Angles below are ordinary compass/math degrees (0 = East, growing
+ * counter-clockwise), converted to y-DOWN client coordinates at the point
+ * of use: cos for x, MINUS sin for y. */
+static POINT disc_point(int cx, int cy, double radius, double deg)
 {
-    double dist = sqrt(dx * dx + dy * dy);
-    double angle_deg;
-    int dir;
-
-    if (dist < radius * DISC_DEADZONE_FRAC)
-        return -1;
-
-    angle_deg = atan2(-dy, dx) * 180.0 / 3.14159265358979323846;
-    if (angle_deg < 0)
-        angle_deg += 360.0;
-    dir = (int)floor(angle_deg / 45.0 + 0.5) % 8;
-    if (dir < 0)
-        dir += 8;
-    return dir * 2;
+    double a = deg * DISC_PI / 180.0;
+    POINT p;
+    p.x = (LONG)floor(cx + radius * cos(a) + 0.5);
+    p.y = (LONG)floor(cy - radius * sin(a) + 0.5);
+    return p;
 }
-
-/* ---- disc window class ------------------------------------------------- */
 
 static void disc_set_direction(HWND hwnd, disc_state *s, int dir)
 {
@@ -104,7 +97,7 @@ static void disc_paint(HWND hwnd, disc_state *s)
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
     RECT c;
-    int cx, cy, r;
+    int cx, cy, r, hub;
     HBRUSH bg, hi, center;
     HPEN pen, oldPen;
     HBRUSH oldBrush;
@@ -114,49 +107,67 @@ static void disc_paint(HWND hwnd, disc_state *s)
     cx = c.right / 2;
     cy = c.bottom / 2;
     r = (c.right < c.bottom ? c.right : c.bottom) / 2 - 4;
+    hub = (int)(r * INTVSESSION_DISC_DEADZONE_FRAC);
 
     bg = CreateSolidBrush(RGB(38, 38, 43));
     hi = CreateSolidBrush(RGB(77, 140, 230));
     center = CreateSolidBrush(RGB(64, 64, 71));
     pen = CreatePen(PS_SOLID, 1, RGB(115, 115, 128));
 
-    FillRect(hdc, &c, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    /* The corners outside the disc take the window's own face colour, as
+     * they do on GNOME/KDE/macOS (this used to paint them black, which is
+     * why the Windows keypad had a black square behind each disc). */
+    FillRect(hdc, &c, (HBRUSH)(COLOR_BTNFACE + 1));
 
     oldBrush = (HBRUSH)SelectObject(hdc, bg);
     oldPen = (HPEN)SelectObject(hdc, GetStockObject(NULL_PEN));
     Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
 
+    /* The held sector: exactly the 22.5 degrees centred on the direction
+     * intvsession_disc_from_point returned, so the lit wedge is always the
+     * one bounded by the two spokes the pointer is between.
+     *
+     * Drawn as a filled Polygon sampled along the arc rather than with
+     * Pie(): every toolkit in this project has its own answer to which way
+     * an arc sweeps in a y-down surface, and GDI's is the murkiest of the
+     * four -- its arc direction is documented as counter-clockwise, but
+     * relative to a logical coordinate system whose y axis points the
+     * other way from the screen's, so which of the two radials is the
+     * start is a coin toss that decides between a 22.5-degree wedge and a
+     * 337.5-degree one. A polygon has no such convention. At r ~= 71px a
+     * 3.75-degree chord bulges 0.04px inside the true arc. */
     if (s->direction >= 0) {
-        /* GDI's Pie() sweeps counter-clockwise from the (xr1,yr1) radial
-         * to (xr2,yr2), in the same y-down client coordinate system this
-         * window already uses -- so the two radial points are computed
-         * with a negated sin term to match the disc's own East-clockwise
-         * compass convention (see direction_from_point's own comment). */
-        double a0 = (s->direction * 22.5 - 22.5) * 3.14159265358979323846 /
-                    180.0;
-        double a1 = (s->direction * 22.5 + 22.5) * 3.14159265358979323846 /
-                    180.0;
+        double centre_deg = s->direction * INTVSESSION_DISC_SECTOR_DEG;
+        POINT wedge[DISC_WEDGE_STEPS + 2];
+        wedge[0].x = cx;
+        wedge[0].y = cy;
+        for (i = 0; i <= DISC_WEDGE_STEPS; i++) {
+            double a = centre_deg - INTVSESSION_DISC_SECTOR_DEG / 2.0 +
+                       INTVSESSION_DISC_SECTOR_DEG * i / DISC_WEDGE_STEPS;
+            wedge[i + 1] = disc_point(cx, cy, r, a);
+        }
         SelectObject(hdc, hi);
-        Pie(hdc, cx - r, cy - r, cx + r, cy + r,
-           (int)(cx + r * cos(a1)), (int)(cy - r * sin(a1)),
-           (int)(cx + r * cos(a0)), (int)(cy - r * sin(a0)));
+        Polygon(hdc, wedge, DISC_WEDGE_STEPS + 2);
     }
 
+    /* One spoke per sector boundary -- 16 of them, at the half-way angles
+     * BETWEEN the 16 positions, so each position gets a visible sector of
+     * its own to aim at. */
     SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
     SelectObject(hdc, pen);
-    for (i = 0; i < 8; i++) {
-        double a = (i * 45.0 - 22.5) * 3.14159265358979323846 / 180.0;
-        MoveToEx(hdc, cx, cy, NULL);
-        LineTo(hdc, (int)(cx + r * cos(a)), (int)(cy - r * sin(a)));
+    for (i = 0; i < INTVSESSION_DISC_POSITIONS; i++) {
+        double a = i * INTVSESSION_DISC_SECTOR_DEG -
+                   INTVSESSION_DISC_SECTOR_DEG / 2.0;
+        POINT inner = disc_point(cx, cy, hub, a);
+        POINT outer = disc_point(cx, cy, r, a);
+        MoveToEx(hdc, inner.x, inner.y, NULL);
+        LineTo(hdc, outer.x, outer.y);
     }
     Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
 
     SelectObject(hdc, center);
     SelectObject(hdc, GetStockObject(NULL_PEN));
-    Ellipse(hdc, (int)(cx - r * DISC_DEADZONE_FRAC),
-           (int)(cy - r * DISC_DEADZONE_FRAC),
-           (int)(cx + r * DISC_DEADZONE_FRAC),
-           (int)(cy + r * DISC_DEADZONE_FRAC));
+    Ellipse(hdc, cx - hub, cy - hub, cx + hub, cy + hub);
 
     SelectObject(hdc, oldBrush);
     SelectObject(hdc, oldPen);
@@ -188,7 +199,7 @@ static LRESULT CALLBACK disc_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             s->held = 1;
             SetCapture(hwnd);
             disc_set_direction(hwnd, s,
-                               direction_from_point(
+                               intvsession_disc_from_point(
                                    (double)(short)LOWORD(lp) - r,
                                    (double)(short)HIWORD(lp) - r, r));
         }
@@ -197,7 +208,7 @@ static LRESULT CALLBACK disc_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (s && s->held) {
             double r = DISC_SIZE / 2.0;
             disc_set_direction(hwnd, s,
-                               direction_from_point(
+                               intvsession_disc_from_point(
                                    (double)(short)LOWORD(lp) - r,
                                    (double)(short)HIWORD(lp) - r, r));
         }

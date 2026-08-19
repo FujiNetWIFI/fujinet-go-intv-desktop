@@ -17,15 +17,19 @@
  * GtkGestureClick / QAbstractButton's own pressed()/released() signals /
  * subclassed WM_LBUTTONDOWN/UP instead.
  *
- * The disc is a small custom NSView subclass snapping to 8 positions,
- * matching the fix already made to the GNOME/KDE/Windows ports' own disc
- * widgets. UNLIKE those three toolkits, AppKit's default (non-flipped)
- * view coordinate system already puts y increasing UPWARD -- the same
- * "compass" convention intv_host.h's disc_codes numbering assumes (0=E,
- * 4=N, 8=W, 12=S, standard math angles) -- so, deliberately, there is NO
- * dy negation here the way GNOME/KDE/Windows each need for their own
- * y-down coordinate systems; negating here would reintroduce the exact
- * N/S-inverted bug those three had to fix.
+ * The disc is a small custom NSView subclass offering all 16 positions the
+ * hardware has, marking all 16 sectors, and lighting exactly the one under
+ * the pointer. Hit testing is intvsession_disc_from_point (core/src/
+ * disc_geom.c), shared with the GNOME/KDE/Windows keypad windows, and the
+ * drawing follows the same step-by-step recipe they do.
+ *
+ * That sharing is why DiscView answers YES to -isFlipped: AppKit's default
+ * view coordinates put y increasing UPWARD, which used to make this the
+ * one file of the four that must NOT negate dy -- a standing invitation to
+ * "fix" it into the N/S-inverted bug the other three each had to fix for
+ * real. Flipping puts mouse points and -drawRect: in the same y-DOWN frame
+ * the shared helper and the other three toolkits use, so this file's
+ * arithmetic is now line-for-line theirs.
  *
  * FOCUS: like the GNOME/KDE keypad windows, this one forwards keyboard
  * input to the session. AppKit does give each control its own
@@ -48,7 +52,10 @@
 #include <math.h>
 
 #define DISC_SIZE 150
-#define DISC_DEADZONE_FRAC 0.22
+
+/* Segments the highlighted sector's arc edge is drawn with -- see
+ * -drawRect:. */
+#define DISC_WEDGE_STEPS 6
 
 /* ---- digit/action buttons ---------------------------------------------- */
 
@@ -72,8 +79,8 @@
 @end
 
 /* ---- direction disc ------------------------------------------------------
- * See this file's header for why dy is used as-is here, unlike the GNOME/
- * KDE/Windows ports' own dy-negated versions. */
+ * See this file's header for why this view is flipped, and intvsession.h
+ * for the position numbering. */
 
 @interface DiscView : NSView
 @property(nonatomic, assign) intvsession *session;
@@ -81,8 +88,9 @@
 @end
 
 @implementation DiscView {
-    int _direction; /* -1 = centered, else an even 0-14 (0=E, 4=N, 8=W,
-                     * 12=S), matching intv_host.h's disc_codes */
+    int _direction; /* -1 = centered, else 0-15 (0=E, 4=N, 8=W, 12=S, odd
+                     * codes the half-steps between), matching
+                     * intv_host.h's disc_codes */
     BOOL _held;
 }
 
@@ -94,22 +102,20 @@
     return self;
 }
 
-static int directionFromPoint(double dx, double dy, double radius)
+/* y increases DOWNWARD in this view, like every other frontend's disc --
+ * see the file header. */
+- (BOOL)isFlipped
 {
-    double dist = sqrt(dx * dx + dy * dy);
-    double angle_deg;
-    int dir;
+    return YES;
+}
 
-    if (dist < radius * DISC_DEADZONE_FRAC)
-        return -1;
-
-    angle_deg = atan2(dy, dx) * 180.0 / M_PI;
-    if (angle_deg < 0)
-        angle_deg += 360.0;
-    dir = (int)floor(angle_deg / 45.0 + 0.5) % 8;
-    if (dir < 0)
-        dir += 8;
-    return dir * 2;
+/* Angles below are ordinary compass/math degrees (0 = East, growing
+ * counter-clockwise), converted to this view's y-DOWN coordinates at the
+ * point of use: cos for x, MINUS sin for y. */
+static NSPoint discPoint(double cx, double cy, double radius, double deg)
+{
+    double a = deg * M_PI / 180.0;
+    return NSMakePoint(cx + radius * cos(a), cy - radius * sin(a));
 }
 
 - (void)setDirection:(int)dir
@@ -126,7 +132,7 @@ static int directionFromPoint(double dx, double dy, double radius)
     NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
     double r = self.bounds.size.width / 2.0;
     _held = YES;
-    [self setDirection:directionFromPoint(p.x - r, p.y - r, r)];
+    [self setDirection:intvsession_disc_from_point(p.x - r, p.y - r, r)];
 }
 
 - (void)mouseDragged:(NSEvent *)event
@@ -135,7 +141,7 @@ static int directionFromPoint(double dx, double dy, double radius)
         return;
     NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
     double r = self.bounds.size.width / 2.0;
-    [self setDirection:directionFromPoint(p.x - r, p.y - r, r)];
+    [self setDirection:intvsession_disc_from_point(p.x - r, p.y - r, r)];
 }
 
 - (void)mouseUp:(NSEvent *)event
@@ -151,10 +157,12 @@ static int directionFromPoint(double dx, double dy, double radius)
     NSRect b = self.bounds;
     double cx = b.size.width / 2.0, cy = b.size.height / 2.0;
     double r = MIN(cx, cy) - 4;
+    double hub = r * INTVSESSION_DISC_DEADZONE_FRAC;
 
-    [[NSColor blackColor] setFill];
-    NSRectFill(b);
-
+    /* No backdrop fill: the corners outside the disc show the window's own
+     * background, as they do on GNOME and KDE (this used to paint them
+     * black, which is why the macOS keypad had a black square behind each
+     * disc and the others did not). */
     NSBezierPath *disc =
         [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(cx - r, cy - r,
                                                            r * 2, r * 2)];
@@ -162,38 +170,54 @@ static int directionFromPoint(double dx, double dy, double radius)
         setFill];
     [disc fill];
 
+    /* The held sector: exactly the 22.5 degrees centred on the direction
+     * intvsession_disc_from_point returned, so the lit wedge is always the
+     * one bounded by the two spokes the pointer is between. It used to
+     * span 67.5 degrees -- three sectors' worth, spilling well past the
+     * one actually pressed (the same ~33.75 mistake commit f6eb131 fixed
+     * on GNOME/KDE/Windows and missed here).
+     *
+     * Drawn as a filled polygon sampled along the arc rather than with
+     * -appendBezierPathWithArcWithCenter:...: every toolkit in this
+     * project has its own answer to which way an arc sweeps -- and in a
+     * flipped view AppKit's answer inverts again. A polygon has no such
+     * convention. At r ~= 71px a 3.75-degree chord bulges 0.04px inside
+     * the true arc. */
     if (_direction >= 0) {
-        /* Standard math convention (0=East, counter-clockwise positive) --
-         * NSBezierPath's own arc convention already matches, so unlike the
-         * GNOME/KDE/Windows discs (each drawing in a y-down system), no
-         * angle inversion is needed here either. */
+        double centreDeg = _direction * INTVSESSION_DISC_SECTOR_DEG;
         NSBezierPath *wedge = [NSBezierPath bezierPath];
         [wedge moveToPoint:NSMakePoint(cx, cy)];
-        [wedge appendBezierPathWithArcWithCenter:NSMakePoint(cx, cy)
-                                          radius:r
-                                      startAngle:_direction * 22.5 - 33.75
-                                        endAngle:_direction * 22.5 + 33.75];
+        for (int i = 0; i <= DISC_WEDGE_STEPS; i++) {
+            double a = centreDeg - INTVSESSION_DISC_SECTOR_DEG / 2.0 +
+                       INTVSESSION_DISC_SECTOR_DEG * i / DISC_WEDGE_STEPS;
+            [wedge lineToPoint:discPoint(cx, cy, r, a)];
+        }
         [wedge closePath];
         [[NSColor colorWithCalibratedRed:0.30 green:0.55 blue:0.90 alpha:1.0]
             setFill];
         [wedge fill];
     }
 
+    /* One spoke per sector boundary -- 16 of them, at the half-way angles
+     * BETWEEN the 16 positions, so each position gets a visible sector of
+     * its own to aim at. */
     [[NSColor colorWithCalibratedRed:0.45 green:0.45 blue:0.50 alpha:1.0]
         setStroke];
-    for (int i = 0; i < 8; i++) {
-        double a = (i * 45.0 - 22.5) * M_PI / 180.0;
+    for (int i = 0; i < INTVSESSION_DISC_POSITIONS; i++) {
+        double a = i * INTVSESSION_DISC_SECTOR_DEG -
+                   INTVSESSION_DISC_SECTOR_DEG / 2.0;
         NSBezierPath *line = [NSBezierPath bezierPath];
-        [line moveToPoint:NSMakePoint(cx, cy)];
-        [line lineToPoint:NSMakePoint(cx + r * cos(a), cy + r * sin(a))];
+        [line setLineWidth:1.5];
+        [line moveToPoint:discPoint(cx, cy, hub, a)];
+        [line lineToPoint:discPoint(cx, cy, r, a)];
         [line stroke];
     }
+    [disc setLineWidth:1.5];
     [disc stroke];
 
-    double dz = r * DISC_DEADZONE_FRAC;
     NSBezierPath *center =
-        [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(cx - dz, cy - dz,
-                                                           dz * 2, dz * 2)];
+        [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(cx - hub, cy - hub,
+                                                           hub * 2, hub * 2)];
     [[NSColor colorWithCalibratedRed:0.25 green:0.25 blue:0.28 alpha:1.0]
         setFill];
     [center fill];

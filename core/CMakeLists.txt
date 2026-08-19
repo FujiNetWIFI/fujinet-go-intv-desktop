@@ -271,6 +271,7 @@ add_library(intv_session STATIC
   src/paths.c
   src/session.c
   src/intv_keymap.c
+  src/disc_geom.c
   src/gamepad_sdl.c
   src/audio_sdl.c
   src/fujinet_runtime.c
@@ -335,6 +336,9 @@ target_link_libraries(audio_ring_test jzintv_core)
 
 add_executable(gamepad_test tests/gamepad_test.c)
 target_link_libraries(gamepad_test intv_session)
+
+add_executable(disc_test tests/disc_test.c)
+target_link_libraries(disc_test intv_session)
 target_include_directories(gamepad_test PRIVATE src)
 
 add_executable(fujibus_smoke tests/fujibus_smoke.c)
@@ -362,6 +366,7 @@ add_test(NAME keymap COMMAND keymap_test)
 add_test(NAME audio COMMAND audio_test)
 add_test(NAME audio_ring COMMAND audio_ring_test)
 add_test(NAME gamepad COMMAND gamepad_test)
+add_test(NAME disc COMMAND disc_test)
 add_test(NAME fujibus_smoke COMMAND fujibus_smoke)
 add_test(NAME debug COMMAND debug_test)
 add_test(NAME stic COMMAND stic_test)

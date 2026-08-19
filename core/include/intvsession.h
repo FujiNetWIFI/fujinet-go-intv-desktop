@@ -202,6 +202,33 @@ void intvsession_pad_key(intvsession *s, intvsession_pad_side side,
 void intvsession_pad_disc(intvsession *s, intvsession_pad_side side,
                           int direction);
 
+/* ---- disc geometry, shared by every frontend's clickable disc widget ----
+ * Pure, no session needed (same shape as intvsession_key_from_keysym below).
+ * Every frontend used to carry its own copy of this arithmetic AND its own
+ * copy of the numbers the widget is drawn from, which is exactly how the
+ * four discs drifted apart -- one lighting a 67.5-degree wedge for a
+ * 22.5-degree sector, another the mirror image of the sector actually
+ * pressed. One definition here, one set of constants, four widgets that
+ * only differ in which toolkit draws the lines. */
+#define INTVSESSION_DISC_POSITIONS 16
+#define INTVSESSION_DISC_SECTOR_DEG (360.0 / INTVSESSION_DISC_POSITIONS)
+#define INTVSESSION_DISC_DEADZONE_FRAC 0.22
+
+/* dx/dy: offsets from the disc's centre in SCREEN convention -- +dx right,
+ * +dy DOWN -- in the same units as radius. Returns the clock position whose
+ * sector contains that point (0-15: 0 = E, 1 = ENE, 2 = NE, ... numerically
+ * counter-clockwise, matching intv_host.c's own disc_codes table), or -1
+ * when the point is inside the dead centre (or radius is non-positive).
+ *
+ * Resolves all 16 positions, including the 8 odd half-steps that OR two
+ * adjacent cardinal bits together. That is deliberately UNLIKE
+ * intv_disc_from_stick (core/src/gamepad_sdl.c), which rounds an analog
+ * stick to the 8 even positions only: a stick sits wherever a spring and a
+ * thumb leave it and wobbles a few degrees off-axis, so a half-step sector
+ * only +-11.25 degrees wide catches wobble that the player did not intend,
+ * whereas a mouse pointer or fingertip is exactly where its owner put it. */
+int intvsession_disc_from_point(double dx, double dy, double radius);
+
 /* ---- ECS keyboard -----------------------------------------------------
  * The ECS's own 7x8 scan-matrix keyboard, distinct from the hand
  * controllers above -- see core/jzintv/intv_host.h's intv_ecs_key for the

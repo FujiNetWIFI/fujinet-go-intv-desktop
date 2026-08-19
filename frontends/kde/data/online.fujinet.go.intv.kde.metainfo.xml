@@ -33,6 +33,26 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.4.5" date="2026-08-19">
+      <description>
+        <p>
+          The keypad window's direction disc now offers every position the
+          real hand controller has. It marks all sixteen sectors instead of
+          eight, resolves a click or drag to the sector it actually landed
+          in -- including the eight half-step positions between the compass
+          directions, which could not be selected at all before -- and
+          lights exactly that one sector.
+        </p>
+        <p>
+          The highlight itself was wrong in different ways on different
+          systems: pressing the disc lit the whole face rather than a wedge,
+          or lit a wedge three times the width of the sector that produced
+          it. All four frontends now share one definition of the disc's
+          geometry and draw it the same way, so the disc looks and behaves
+          identically wherever you run it.
+        </p>
+      </description>
+    </release>
     <release version="0.4.4" date="2026-08-18">
       <description>
         <p>

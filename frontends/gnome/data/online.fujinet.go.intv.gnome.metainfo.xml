@@ -34,6 +34,24 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.4.4" date="2026-08-18">
+      <description>
+        <p>
+          Cartridges that come as a .bin plus a same-named .cfg memory map
+          now load correctly from the SD host slot. The FujiNet web file
+          manager stored only the first file of an upload and still reported
+          success, so sending a cartridge and its .cfg together left the card
+          holding the .bin alone; the emulator then booted it against a
+          guessed memory map, which for most titles means a black screen,
+          garbage or a hang. Uploads now accept and store every selected file,
+          drag-and-drop included, and name each one in the result.
+        </p>
+        <p>
+          A cartridge that mounts without its .cfg now says so in the FujiNet
+          log, naming the path it looked for, instead of failing silently.
+        </p>
+      </description>
+    </release>
     <release version="0.4.3" date="2026-08-17">
       <description>
         <p>

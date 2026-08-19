@@ -247,7 +247,7 @@ static const EcsKeyLabel kRowZxcv[10] = {
                     backing:NSBackingStoreBuffered
                       defer:NO];
     _window.title = @"ECS Keyboard";
-    _window.session = session;
+    _window.session = _session;
     /* This window IS the ECS keyboard, so its keystrokes drive the ECS
      * matrix whether or not "keyboard_mode" is on -- matching its
      * on-screen buttons (see this file's header) and the GNOME and KDE

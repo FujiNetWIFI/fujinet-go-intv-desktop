@@ -311,13 +311,30 @@ static GtkWidget *build_controller(intvsession *session,
 
 /* ---- keyboard passthrough (see file header) ----------------------------- */
 
-static gboolean forward_key(guint keyval, GdkModifierType state, int down)
+static gboolean forward_key(GtkEventControllerKey *c, guint keyval,
+                            guint keycode, GdkModifierType state, int down)
 {
     intvsession_key_mapping m;
-    (void)state;
+    uint32_t keysym;
+
     if (!g_session)
         return FALSE;
-    m = intvsession_key_from_keysym(intv_keysym_from_gdk(keyval));
+
+    keysym = intv_keysym_from_key_event(c, keyval, keycode, state);
+
+    /* Honour "ECS Keyboard" input mode here exactly as window.c's own
+     * forward_key does. Without this branch, typing while THIS window holds
+     * focus drove the hand controllers even with ECS keyboard mode on --
+     * the same keystroke meant two different things depending on which of
+     * the app's windows happened to be focused. */
+    if (intvsession_get_int(g_session, "keyboard_mode", 0)) {
+        intvsession_ecs_key key = intvsession_ecs_key_from_keysym(keysym);
+        if (key != INTVSESSION_ECS_KEY_NONE)
+            intvsession_ecs_key_set(g_session, key, down);
+        return TRUE;
+    }
+
+    m = intvsession_key_from_keysym(keysym);
     if (m.kind == INTVSESSION_MAP_KEY)
         intvsession_pad_key(g_session, m.side, m.key, down);
     else if (m.kind == INTVSESSION_MAP_DISC)
@@ -329,20 +346,16 @@ static gboolean on_key_pressed(GtkEventControllerKey *c, guint keyval,
                                guint keycode, GdkModifierType state,
                                gpointer user_data)
 {
-    (void)c;
-    (void)keycode;
     (void)user_data;
-    return forward_key(keyval, state, 1);
+    return forward_key(c, keyval, keycode, state, 1);
 }
 
 static void on_key_released(GtkEventControllerKey *c, guint keyval,
                             guint keycode, GdkModifierType state,
                             gpointer user_data)
 {
-    (void)c;
-    (void)keycode;
     (void)user_data;
-    forward_key(keyval, state, 0);
+    forward_key(c, keyval, keycode, state, 0);
 }
 
 static gboolean on_close_request(GtkWindow *win, gpointer user_data)

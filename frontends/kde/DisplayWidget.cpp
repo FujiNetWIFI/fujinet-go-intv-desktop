@@ -27,73 +27,12 @@
 
 #include "DisplayWidget.h"
 
+#include "KeyForward.h"
+
 #include <QFocusEvent>
 #include <QKeyEvent>
 #include <QPainter>
 #include <QTimer>
-
-namespace {
-
-/* Qt key code -> intvsession.h's private INTVSESSION_KEYSYM_* numbering,
- * for the keys intvsession_key_from_keysym resolves by symbol rather than
- * by character. F9 (keypad)/F11 (fullscreen)/F12 (debugger) are the
- * frontend's own and never reach here -- DisplayWidget::event() lets those
- * three through as shortcuts instead of claiming them. */
-quint32 keysymForKey(const QKeyEvent *event)
-{
-    switch (event->key()) {
-    case Qt::Key_Up:    return INTVSESSION_KEYSYM_UP;
-    case Qt::Key_Down:  return INTVSESSION_KEYSYM_DOWN;
-    case Qt::Key_Left:  return INTVSESSION_KEYSYM_LEFT;
-    case Qt::Key_Right: return INTVSESSION_KEYSYM_RIGHT;
-    /* Qt reports NumLock-off navigation keypad keys with the same
-     * Key_Insert/End/Down/... codes as the main keyboard, distinguished
-     * only by the KeypadModifier flag -- so those cases are handled
-     * before this switch, in forwardKey/keysymForKey's caller. This
-     * switch only needs the NumLock-on digit/decimal/enter codes, which
-     * Qt reports distinctly regardless of the modifier. */
-    case Qt::Key_0: if (event->modifiers() & Qt::KeypadModifier) return INTVSESSION_KEYSYM_KP_0; break;
-    case Qt::Key_1: if (event->modifiers() & Qt::KeypadModifier) return INTVSESSION_KEYSYM_KP_1; break;
-    case Qt::Key_2: if (event->modifiers() & Qt::KeypadModifier) return INTVSESSION_KEYSYM_KP_2; break;
-    case Qt::Key_3: if (event->modifiers() & Qt::KeypadModifier) return INTVSESSION_KEYSYM_KP_3; break;
-    case Qt::Key_4: if (event->modifiers() & Qt::KeypadModifier) return INTVSESSION_KEYSYM_KP_4; break;
-    case Qt::Key_5: if (event->modifiers() & Qt::KeypadModifier) return INTVSESSION_KEYSYM_KP_5; break;
-    case Qt::Key_6: if (event->modifiers() & Qt::KeypadModifier) return INTVSESSION_KEYSYM_KP_6; break;
-    case Qt::Key_7: if (event->modifiers() & Qt::KeypadModifier) return INTVSESSION_KEYSYM_KP_7; break;
-    case Qt::Key_8: if (event->modifiers() & Qt::KeypadModifier) return INTVSESSION_KEYSYM_KP_8; break;
-    case Qt::Key_9: if (event->modifiers() & Qt::KeypadModifier) return INTVSESSION_KEYSYM_KP_9; break;
-    case Qt::Key_Period:
-    case Qt::Key_Comma:
-        if (event->modifiers() & Qt::KeypadModifier)
-            return INTVSESSION_KEYSYM_KP_PERIOD;
-        break;
-    case Qt::Key_Enter:
-        if (event->modifiers() & Qt::KeypadModifier)
-            return INTVSESSION_KEYSYM_KP_ENTER;
-        break;
-    /* Modifiers are real Intellivision action-button bindings (mapping.c
-     * crosses RSHIFT/RALT/RCTRL to the LEFT controller and LSHIFT/LALT/
-     * LCTRL to the right -- see intv_keymap.c), so forwarded rather than
-     * swallowed -- but Qt, unlike GDK, reports left and right as the SAME
-     * key code for Shift/Control/Alt, so both land on the left-side
-     * binding here (matching the MSX port's own DisplayWidget.cpp
-     * precedent for this exact platform limitation). Control and Alt are
-     * handled in forwardKey's own fallback below, not here, since they
-     * also double as printable-key modifiers.
-    */
-    case Qt::Key_Shift: return INTVSESSION_KEYSYM_LSHIFT;
-    /* Non-printable keys the base controller map has no use for, but the
-     * ECS keyboard map (forwarded below when "keyboard_mode" is on) does. */
-    case Qt::Key_Escape:    return INTVSESSION_KEYSYM_ESCAPE;
-    case Qt::Key_Return:    return INTVSESSION_KEYSYM_RETURN;
-    case Qt::Key_Backspace: return INTVSESSION_KEYSYM_BACKSPACE;
-    default:
-        break;
-    }
-    return 0;
-}
-
-} // namespace
 
 DisplayWidget::DisplayWidget(intvsession *session, QWidget *parent)
     : QWidget(parent),
@@ -156,48 +95,7 @@ bool DisplayWidget::event(QEvent *event)
 
 void DisplayWidget::forwardKey(const QKeyEvent *event, int down)
 {
-    /* intvsession_key_from_keysym takes only the keysym -- no shift/ctrl
-     * parameters exist to feed (matching the GNOME frontend's own
-     * window.c, which doesn't compute them either) -- Ctrl is only
-     * examined here for the unshifted-letter fallback just below. */
-    const bool ctrl = event->modifiers().testFlag(Qt::ControlModifier);
-    quint32 unicode = 0;
-    if (!event->text().isEmpty())
-        unicode = event->text().at(0).unicode();
-
-    quint32 keysym = keysymForKey(event);
-    if (keysym == 0) {
-        if (event->key() == Qt::Key_Control)
-            keysym = INTVSESSION_KEYSYM_LCTRL;
-        else if (event->key() == Qt::Key_Alt)
-            keysym = INTVSESSION_KEYSYM_LALT;
-        else if (ctrl && event->key() >= Qt::Key_A && event->key() <= Qt::Key_Z)
-            /* Printable: Qt gives no text for a Ctrl combo, so fall back
-             * to the unshifted letter, which is what the keysym contract
-             * wants. */
-            keysym = 'a' + (quint32)(event->key() - Qt::Key_A);
-        else
-            keysym = unicode;
-    }
-    if (keysym == 0)
-        return;
-
-    /* "ECS Keyboard" input mode (Settings, or toggled live from there)
-     * steals the host keyboard for the ECS's own keyboard instead of the
-     * hand controllers -- see intvsession_ecs_key_from_keysym's own
-     * comment on why the two can't both claim it at once. */
-    if (intvsession_get_int(m_session, "keyboard_mode", 0)) {
-        intvsession_ecs_key key = intvsession_ecs_key_from_keysym(keysym);
-        if (key != INTVSESSION_ECS_KEY_NONE)
-            intvsession_ecs_key_set(m_session, key, down);
-        return;
-    }
-
-    intvsession_key_mapping m = intvsession_key_from_keysym(keysym);
-    if (m.kind == INTVSESSION_MAP_KEY)
-        intvsession_pad_key(m_session, m.side, m.key, down);
-    else if (m.kind == INTVSESSION_MAP_DISC)
-        intvsession_pad_disc(m_session, m.side, down ? m.direction : -1);
+    intvForwardKey(m_session, event, down);
 }
 
 void DisplayWidget::focusOutEvent(QFocusEvent *event)

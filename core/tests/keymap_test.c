@@ -43,14 +43,38 @@ static void expect_none(uint32_t keysym)
 
 int main(void)
 {
-    /* Numpad -> left controller keypad (mapping.c: KP_7..KP_ENTER). */
+    /* Every one of the 50 PD0L_ and PD0R_ rows in mapping.c's cfg_key_bind[]
+     * column 1 (the default one-player map intv_keymap.c mirrors) is checked
+     * below -- exhaustively, not by sample, so that a dropped or transposed
+     * row cannot pass. The frontends each translate their toolkit's own key
+     * values into these keysyms; the whole point of that translation is to
+     * land on exactly this table, so it is the one contract worth pinning. */
+
+    /* Numpad -> left controller keypad (mapping.c: KP_7..KP_ENTER). Note
+     * upstream's deliberate offset: the numpad's own 7/8/9 row is the
+     * Intellivision keypad's 1/2/3 row, KP_0 is Clear and KP_PERIOD is 0. */
     expect_key(INTVSESSION_KEYSYM_KP_7, INTVSESSION_PAD_LEFT, INTVSESSION_KEY_1);
+    expect_key(INTVSESSION_KEYSYM_KP_8, INTVSESSION_PAD_LEFT, INTVSESSION_KEY_2);
+    expect_key(INTVSESSION_KEYSYM_KP_9, INTVSESSION_PAD_LEFT, INTVSESSION_KEY_3);
+    expect_key(INTVSESSION_KEYSYM_KP_4, INTVSESSION_PAD_LEFT, INTVSESSION_KEY_4);
+    expect_key(INTVSESSION_KEYSYM_KP_5, INTVSESSION_PAD_LEFT, INTVSESSION_KEY_5);
+    expect_key(INTVSESSION_KEYSYM_KP_6, INTVSESSION_PAD_LEFT, INTVSESSION_KEY_6);
+    expect_key(INTVSESSION_KEYSYM_KP_1, INTVSESSION_PAD_LEFT, INTVSESSION_KEY_7);
+    expect_key(INTVSESSION_KEYSYM_KP_2, INTVSESSION_PAD_LEFT, INTVSESSION_KEY_8);
+    expect_key(INTVSESSION_KEYSYM_KP_3, INTVSESSION_PAD_LEFT, INTVSESSION_KEY_9);
     expect_key(INTVSESSION_KEYSYM_KP_0, INTVSESSION_PAD_LEFT, INTVSESSION_KEY_CLEAR);
     expect_key(INTVSESSION_KEYSYM_KP_PERIOD, INTVSESSION_PAD_LEFT, INTVSESSION_KEY_0);
     expect_key(INTVSESSION_KEYSYM_KP_ENTER, INTVSESSION_PAD_LEFT, INTVSESSION_KEY_ENTER);
 
     /* Number row -> right controller keypad (mapping.c: "1".."="). */
     expect_key('1', INTVSESSION_PAD_RIGHT, INTVSESSION_KEY_1);
+    expect_key('2', INTVSESSION_PAD_RIGHT, INTVSESSION_KEY_2);
+    expect_key('3', INTVSESSION_PAD_RIGHT, INTVSESSION_KEY_3);
+    expect_key('4', INTVSESSION_PAD_RIGHT, INTVSESSION_KEY_4);
+    expect_key('5', INTVSESSION_PAD_RIGHT, INTVSESSION_KEY_5);
+    expect_key('6', INTVSESSION_PAD_RIGHT, INTVSESSION_KEY_6);
+    expect_key('7', INTVSESSION_PAD_RIGHT, INTVSESSION_KEY_7);
+    expect_key('8', INTVSESSION_PAD_RIGHT, INTVSESSION_KEY_8);
     expect_key('9', INTVSESSION_PAD_RIGHT, INTVSESSION_KEY_9);
     expect_key('-', INTVSESSION_PAD_RIGHT, INTVSESSION_KEY_CLEAR);
     expect_key('0', INTVSESSION_PAD_RIGHT, INTVSESSION_KEY_0);
@@ -59,25 +83,37 @@ int main(void)
     /* Action buttons -- upstream crosses left/right modifiers with
      * right/left controllers (mapping.c: RSHIFT..LCTRL). */
     expect_key(INTVSESSION_KEYSYM_RSHIFT, INTVSESSION_PAD_LEFT, INTVSESSION_ACTION_TOP);
-    expect_key(INTVSESSION_KEYSYM_LSHIFT, INTVSESSION_PAD_RIGHT, INTVSESSION_ACTION_TOP);
+    expect_key(INTVSESSION_KEYSYM_RALT, INTVSESSION_PAD_LEFT, INTVSESSION_ACTION_LOWER_LEFT);
     expect_key(INTVSESSION_KEYSYM_RCTRL, INTVSESSION_PAD_LEFT, INTVSESSION_ACTION_LOWER_RIGHT);
+    expect_key(INTVSESSION_KEYSYM_LSHIFT, INTVSESSION_PAD_RIGHT, INTVSESSION_ACTION_TOP);
+    expect_key(INTVSESSION_KEYSYM_LALT, INTVSESSION_PAD_RIGHT, INTVSESSION_ACTION_LOWER_LEFT);
+    expect_key(INTVSESSION_KEYSYM_LCTRL, INTVSESSION_PAD_RIGHT, INTVSESSION_ACTION_LOWER_RIGHT);
 
     /* Arrows -> left disc (mapping.c: RIGHT/UP/LEFT/DOWN). */
-    expect_disc(INTVSESSION_KEYSYM_UP, INTVSESSION_PAD_LEFT, 4);
     expect_disc(INTVSESSION_KEYSYM_RIGHT, INTVSESSION_PAD_LEFT, 0);
-    expect_disc(INTVSESSION_KEYSYM_DOWN, INTVSESSION_PAD_LEFT, 12);
+    expect_disc(INTVSESSION_KEYSYM_UP, INTVSESSION_PAD_LEFT, 4);
     expect_disc(INTVSESSION_KEYSYM_LEFT, INTVSESSION_PAD_LEFT, 8);
+    expect_disc(INTVSESSION_KEYSYM_DOWN, INTVSESSION_PAD_LEFT, 12);
 
     /* IJKM diagonals -> left disc, case-insensitive (mapping.c: K/O/I/U/
      * J/N/M/,). */
     expect_disc('k', INTVSESSION_PAD_LEFT, 0);
     expect_disc('O', INTVSESSION_PAD_LEFT, 2);
     expect_disc('i', INTVSESSION_PAD_LEFT, 4);
+    expect_disc('U', INTVSESSION_PAD_LEFT, 6);
+    expect_disc('j', INTVSESSION_PAD_LEFT, 8);
+    expect_disc('N', INTVSESSION_PAD_LEFT, 10);
+    expect_disc('m', INTVSESSION_PAD_LEFT, 12);
     expect_disc(',', INTVSESSION_PAD_LEFT, 14);
 
     /* DRWEASZXC -> right disc (mapping.c: D/R/E/W/S/Z/X/C). */
     expect_disc('d', INTVSESSION_PAD_RIGHT, 0);
+    expect_disc('R', INTVSESSION_PAD_RIGHT, 2);
+    expect_disc('e', INTVSESSION_PAD_RIGHT, 4);
     expect_disc('W', INTVSESSION_PAD_RIGHT, 6);
+    expect_disc('s', INTVSESSION_PAD_RIGHT, 8);
+    expect_disc('Z', INTVSESSION_PAD_RIGHT, 10);
+    expect_disc('x', INTVSESSION_PAD_RIGHT, 12);
     expect_disc('c', INTVSESSION_PAD_RIGHT, 14);
 
     /* Reserved-for-frontends and non-pad keys must not map. */

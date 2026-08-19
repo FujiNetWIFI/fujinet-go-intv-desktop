@@ -14,17 +14,19 @@
  * the way a hand can, so they latch, and intv_host_ecs_key's OR-in-a-bit
  * chording (core/jzintv/intv_host.c) does the rest.
  *
- * FOCUS: forwards keyboard events the same way KeypadWindow does, reusing
- * DisplayWidget.cpp's own keysym translation approach (there is no shared
- * header for it -- each Qt window's forwardKey is small enough that
- * duplicating the switch has been the pattern here, matching KeypadWindow
- * .cpp's own local forwardKey rather than factoring out a shared one).
+ * FOCUS: forwards keyboard events through KeyForward.h's shared translation,
+ * the same one DisplayWidget and KeypadWindow use -- see that header for why
+ * the three windows no longer each carry their own copy. This window's own
+ * forwardKey still routes to the ECS matrix unconditionally rather than
+ * calling intvForwardKey, for the "keyboard_mode"-independence reason above.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include "EcsKeyboardWindow.h"
+
+#include "KeyForward.h"
 
 #include <QCloseEvent>
 #include <QGridLayout>
@@ -111,27 +113,6 @@ QHBoxLayout *addRow(const EcsKeyLabel *row, int count, intvsession *session)
     return hbox;
 }
 
-/* Qt key code -> intvsession.h's private INTVSESSION_KEYSYM_* numbering.
- * Same approach as DisplayWidget.cpp's own keysymForKey (no shared header
- * for it -- see file header). */
-quint32 keysymForKey(const QKeyEvent *event)
-{
-    switch (event->key()) {
-    case Qt::Key_Up:        return INTVSESSION_KEYSYM_UP;
-    case Qt::Key_Down:      return INTVSESSION_KEYSYM_DOWN;
-    case Qt::Key_Left:      return INTVSESSION_KEYSYM_LEFT;
-    case Qt::Key_Right:     return INTVSESSION_KEYSYM_RIGHT;
-    case Qt::Key_Shift:     return INTVSESSION_KEYSYM_LSHIFT;
-    case Qt::Key_Control:   return INTVSESSION_KEYSYM_LCTRL;
-    case Qt::Key_Escape:    return INTVSESSION_KEYSYM_ESCAPE;
-    case Qt::Key_Return:    return INTVSESSION_KEYSYM_RETURN;
-    case Qt::Key_Backspace: return INTVSESSION_KEYSYM_BACKSPACE;
-    default:
-        break;
-    }
-    return 0;
-}
-
 QPointer<EcsKeyboardWindow> g_singleton;
 QPointer<QWidget> g_topLevel;
 
@@ -214,18 +195,11 @@ QWidget *EcsKeyboardWindow::buildKeyboard()
 
 void EcsKeyboardWindow::forwardKey(const QKeyEvent *event, int down)
 {
-    const bool ctrl = event->modifiers().testFlag(Qt::ControlModifier);
-    quint32 unicode = 0;
-    if (!event->text().isEmpty())
-        unicode = event->text().at(0).unicode();
-
-    quint32 keysym = keysymForKey(event);
-    if (keysym == 0) {
-        if (ctrl && event->key() >= Qt::Key_A && event->key() <= Qt::Key_Z)
-            keysym = 'a' + (quint32)(event->key() - Qt::Key_A);
-        else
-            keysym = unicode;
-    }
+    /* Deliberately NOT intvForwardKey: this window is the ECS keyboard, so
+     * it routes to the ECS matrix whether or not "keyboard_mode" is on --
+     * same reasoning as its on-screen buttons (see this file's header).
+     * Only the translation is shared. */
+    const quint32 keysym = intvKeysymForKeyEvent(event);
     if (keysym == 0)
         return;
 

@@ -21,19 +21,22 @@
  * a lower y. SetCapture/ReleaseCapture keep receiving mouse-move messages
  * while dragging outside the widget's own bounds.
  *
- * FOCUS: unlike the GNOME/KDE keypad windows, this one does NOT forward
- * keyboard input -- Win32 child controls (BUTTON, the custom disc class)
- * take keyboard focus on click by default, same underlying platform
- * limitation those two document, but there is no session-wide keyboard
- * hook available here the way GTK/Qt's own top-level event routing gives
- * for free; typing while this window has focus is simply inert, matching
- * how a real Windows dialog would already behave if it stole focus.
+ * FOCUS: like the GNOME/KDE keypad windows, this one forwards keyboard
+ * input to the session rather than letting it fall on the floor. Win32
+ * child controls (BUTTON, the custom disc class) take keyboard focus on
+ * click by default, so WM_KEYDOWN/WM_KEYUP arrive at the child rather than
+ * at the main window -- but each of those child procs is already
+ * subclassed here for its own mouse handling, so they forward the key
+ * messages from the same place (see key_forward.h) and no session-wide
+ * keyboard hook is needed after all.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include "keypad_window.h"
+
+#include "key_forward.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -168,6 +171,11 @@ static LRESULT CALLBACK disc_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     disc_state *s = (disc_state *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
 
+    /* Same reason as key_btn_proc: this custom control takes focus when
+     * clicked, so keystrokes land here (see key_forward.h). */
+    if (intv_forward_key_msg(msg, wp, lp))
+        return 0;
+
     switch (msg) {
     case WM_PAINT:
         if (s) disc_paint(hwnd, s);
@@ -215,6 +223,13 @@ static WNDPROC g_btn_proc;
 static LRESULT CALLBACK key_btn_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     key_binding *kb = (key_binding *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+
+    /* A clicked BUTTON keeps the focus, so keystrokes arrive here rather
+     * than at the main window -- forward them instead of swallowing them
+     * (see key_forward.h). Claiming the message also stops the BUTTON's own
+     * default handling from treating Space/Enter as "press me". */
+    if (intv_forward_key_msg(msg, wp, lp))
+        return 0;
 
     if (kb) {
         if (msg == WM_LBUTTONDOWN) {
@@ -308,6 +323,9 @@ static void build_controller(HWND parent, HINSTANCE inst, intvsession *session,
 static LRESULT CALLBACK keypad_wnd_proc(HWND hwnd, UINT msg, WPARAM wp,
                                         LPARAM lp)
 {
+    if (intv_forward_key_msg(msg, wp, lp))
+        return 0;
+
     switch (msg) {
     case WM_CLOSE:
         ShowWindow(hwnd, SW_HIDE);

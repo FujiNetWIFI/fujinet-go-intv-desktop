@@ -30,13 +30,19 @@
  * the session itself (see forwardKey) rather than trying to refuse focus
  * outright -- no toolkit reliably prevents a clicked toplevel from taking
  * keyboard focus, so typing still drives the machine correctly whichever
- * window currently has it.
+ * window currently has it. That forwarding goes through KeyForward.h's
+ * shared translation now: this file used to carry its own cut-down copy
+ * that handled the arrow keys and event->text() and nothing else, so with
+ * this window focused the numpad, the modifiers/action buttons and
+ * "keyboard_mode" were all quietly ignored.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include "KeypadWindow.h"
+
+#include "KeyForward.h"
 
 #include <QGridLayout>
 #include <QHBoxLayout>
@@ -268,24 +274,7 @@ QWidget *KeypadWindow::buildController(intvsession_pad_side side,
 
 void KeypadWindow::forwardKey(const QKeyEvent *event, int down)
 {
-    quint32 unicode = 0;
-    if (!event->text().isEmpty())
-        unicode = event->text().at(0).unicode();
-    quint32 keysym = unicode;
-    switch (event->key()) {
-    case Qt::Key_Up:    keysym = INTVSESSION_KEYSYM_UP; break;
-    case Qt::Key_Down:  keysym = INTVSESSION_KEYSYM_DOWN; break;
-    case Qt::Key_Left:  keysym = INTVSESSION_KEYSYM_LEFT; break;
-    case Qt::Key_Right: keysym = INTVSESSION_KEYSYM_RIGHT; break;
-    default: break;
-    }
-    if (keysym == 0)
-        return;
-    intvsession_key_mapping m = intvsession_key_from_keysym(keysym);
-    if (m.kind == INTVSESSION_MAP_KEY)
-        intvsession_pad_key(m_session, m.side, m.key, down);
-    else if (m.kind == INTVSESSION_MAP_DISC)
-        intvsession_pad_disc(m_session, m.side, down ? m.direction : -1);
+    intvForwardKey(m_session, event, down);
 }
 
 void KeypadWindow::keyPressEvent(QKeyEvent *event)

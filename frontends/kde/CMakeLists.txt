@@ -27,6 +27,7 @@ add_executable(fujinet-go-intv-kde
   main.cpp
   MainWindow.cpp
   DisplayWidget.cpp
+  KeyForward.cpp
   FujiNetWindows.cpp
   SettingsDialog.cpp
   debugger/DebuggerWindow.cpp
@@ -63,6 +64,17 @@ if(WITH_WEBVIEW)
     message(STATUS "KDE frontend: QtWebEngine not found -- FujiNet config opens in the browser")
   endif()
 endif()
+
+# KeyForward's scancode translation is the one piece of this frontend that
+# is worth testing without a human at a keyboard -- QKeyEvent takes a
+# nativeScanCode in its constructor and needs no QGuiApplication, so the
+# action-button + keypad chords and the left/right modifier split can both
+# be checked directly. Qt6::Gui alone: no widgets, no display server.
+add_executable(keyforward_test keyforward_test.cpp KeyForward.cpp)
+target_link_libraries(keyforward_test PRIVATE intv_session Qt6::Gui)
+target_include_directories(keyforward_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_options(keyforward_test PRIVATE -Wall -Wextra)
+add_test(NAME keyforward COMMAND keyforward_test)
 
 install(TARGETS fujinet-go-intv-kde RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES data/${KDE_APP_ID}.desktop

@@ -16,16 +16,19 @@
  * window's own WM_COMMAND), and intv_host_ecs_key's OR-in-a-bit chording
  * (core/jzintv/intv_host.c) does the rest.
  *
- * FOCUS: like keypad_window.c, this window does NOT forward keyboard
- * input -- see that file's own FOCUS note for why (no session-wide
- * keyboard hook exists in this frontend the way GTK/Qt's top-level event
- * routing gives for free).
+ * FOCUS: like keypad_window.c, this window forwards keyboard input to the
+ * session -- see that file's own FOCUS note. Here it goes through
+ * intv_forward_ecs_key, which routes to the ECS matrix regardless of the
+ * "keyboard_mode" setting, matching this window's on-screen buttons above
+ * and the GNOME and KDE ports' equivalents.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include "ecskbd_window.h"
+
+#include "key_forward.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -49,6 +52,13 @@ static WNDPROC g_btn_proc;
 static LRESULT CALLBACK key_btn_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     key_binding *kb = (key_binding *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+
+    /* A clicked BUTTON keeps the focus, so keystrokes arrive here rather
+     * than at the main window -- forward them instead of swallowing them
+     * (see key_forward.h). Claiming the message also stops the BUTTON's own
+     * default handling from treating Space/Enter as "press me". */
+    if (intv_forward_ecs_key_msg(msg, wp, lp))
+        return 0;
 
     if (kb) {
         if (msg == WM_LBUTTONDOWN) {
@@ -201,6 +211,9 @@ static void update_notice(intvsession *session)
 static LRESULT CALLBACK ecskbd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp,
                                         LPARAM lp)
 {
+    if (intv_forward_ecs_key_msg(msg, wp, lp))
+        return 0;
+
     switch (msg) {
     case WM_COMMAND:
         if (HIWORD(wp) == BN_CLICKED) {

@@ -26,6 +26,7 @@
 
 #include "intvsession.h"
 #include "debugger/dbg_window.h"
+#include "key_forward.h"
 #include "ecskbd/ecskbd_window.h"
 #include "keypad/keypad_window.h"
 #include "resource.h"
@@ -162,6 +163,7 @@ static uint32_t base_char(WPARAM vk)
     case VK_OEM_PLUS:   return '=';
     case VK_OEM_COMMA:  return ',';
     case VK_OEM_PERIOD: return '.';
+    case VK_OEM_1:      return ';'; /* ECS-keyboard-only (KEYB_SEMI) */
     default:            return 0;
     }
 }
@@ -197,10 +199,6 @@ static void reset_to_config(void);
 
 static void on_key(HWND hwnd, WPARAM vk, LPARAM lp, int down)
 {
-    WPARAM rvk;
-    uint32_t keysym;
-    intvsession_key_mapping m;
-
     if (down) {
         switch (vk) {
         case VK_F9:
@@ -234,11 +232,20 @@ static void on_key(HWND hwnd, WPARAM vk, LPARAM lp, int down)
         return;
     }
 
-    rvk = resolve_side(vk, lp);
+    intv_forward_key(vk, lp, down);
+}
+
+/* VK code + message lParam -> intvsession.h's keysym numbering. 0 for keys
+ * the emulated machine has no use for. */
+static uint32_t resolve_keysym(WPARAM vk, LPARAM lp)
+{
+    const WPARAM rvk = resolve_side(vk, lp);
+    uint32_t keysym;
+
     /* Numpad Enter reports as VK_RETURN with the extended-key bit set;
      * plain Enter has no keypad binding in intv_keymap.c's base controller
      * map (jzIntv's own mapping.c has no ENTER-key binding outside the
-     * numpad), but the ECS keyboard map below does want it, hence
+     * numpad), but the ECS keyboard map does want it, hence
      * INTVSESSION_KEYSYM_RETURN rather than dropping it outright. */
     if (rvk == VK_RETURN && (lp & 0x01000000))
         keysym = INTVSESSION_KEYSYM_KP_ENTER;
@@ -246,11 +253,21 @@ static void on_key(HWND hwnd, WPARAM vk, LPARAM lp, int down)
         keysym = INTVSESSION_KEYSYM_RETURN;
     else
         keysym = special_keysym(rvk);
-    if (!keysym) {
-        keysym = base_char(rvk);
-        if (!keysym)
-            return; /* not a key the emulated controller has */
-    }
+
+    return keysym ? keysym : base_char(rvk);
+}
+
+/* The translate-and-dispatch half of on_key, without any of its hotkey
+ * handling -- shared with the keypad window, whose child controls take
+ * focus on click and so must forward keystrokes here rather than letting
+ * them fall on the floor. Declared in key_forward.h. */
+void intv_forward_key(WPARAM vk, LPARAM lp, int down)
+{
+    const uint32_t keysym = resolve_keysym(vk, lp);
+    intvsession_key_mapping m;
+
+    if (!keysym)
+        return;
 
     /* "ECS Keyboard" input mode (Settings, or toggled live from there)
      * steals the keyboard for the ECS's own keyboard instead of the hand
@@ -268,6 +285,24 @@ static void on_key(HWND hwnd, WPARAM vk, LPARAM lp, int down)
         intvsession_pad_key(g_session, m.side, m.key, down);
     else if (m.kind == INTVSESSION_MAP_DISC)
         intvsession_pad_disc(g_session, m.side, down ? m.direction : -1);
+}
+
+/* Unconditionally routes to the ECS keyboard matrix, ignoring
+ * "keyboard_mode" -- for the ECS keyboard window, which IS the ECS
+ * keyboard and so means the same thing whether or not the setting happens
+ * to be on. Matches that window's on-screen buttons, and the GNOME and KDE
+ * ports' equivalents. Declared in key_forward.h. */
+void intv_forward_ecs_key(WPARAM vk, LPARAM lp, int down)
+{
+    const uint32_t keysym = resolve_keysym(vk, lp);
+    intvsession_ecs_key key;
+
+    if (!keysym)
+        return;
+
+    key = intvsession_ecs_key_from_keysym(keysym);
+    if (key != INTVSESSION_ECS_KEY_NONE)
+        intvsession_ecs_key_set(g_session, key, down);
 }
 
 /* ---- menu actions ------------------------------------------------------------ */

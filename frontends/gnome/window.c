@@ -52,11 +52,11 @@ void intv_window_restart_session(IntvWindow *self)
  * core/jzintv/intv_host.h), so a missed release leaves that key down in the
  * machine. */
 
-static gboolean forward_key(IntvWindow *self, guint keyval,
+static gboolean forward_key(IntvWindow *self, GtkEventControllerKey *ctrl,
+                            guint keyval, guint keycode,
                             GdkModifierType state, int down)
 {
-    uint32_t keysym = intv_keysym_from_gdk(keyval);
-    (void)state;
+    uint32_t keysym = intv_keysym_from_key_event(ctrl, keyval, keycode, state);
 
     /* "ECS Keyboard" input mode (Preferences -> Input, or toggled live from
      * there) steals the host keyboard for the ECS's own keyboard instead of
@@ -82,8 +82,6 @@ static gboolean on_key_pressed(GtkEventControllerKey *controller, guint keyval,
                                gpointer user_data)
 {
     IntvWindow *self = INTV_WINDOW(user_data);
-    (void)controller;
-    (void)keycode;
 
     switch (keyval) {
     case GDK_KEY_F9:
@@ -113,7 +111,7 @@ static gboolean on_key_pressed(GtkEventControllerKey *controller, guint keyval,
         break;
     }
 
-    return forward_key(self, keyval, state, 1);
+    return forward_key(self, controller, keyval, keycode, state, 1);
 }
 
 static void on_key_released(GtkEventControllerKey *controller, guint keyval,
@@ -121,15 +119,13 @@ static void on_key_released(GtkEventControllerKey *controller, guint keyval,
                             gpointer user_data)
 {
     IntvWindow *self = INTV_WINDOW(user_data);
-    (void)controller;
-    (void)keycode;
     if (keyval == GDK_KEY_F9 || keyval == GDK_KEY_F10 ||
         keyval == GDK_KEY_F11 || keyval == GDK_KEY_F12)
         return;
     if ((keyval == GDK_KEY_r || keyval == GDK_KEY_R) &&
         (state & GDK_CONTROL_MASK))
         return;
-    forward_key(self, keyval, state, 0);
+    forward_key(self, controller, keyval, keycode, state, 0);
 }
 
 /* Losing keyboard focus (alt-tab, another window raised) shouldn't leave a

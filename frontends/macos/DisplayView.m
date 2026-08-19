@@ -9,16 +9,11 @@
  * poll instead, matching the reasoning in frontends/gnome/display.c and
  * frontends/windows/main.c's own file comments.
  *
- * Keyboard: intvsession_key_from_keysym wants intvsession.h's OWN private
- * numbering for non-printable keys (INTVSESSION_KEYSYM_* starting at
- * 0x1000), not a raw NSEvent keyCode or character -- see the GNOME port's
- * keysym_map.h for why that distinction matters (passing a toolkit's
- * native key value straight through silently drops every arrow/numpad/
- * modifier key while ASCII letters keep working by coincidence). Virtual
- * keyCodes (layout-independent, unlike charactersIgnoringModifiers, which
- * cannot tell a numpad digit from a top-row one) are used for arrows/
- * numpad/modifiers, matching the Windows port's own special_keysym()/
- * base_char() split with VK_* codes.
+ * Keyboard: the translation and dispatch both live in IntvKeyForward.m,
+ * shared with the keypad and ECS keyboard windows -- see that file's
+ * header for the keyCode-versus-character reasoning, and the GNOME port's
+ * keysym_map.h for why intvsession.h's private INTVSESSION_KEYSYM_*
+ * numbering is not interchangeable with a toolkit's own key values.
  *
  * NOT BUILT OR RUN-VERIFIED -- see main.m's file header.
  *
@@ -27,6 +22,8 @@
  */
 
 #import "DisplayView.h"
+
+#import "IntvKeyForward.h"
 
 #define TICK_INTERVAL (1.0 / 60.0)
 
@@ -140,107 +137,9 @@
     return YES;
 }
 
-/* macOS virtual keyCodes for arrows/numpad/modifiers -- layout-independent,
- * unlike characters. */
-enum {
-    kVK_ANSI_KeypadDecimal = 0x41,
-    kVK_ANSI_KeypadMultiply = 0x43,
-    kVK_ANSI_KeypadPlus = 0x45,
-    kVK_ANSI_KeypadClear = 0x47,
-    kVK_ANSI_KeypadDivide = 0x4B,
-    kVK_ANSI_KeypadEnter = 0x4C,
-    kVK_ANSI_KeypadMinus = 0x4E,
-    kVK_ANSI_KeypadEquals = 0x51,
-    kVK_ANSI_Keypad0 = 0x52,
-    kVK_ANSI_Keypad1 = 0x53,
-    kVK_ANSI_Keypad2 = 0x54,
-    kVK_ANSI_Keypad3 = 0x55,
-    kVK_ANSI_Keypad4 = 0x56,
-    kVK_ANSI_Keypad5 = 0x57,
-    kVK_ANSI_Keypad6 = 0x58,
-    kVK_ANSI_Keypad7 = 0x59,
-    kVK_ANSI_Keypad8 = 0x5B,
-    kVK_ANSI_Keypad9 = 0x5C,
-    kVK_Shift = 0x38,
-    kVK_RightShift = 0x3C,
-    kVK_Control = 0x3B,
-    kVK_RightControl = 0x3E,
-    kVK_Option = 0x3A,
-    kVK_RightOption = 0x3D,
-    kVK_LeftArrow = 0x7B,
-    kVK_RightArrow = 0x7C,
-    kVK_DownArrow = 0x7D,
-    kVK_UpArrow = 0x7E,
-    kVK_Return = 0x24,
-    kVK_Delete = 0x33, /* "Backspace" on a Mac keyboard */
-    kVK_Escape = 0x35,
-};
-
-static uint32_t special_keysym(unsigned short keyCode)
-{
-    switch (keyCode) {
-    case kVK_UpArrow:    return INTVSESSION_KEYSYM_UP;
-    case kVK_DownArrow:  return INTVSESSION_KEYSYM_DOWN;
-    case kVK_LeftArrow:  return INTVSESSION_KEYSYM_LEFT;
-    case kVK_RightArrow: return INTVSESSION_KEYSYM_RIGHT;
-    case kVK_ANSI_Keypad0: return INTVSESSION_KEYSYM_KP_0;
-    case kVK_ANSI_Keypad1: return INTVSESSION_KEYSYM_KP_1;
-    case kVK_ANSI_Keypad2: return INTVSESSION_KEYSYM_KP_2;
-    case kVK_ANSI_Keypad3: return INTVSESSION_KEYSYM_KP_3;
-    case kVK_ANSI_Keypad4: return INTVSESSION_KEYSYM_KP_4;
-    case kVK_ANSI_Keypad5: return INTVSESSION_KEYSYM_KP_5;
-    case kVK_ANSI_Keypad6: return INTVSESSION_KEYSYM_KP_6;
-    case kVK_ANSI_Keypad7: return INTVSESSION_KEYSYM_KP_7;
-    case kVK_ANSI_Keypad8: return INTVSESSION_KEYSYM_KP_8;
-    case kVK_ANSI_Keypad9: return INTVSESSION_KEYSYM_KP_9;
-    case kVK_ANSI_KeypadDecimal: return INTVSESSION_KEYSYM_KP_PERIOD;
-    case kVK_ANSI_KeypadEnter:   return INTVSESSION_KEYSYM_KP_ENTER;
-    case kVK_Shift:        return INTVSESSION_KEYSYM_LSHIFT;
-    case kVK_RightShift:   return INTVSESSION_KEYSYM_RSHIFT;
-    case kVK_Control:      return INTVSESSION_KEYSYM_LCTRL;
-    case kVK_RightControl: return INTVSESSION_KEYSYM_RCTRL;
-    case kVK_Option:       return INTVSESSION_KEYSYM_LALT;
-    case kVK_RightOption:  return INTVSESSION_KEYSYM_RALT;
-    /* Non-printable keys the base controller map has no use for, but the
-     * ECS keyboard map (forwarded below when "keyboard_mode" is on) does. */
-    case kVK_Return: return INTVSESSION_KEYSYM_RETURN;
-    case kVK_Delete: return INTVSESSION_KEYSYM_BACKSPACE;
-    case kVK_Escape: return INTVSESSION_KEYSYM_ESCAPE;
-    default:
-        return 0;
-    }
-}
-
 - (void)forwardKeyEvent:(NSEvent *)event down:(int)down
 {
-    uint32_t keysym = special_keysym(event.keyCode);
-    intvsession_key_mapping m;
-
-    if (!keysym) {
-        NSString *chars = event.charactersIgnoringModifiers;
-        unichar c = chars.length ? [chars characterAtIndex:0] : 0;
-        if (c >= 0x20 && c < 0x7F)
-            keysym = c;
-        else
-            return; /* not a key the emulated controller has */
-    }
-
-    /* "ECS Keyboard" input mode (Settings, or toggled live from there)
-     * steals the keyboard for the ECS's own keyboard instead of the hand
-     * controllers -- see intvsession_ecs_key_from_keysym's own comment on
-     * why the two can't both claim it at once. */
-    if (intvsession_get_int(_session, "keyboard_mode", 0)) {
-        intvsession_ecs_key key = intvsession_ecs_key_from_keysym(keysym);
-        if (key != INTVSESSION_ECS_KEY_NONE)
-            intvsession_ecs_key_set(_session, key, down);
-        return;
-    }
-
-    m = intvsession_key_from_keysym(keysym);
-    if (m.kind == INTVSESSION_MAP_KEY)
-        intvsession_pad_key(_session, m.side, m.key, down);
-    else if (m.kind == INTVSESSION_MAP_DISC)
-        intvsession_pad_disc(_session, m.side, down ? m.direction : -1);
+    IntvForwardKeyEvent(_session, event, down);
 }
 
 - (void)keyDown:(NSEvent *)event
@@ -266,23 +165,9 @@ static uint32_t special_keysym(unsigned short keyCode)
 
 - (void)flagsChanged:(NSEvent *)event
 {
-    /* NSEventTypeFlagsChanged carries no down/up of its own -- infer it
-     * from whether the bit for this specific key's side is now set, the
-     * standard AppKit idiom (matches the CoCo/ADAM ports' own
-     * flagsChanged: handling). */
-    NSEventModifierFlags f = event.modifierFlags;
     int down;
-    switch (event.keyCode) {
-    case kVK_Shift:        down = (f & NSEventModifierFlagShift) != 0; break;
-    case kVK_RightShift:   down = (f & NSEventModifierFlagShift) != 0; break;
-    case kVK_Control:      down = (f & NSEventModifierFlagControl) != 0; break;
-    case kVK_RightControl: down = (f & NSEventModifierFlagControl) != 0; break;
-    case kVK_Option:       down = (f & NSEventModifierFlagOption) != 0; break;
-    case kVK_RightOption:  down = (f & NSEventModifierFlagOption) != 0; break;
-    default:
-        return;
-    }
-    [self forwardKeyEvent:event down:down];
+    if (IntvModifierKeyState(event, &down))
+        [self forwardKeyEvent:event down:down];
 }
 
 @end

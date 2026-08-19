@@ -27,13 +27,13 @@
  * y-down coordinate systems; negating here would reintroduce the exact
  * N/S-inverted bug those three had to fix.
  *
- * FOCUS: unlike the GNOME/KDE keypad windows, this one does NOT forward
- * keyboard input -- AppKit gives each control its own first-responder
- * status on click by default, same underlying platform limitation the
- * Windows port documents, and there is no session-wide keyboard hook
- * available here the way GTK/Qt's own top-level event routing gives for
- * free; typing while this window has focus is simply inert, matching how
- * a real Mac panel would already behave if it stole focus.
+ * FOCUS: like the GNOME/KDE keypad windows, this one forwards keyboard
+ * input to the session. AppKit does give each control its own
+ * first-responder status on click, but a key event no control consumes
+ * still travels up the responder chain to the NSWindow itself -- so the
+ * window is an IntvKeyWindow (see IntvKeyForward.h), which overrides
+ * -keyDown:/-keyUp:/-flagsChanged: and forwards from there. No
+ * session-wide keyboard hook is needed after all.
  *
  * NOT BUILT OR RUN-VERIFIED -- see ../main.m's file header.
  *
@@ -42,6 +42,8 @@
  */
 
 #import "KeypadWindow.h"
+
+#import "IntvKeyForward.h"
 
 #include <math.h>
 
@@ -216,7 +218,7 @@ static const struct {
 
 @implementation KeypadWindow {
     intvsession *_session;
-    NSWindow *_window;
+    IntvKeyWindow *_window;
 }
 
 + (void)toggleForSession:(intvsession *)session
@@ -246,6 +248,10 @@ static const struct {
 {
     PadKeyButton *b = [[PadKeyButton alloc] init];
     b.title = title;
+    /* Click-only: without this the button takes first responder on
+     * click and then eats Space/Enter as "press me", so those keys
+     * would never reach the window's own key forwarding. */
+    b.refusesFirstResponder = YES;
     b.bezelStyle = NSBezelStyleRounded;
     b.session = _session;
     b.side = side;
@@ -334,7 +340,7 @@ static const struct {
     root.spacing = 16;
     root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
 
-    _window = [[NSWindow alloc]
+    _window = [[IntvKeyWindow alloc]
         initWithContentRect:NSMakeRect(0, 0, 480, 420)
                   styleMask:NSWindowStyleMaskTitled |
                             NSWindowStyleMaskClosable |
@@ -342,6 +348,9 @@ static const struct {
                     backing:NSBackingStoreBuffered
                       defer:NO];
     _window.title = @"Keypad";
+    /* Follows the "keyboard_mode" setting, unlike the ECS keyboard window
+     * -- typing here means whatever it would mean in the main window. */
+    _window.session = _session;
     _window.releasedWhenClosed = NO;
     _window.contentView = root;
     [_window setContentSize:NSMakeSize(480, 420)];

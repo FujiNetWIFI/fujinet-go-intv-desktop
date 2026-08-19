@@ -16,10 +16,10 @@
  * intv_host_ecs_key's OR-in-a-bit chording (core/jzintv/intv_host.c) does
  * the rest.
  *
- * FOCUS: like KeypadWindow, this does NOT forward keyboard input -- see
- * that file's own FOCUS note for why (no session-wide keyboard hook
- * available here the way GTK/Qt's own top-level event routing gives for
- * free).
+ * FOCUS: like KeypadWindow, this forwards keyboard input through an
+ * IntvKeyWindow -- see that file's own FOCUS note for how. Here `ecsOnly`
+ * is set, so typed keys reach the ECS matrix regardless of the
+ * "keyboard_mode" setting, exactly as the on-screen buttons above do.
  *
  * NOT BUILT OR RUN-VERIFIED -- see ../main.m's file header.
  *
@@ -28,6 +28,8 @@
  */
 
 #import "EcsKeyboardWindow.h"
+
+#import "IntvKeyForward.h"
 
 /* ---- ordinary keys ------------------------------------------------------ */
 
@@ -104,7 +106,7 @@ static const EcsKeyLabel kRowZxcv[10] = {
 
 @implementation EcsKeyboardWindow {
     intvsession *_session;
-    NSWindow *_window;
+    IntvKeyWindow *_window;
     NSTextField *_notice;
 }
 
@@ -145,6 +147,10 @@ static const EcsKeyLabel kRowZxcv[10] = {
 {
     EcsKeyButton *b = [[EcsKeyButton alloc] init];
     b.title = title;
+    /* Click-only: without this the button takes first responder on
+     * click and then eats Space/Enter as "press me", so those keys
+     * would never reach the window's own key forwarding. */
+    b.refusesFirstResponder = YES;
     b.bezelStyle = NSBezelStyleRounded;
     b.session = _session;
     b.key = key;
@@ -158,6 +164,10 @@ static const EcsKeyLabel kRowZxcv[10] = {
 {
     EcsModButton *b = [[EcsModButton alloc] init];
     b.title = title;
+    /* Click-only: without this the button takes first responder on
+     * click and then eats Space/Enter as "press me", so those keys
+     * would never reach the window's own key forwarding. */
+    b.refusesFirstResponder = YES;
     b.bezelStyle = NSBezelStyleRounded;
     [b setButtonType:NSButtonTypePushOnPushOff];
     b.session = _session;
@@ -229,7 +239,7 @@ static const EcsKeyLabel kRowZxcv[10] = {
     col.spacing = 8;
     col.edgeInsets = NSEdgeInsetsMake(12, 16, 16, 16);
 
-    _window = [[NSWindow alloc]
+    _window = [[IntvKeyWindow alloc]
         initWithContentRect:NSMakeRect(0, 0, 620, 260)
                   styleMask:NSWindowStyleMaskTitled |
                             NSWindowStyleMaskClosable |
@@ -237,6 +247,12 @@ static const EcsKeyLabel kRowZxcv[10] = {
                     backing:NSBackingStoreBuffered
                       defer:NO];
     _window.title = @"ECS Keyboard";
+    _window.session = session;
+    /* This window IS the ECS keyboard, so its keystrokes drive the ECS
+     * matrix whether or not "keyboard_mode" is on -- matching its
+     * on-screen buttons (see this file's header) and the GNOME and KDE
+     * ports' equivalents. */
+    _window.ecsOnly = YES;
     _window.releasedWhenClosed = NO;
     _window.contentView = col;
     [_window setContentSize:NSMakeSize(620, 260)];

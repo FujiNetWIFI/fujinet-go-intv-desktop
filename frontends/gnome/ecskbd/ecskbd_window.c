@@ -194,13 +194,14 @@ static GtkWidget *build_keyboard(intvsession *session)
 
 /* ---- keyboard passthrough (see file header) ----------------------------- */
 
-static gboolean forward_key(guint keyval, GdkModifierType state, int down)
+static gboolean forward_key(GtkEventControllerKey *c, guint keyval,
+                            guint keycode, GdkModifierType state, int down)
 {
     intvsession_ecs_key key;
-    (void)state;
     if (!g_session)
         return FALSE;
-    key = intvsession_ecs_key_from_keysym(intv_keysym_from_gdk(keyval));
+    key = intvsession_ecs_key_from_keysym(
+        intv_keysym_from_key_event(c, keyval, keycode, state));
     if (key != INTVSESSION_ECS_KEY_NONE)
         intvsession_ecs_key_set(g_session, key, down);
     return TRUE;
@@ -210,16 +211,16 @@ static gboolean on_key_pressed(GtkEventControllerKey *c, guint keyval,
                                guint keycode, GdkModifierType state,
                                gpointer user_data)
 {
-    (void)c; (void)keycode; (void)user_data;
-    return forward_key(keyval, state, 1);
+    (void)user_data;
+    return forward_key(c, keyval, keycode, state, 1);
 }
 
 static void on_key_released(GtkEventControllerKey *c, guint keyval,
                             guint keycode, GdkModifierType state,
                             gpointer user_data)
 {
-    (void)c; (void)keycode; (void)user_data;
-    forward_key(keyval, state, 0);
+    (void)user_data;
+    forward_key(c, keyval, keycode, state, 0);
 }
 
 /* Losing focus, or the window closing, must not leave a key stuck down in

@@ -34,6 +34,28 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.4.6" date="2026-08-19">
+      <description>
+        <p>
+          Booting a cartridge from FujiNet could stop dead partway through
+          the transfer, leaving the console on the "BOOTING / DO NOT POWER
+          OFF" screen with the progress bar frozen and the title line drawn
+          as garbage. Whether a title was affected came down to its own
+          data: roughly half the 32K Intellivision-era carts hung every
+          time, the rest loaded fine.
+        </p>
+        <p>
+          The emulator's receive buffer was sized for the FujiNet mailbox's
+          replies rather than for the much larger frames a cartridge push
+          arrives in, so a block of graphics data that happened to encode
+          badly overran it -- and once that happened the connection could
+          never recover, which is why the bar froze instead of reporting a
+          failure. The buffer is now sized for what it actually carries, and
+          a bad frame is discarded and resynchronized rather than wedging
+          the link.
+        </p>
+      </description>
+    </release>
     <release version="0.4.5" date="2026-08-19">
       <description>
         <p>

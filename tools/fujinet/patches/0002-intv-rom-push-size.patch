@@ -1,0 +1,58 @@
+Backport of the NETCMD_OPEN size header onto the pinned fujinet-firmware
+(FUJINET_COMMIT in cmake/Dependencies.cmake).
+
+MediaTypeROM::push_stream() has always known each stream's exact size -- it
+takes expected_size and uses it to detect a short transfer -- but the OPEN
+payload it sent was a single byte, the stream id, so the size never reached
+the cart. Both cart implementations therefore drew the boot progress bar by
+dividing bytes-so-far by a fixed 32768: a 13KB cart crawled to 41% and then
+jumped to 100%, while a 232KB cart hit 99% after its first 32KB and stayed
+there for the remaining 200KB.
+
+Upstream fixed this by widening the OPEN payload to five bytes -- the stream
+id followed by the total size, little-endian -- and consuming it on the
+RP2040 side (bootmap_pct() in pico/intellivision/firmware/src/bootmap.c).
+jzIntv's own receiver reads the same header (see tools/jzintv/
+jzintv-fujinet.patch). This backports just the sender half onto the pinned
+commit, which predates it, so the shipped desktop build actually sends what
+the emulator now knows how to read.
+
+Compatible in both directions by construction: a receiver that predates the
+header reads data[0] for the stream id and ignores the rest, and a receiver
+that expects it falls back to the old estimate when the payload is 1 byte.
+
+u32le_t is unchanged at the pinned commit (include/global_types.h), so this
+needs nothing else.
+
+Drop this patch when FUJINET_COMMIT next moves to a revision that already
+carries the change -- it is on fujinet-firmware master.
+
+--- a/lib/media/rs232/diskTypeROM.cpp
++++ b/lib/media/rs232/diskTypeROM.cpp
+@@ -57,12 +57,23 @@
+ {
+     uint8_t buf[DISK_SECTORBUF_SIZE];
+ 
+-    uint8_t open_payload = (uint8_t)stream_id;
++    // OPEN payload is the stream id followed by the stream's total size as
++    // 4 little-endian bytes. The receiver needs the size to draw an exact
++    // progress bar -- without it there is nothing to divide by and the bar
++    // has to guess against a fixed constant. A receiver predating this
++    // reads data[0] and ignores the rest, so it stays compatible in both
++    // directions.
++    struct { uint8_t id; u32le_t size; } open_hdr;
++    static_assert(sizeof(open_hdr) == 5, "OPEN header must not be padded");
++    open_hdr.id = (uint8_t)stream_id;
++    open_hdr.size = expected_size;
++
+     auto reply = SYSTEM_BUS.sendCommand(FUJI_DEVICEID_DBC, NETCMD_OPEN,
+-                                        std::string(1, (char)open_payload));
++                                        std::string((const char *)&open_hdr, sizeof(open_hdr)));
+     if (!reply || reply->command() != FUJICMD_ACK)
+     {
+-        Debug_printv("MediaTypeROM: failed to open DBC stream %u\n", stream_id);
++        Debug_printv("MediaTypeROM: failed to open DBC stream %u (%lu bytes)\n",
++                     stream_id, (unsigned long)expected_size);
+         return false;
+     }
+ 

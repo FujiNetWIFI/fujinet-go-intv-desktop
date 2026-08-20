@@ -53,6 +53,13 @@
           games for JLP titles are kept per title and survive between
           sessions.
         </p>
+        <p>
+          The boot progress bar now tracks the actual transfer. It had been
+          measuring against a fixed guess rather than the cartridge's real
+          size, so a small cartridge crawled part-way across and then jumped
+          to the end, while a large one filled the bar within the first few
+          seconds and sat there for the rest of the transfer.
+        </p>
       </description>
     </release>
     <release version="0.4.7" date="2026-08-19">

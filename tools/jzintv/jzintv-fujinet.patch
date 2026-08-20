@@ -1,5 +1,5 @@
 --- a/examples/fujinet/fujitest.bas	1969-12-31 18:00:00.000000000 -0600
-+++ b/examples/fujinet/fujitest.bas	2026-08-19 18:45:14.000000000 -0500
++++ b/examples/fujinet/fujitest.bas	2026-08-19 21:51:46.000000000 -0500
 @@ -0,0 +1,145 @@
 +' fujitest.bas -- end-to-end FujiNet demo.
 +'
@@ -147,7 +147,7 @@
 +    next i
 +end
 --- a/examples/fujinet/README.txt	1969-12-31 18:00:00.000000000 -0600
-+++ b/examples/fujinet/README.txt	2026-08-19 18:45:14.000000000 -0500
++++ b/examples/fujinet/README.txt	2026-08-19 21:51:46.000000000 -0500
 @@ -0,0 +1,66 @@
 +FUJINET MAILBOX TEST
 +
@@ -215,8 +215,8 @@
 +    intybasic --title "FujiNet Test" fujitest.bas fujitest.asm <path-to-intybasic-prologue-epilogue>
 +    as1600 fujitest.asm -o fujitest.bin -l fujitest.lst
 +    bin2rom fujitest
---- a/src/bincfg/legacy.c	2026-08-19 21:50:30.772338232 -0500
-+++ b/src/bincfg/legacy.c	2026-08-19 21:50:30.783232928 -0500
+--- a/src/bincfg/legacy.c	2026-08-20 07:33:06.017258696 -0500
++++ b/src/bincfg/legacy.c	2026-08-20 07:33:06.028361366 -0500
 @@ -516,9 +516,9 @@
  /* ======================================================================== */
  /*  LEGACY_READ_BINCFG -- Reads a .BIN and optional .CFG file.              */
@@ -289,8 +289,8 @@
  
      return fn;
  }
---- a/src/bincfg/legacy.h	2026-08-19 21:50:30.772278861 -0500
-+++ b/src/bincfg/legacy.h	2026-08-19 21:50:30.783172396 -0500
+--- a/src/bincfg/legacy.h	2026-08-20 07:33:06.017199486 -0500
++++ b/src/bincfg/legacy.h	2026-08-20 07:33:06.028300803 -0500
 @@ -49,6 +49,38 @@
  
  
@@ -330,8 +330,8 @@
  /*  LEGACY_BINCFG -- Try to determine if a file is BIN+CFG or ROM, and      */
  /*                   read it in if it is BIN+CFG.                           */
  /*                                                                          */
---- a/src/cfg/cfg.c	2026-08-19 21:50:30.772120670 -0500
-+++ b/src/cfg/cfg.c	2026-08-19 21:50:30.783066484 -0500
+--- a/src/cfg/cfg.c	2026-08-20 07:33:06.017036177 -0500
++++ b/src/cfg/cfg.c	2026-08-20 07:33:06.028191927 -0500
 @@ -44,6 +44,8 @@
  #include "joy/joy.h"
  #include "serializer/serializer.h"
@@ -617,8 +617,8 @@
      /*  Register the debugger.  This _must_ be done last.                   */
      /* -------------------------------------------------------------------- */
      if (cfg->debugging)
---- a/src/cfg/cfg.h	2026-08-19 21:50:30.772028259 -0500
-+++ b/src/cfg/cfg.h	2026-08-19 21:50:30.782966682 -0500
+--- a/src/cfg/cfg.h	2026-08-20 07:33:06.016944427 -0500
++++ b/src/cfg/cfg.h	2026-08-20 07:33:06.028095189 -0500
 @@ -66,6 +66,7 @@
      legacy_t    legacy;         /* Legacy BIN+CFG game program              */
      ecs_t       ecs;            /* Entertainment Computer System (ECS)      */
@@ -627,8 +627,8 @@
      t_locutus_wrap locutus;
  
      uint16_t    exec_img[4096 + 4096];
---- a/src/cfg/mapping.c	2026-08-19 21:50:30.772003471 -0500
-+++ b/src/cfg/mapping.c	2026-08-19 21:50:30.782901442 -0500
+--- a/src/cfg/mapping.c	2026-08-20 07:33:06.016920390 -0500
++++ b/src/cfg/mapping.c	2026-08-20 07:33:06.028033866 -0500
 @@ -35,6 +35,7 @@
  #include "joy/joy.h"
  #include "serializer/serializer.h"
@@ -638,7 +638,7 @@
  #include "cheat/cheat.h"
  #include "mapping.h"
 --- a/src/cfg/subMakefile	2026-08-19 21:32:24.573934568 -0500
-+++ b/src/cfg/subMakefile	2026-08-19 18:45:14.000000000 -0500
++++ b/src/cfg/subMakefile	2026-08-19 21:51:46.000000000 -0500
 @@ -10,9 +10,10 @@
  cfg/cfg.$(O): bincfg/bincfg.h misc/types.h ecs/ecs.h
  cfg/cfg.$(O): demo/demo.h joy/joy.h cp1600/emu_link.h event/event.h 
@@ -659,8 +659,8 @@
  
  cfg/usage.$(O): config.h cfg/cfg.h
  
---- a/src/cfg/usage.c	2026-08-19 21:50:30.771935768 -0500
-+++ b/src/cfg/usage.c	2026-08-19 21:50:30.782818446 -0500
+--- a/src/cfg/usage.c	2026-08-20 07:33:06.016852336 -0500
++++ b/src/cfg/usage.c	2026-08-20 07:33:06.027950899 -0500
 @@ -234,6 +234,34 @@
  "            --cheat='<cheat>'     Adds a cheat code.  Up to 8 cheats can"  "\n"
  "                                  be added.  See doc/jzintv/cheat.txt."    "\n"
@@ -696,8 +696,8 @@
  "    -l      --license             License information"                     "\n"
  " -h -?      --help                This usage info"                         "\n"
                                                                              "\n"
---- a/src/cp1600/cp1600.c	2026-08-19 21:50:30.771852390 -0500
-+++ b/src/cp1600/cp1600.c	2026-08-19 21:50:30.782733827 -0500
+--- a/src/cp1600/cp1600.c	2026-08-20 07:33:06.016758613 -0500
++++ b/src/cp1600/cp1600.c	2026-08-20 07:33:06.027865859 -0500
 @@ -495,6 +495,29 @@
  
  /*
@@ -728,8 +728,8 @@
   *  CP1600_INVALIDATE    -- Invalidates a region of cached instructions.
   * ============================================================================
   */
---- a/src/cp1600/cp1600.h	2026-08-19 21:50:30.771809755 -0500
-+++ b/src/cp1600/cp1600.h	2026-08-19 21:50:30.782689509 -0500
+--- a/src/cp1600/cp1600.h	2026-08-20 07:33:06.016715747 -0500
++++ b/src/cp1600/cp1600.h	2026-08-20 07:33:06.027821071 -0500
 @@ -216,6 +216,31 @@
  
  /*
@@ -763,7 +763,7 @@
   * ============================================================================
   */
 --- a/src/fujinet/fn_sock.c	1969-12-31 18:00:00.000000000 -0600
-+++ b/src/fujinet/fn_sock.c	2026-08-19 18:45:14.000000000 -0500
++++ b/src/fujinet/fn_sock.c	2026-08-19 21:51:46.000000000 -0500
 @@ -0,0 +1,334 @@
 +/*
 + * ============================================================================
@@ -1100,7 +1100,7 @@
 +/*  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.             */
 +/* ======================================================================== */
 --- a/src/fujinet/fn_sock.h	1969-12-31 18:00:00.000000000 -0600
-+++ b/src/fujinet/fn_sock.h	2026-08-19 18:45:14.000000000 -0500
++++ b/src/fujinet/fn_sock.h	2026-08-19 21:51:46.000000000 -0500
 @@ -0,0 +1,121 @@
 +/*
 + * ============================================================================
@@ -1224,7 +1224,7 @@
 +/*  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.             */
 +/* ======================================================================== */
 --- a/src/fujinet/fujibus.c	1969-12-31 18:00:00.000000000 -0600
-+++ b/src/fujinet/fujibus.c	2026-08-19 18:45:14.000000000 -0500
++++ b/src/fujinet/fujibus.c	2026-08-19 21:51:46.000000000 -0500
 @@ -0,0 +1,337 @@
 +// See fujibus.h. Ported line-for-line against
 +// lib/bus/rs232/FujiBusPacket.cpp in the main fujinet-firmware tree -- that
@@ -1564,7 +1564,7 @@
 +    return true;
 +}
 --- a/src/fujinet/fujibus.h	1969-12-31 18:00:00.000000000 -0600
-+++ b/src/fujinet/fujibus.h	2026-08-19 20:47:14.626516059 -0500
++++ b/src/fujinet/fujibus.h	2026-08-19 21:51:46.000000000 -0500
 @@ -0,0 +1,91 @@
 +// FujiBus/SLIP client for the RP2040 <-> ESP32-S3 (fujiversal-rs232) link.
 +//
@@ -1658,7 +1658,7 @@
 +
 +#endif /* FUJIBUS_H */
 --- a/src/fujinet/fuji_mailbox.h	1969-12-31 18:00:00.000000000 -0600
-+++ b/src/fujinet/fuji_mailbox.h	2026-08-19 18:45:14.000000000 -0500
++++ b/src/fujinet/fuji_mailbox.h	2026-08-19 21:51:46.000000000 -0500
 @@ -0,0 +1,131 @@
 +#ifndef FUJI_MAILBOX_H
 +#define FUJI_MAILBOX_H
@@ -1792,8 +1792,8 @@
 +
 +#endif /* FUJI_MAILBOX_H */
 --- a/src/fujinet/fujinet.c	1969-12-31 18:00:00.000000000 -0600
-+++ b/src/fujinet/fujinet.c	2026-08-19 21:43:01.181784832 -0500
-@@ -0,0 +1,1503 @@
++++ b/src/fujinet/fujinet.c	2026-08-20 07:15:56.806976822 -0500
+@@ -0,0 +1,1553 @@
 +/*
 + * ============================================================================
 + *  Title:    FujiNet mailbox peripheral
@@ -2151,7 +2151,8 @@
 +/*  FUJINET_DBC_STREAM_OPEN/WRITE/CLOSE -- --fujinet-bootdump=PREFIX file   */
 +/*                       plumbing. See fujinet.h's bootdump_* fields.       */
 +/* ======================================================================== */
-+LOCAL void fujinet_dbc_stream_open(fujinet_t *const fn, int stream)
++LOCAL void fujinet_dbc_stream_open(fujinet_t *const fn, int stream,
++                                    uint32_t expected)
 +{
 +    fn->bootdump_stream = stream;
 +    if (stream == 0)
@@ -2159,6 +2160,22 @@
 +        fn->bootdump_rom_bytes = 0;
 +        fn->rom_len = 0;
 +        fn->rom_truncated = 0;
++        fn->rom_expected = expected;
++
++        /*  The sender told us the exact size, so take the whole buffer in   */
++        /*  one go rather than letting fujinet_rom_buf_append() double its   */
++        /*  way there (six reallocs of a growing 232KB image for             */
++        /*  Pacmanthology).  Purely an optimization: a failure here leaves   */
++        /*  rom_cap alone and the append path grows as it always did.        */
++        if (expected && expected > fn->rom_cap)
++        {
++            uint8_t *grown = (uint8_t *)realloc(fn->rom_buf, expected);
++            if (grown)
++            {
++                fn->rom_buf = grown;
++                fn->rom_cap = expected;
++            }
++        }
 +    }
 +    else
 +    {
@@ -2181,9 +2198,10 @@
 +    }
 +}
 +
-+/* Growable append into fn->rom_buf, doubling capacity as needed -- a real
-+ * game tops out well under 128KB, so this converges in a handful of
-+ * reallocs. */
++/* Growable append into fn->rom_buf, doubling capacity as needed. Normally
++ * this never has to grow at all: fujinet_dbc_stream_open() reserves the
++ * exact size the OPEN header carried. It still matters against a sender
++ * that doesn't send one, and as the backstop if that reservation failed. */
 +LOCAL void fujinet_rom_buf_append(fujinet_t *const fn,
 +                                   const uint8_t *data, uint16_t len)
 +{
@@ -2846,13 +2864,32 @@
 +    if (req->command == NETCMD_OPEN)
 +    {
 +        int stream = (req->data_len > 0) ? req->data[0] : 0;
-+        fujinet_dbc_stream_open(fn, stream);
++
++        /* OPEN payload is the stream id followed by that stream's total
++         * size, four little-endian bytes -- see push_stream()'s open_hdr in
++         * fujinet-firmware's lib/media/rs232/diskTypeROM.cpp, and the
++         * identical decode in the RP2040's own dbc_inbound_handler(). The
++         * length guard is the compatibility hinge in the other direction:
++         * a sender predating the header sends the stream id alone, and we
++         * fall back to the fixed-size guess below, exactly as before. */
++        uint32_t total = 0;
++        if (req->data_len >= 5)
++            total = (uint32_t)req->data[1]        |
++                    ((uint32_t)req->data[2] << 8)  |
++                    ((uint32_t)req->data[3] << 16) |
++                    ((uint32_t)req->data[4] << 24);
++
++        fujinet_dbc_stream_open(fn, stream, total);
 +        fn->ram[OFS(FUJI_MB_BOOT_STATE)] = (stream == 1) ? FUJI_BOOT_OPENING
 +                                                          : FUJI_BOOT_XFER;
 +        if (stream == 0)
 +        {
 +            fn->ram[OFS(FUJI_MB_BOOT_PCT)] = 0;
 +            fn->ram[OFS(FUJI_MB_BOOT_ERR)] = 0;
++            if (fn->debug)
++                jzp_printf("FUJINET: ROM push, %u bytes%s\n",
++                           (unsigned)total,
++                           total ? "" : " (size not sent; progress estimated)");
 +        }
 +    }
 +    else if (req->command == NETCMD_WRITE)
@@ -2860,14 +2897,27 @@
 +        fujinet_dbc_stream_write(fn, req->data, req->data_len);
 +        if (fn->bootdump_stream == 0)
 +        {
-+            /* Total size isn't known in advance, so this saturates near
-+             * 100% rather than reaching it exactly until CLOSE -- same
-+             * approximation the RP2040 side uses, good enough to see the
-+             * bar move. */
++            /* Mirrors bootmap_pct() in the RP2040 firmware's bootmap.c,
++             * including its fallback denominator: without a size from the
++             * sender there is nothing to divide by, and a fixed 32KB at
++             * least makes the bar move. The clamp at 99 is deliberate on
++             * both sides -- CLOSE publishes 100, once the cart is actually
++             * mapped, so the bar never claims a boot that hasn't happened. */
++            uint32_t total = fn->rom_expected ? fn->rom_expected : 32768;
 +            uint32_t pct;
++            uint8_t  was = fn->ram[OFS(FUJI_MB_BOOT_PCT)];
 +            fn->bootdump_rom_bytes += req->data_len;
-+            pct = (fn->bootdump_rom_bytes * 100) / 32768;
++            pct = (fn->bootdump_rom_bytes * 100) / total;
 +            fn->ram[OFS(FUJI_MB_BOOT_PCT)] = (uint8_t)(pct > 99 ? 99 : pct);
++
++            /*  Only on a change, so this is ~100 lines across a whole push  */
++            /*  rather than one per 512-byte frame -- enough to see the bar  */
++            /*  advance (or notice it wedged) without burying the trace.     */
++            if (fn->debug && fn->ram[OFS(FUJI_MB_BOOT_PCT)] != was)
++                jzp_printf("FUJINET: boot %u%% (%u/%u bytes)\n",
++                           (unsigned)fn->ram[OFS(FUJI_MB_BOOT_PCT)],
++                           (unsigned)fn->bootdump_rom_bytes,
++                           (unsigned)total);
 +        }
 +    }
 +    else if (req->command == NETCMD_CLOSE)
@@ -3298,7 +3348,7 @@
 +/*  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.             */
 +/* ======================================================================== */
 --- a/src/fujinet/fujinet_config_rom.c	1969-12-31 18:00:00.000000000 -0600
-+++ b/src/fujinet/fujinet_config_rom.c	2026-08-19 18:45:14.000000000 -0500
++++ b/src/fujinet/fujinet_config_rom.c	2026-08-19 21:51:46.000000000 -0500
 @@ -0,0 +1,1256 @@
 +/*
 + * ============================================================================
@@ -4557,7 +4607,7 @@
 +    0x07, 0x05, 0x07, 0x07, 0x03, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0xEC, 0x17,
 +};
 --- a/src/fujinet/fujinet_config_rom.h	1969-12-31 18:00:00.000000000 -0600
-+++ b/src/fujinet/fujinet_config_rom.h	2026-08-19 18:45:14.000000000 -0500
++++ b/src/fujinet/fujinet_config_rom.h	2026-08-19 21:51:46.000000000 -0500
 @@ -0,0 +1,14 @@
 +/*
 + * ============================================================================
@@ -4574,8 +4624,8 @@
 +
 +#endif /* FUJINET_CONFIG_ROM_H_ */
 --- a/src/fujinet/fujinet.h	1969-12-31 18:00:00.000000000 -0600
-+++ b/src/fujinet/fujinet.h	2026-08-19 20:47:46.480336612 -0500
-@@ -0,0 +1,200 @@
++++ b/src/fujinet/fujinet.h	2026-08-20 07:14:17.171394755 -0500
+@@ -0,0 +1,207 @@
 +/*
 + * ============================================================================
 + *  Title:    FujiNet mailbox peripheral
@@ -4677,6 +4727,13 @@
 +    int             bootdump_stream;               /* -1, or 0=rom/1=cfg. */
 +    uint32_t        bootdump_rom_bytes;            /* For the progress bar.*/
 +
++    /*  Total byte count of the ROM stream, from the NETCMD_OPEN header --  */
++    /*  the denominator FUJI_MB_BOOT_PCT needs to mean anything.  0 means   */
++    /*  "not told": an OPEN whose payload is just the stream id, i.e. a     */
++    /*  fujinet-firmware predating the 5-byte header, in which case the     */
++    /*  progress bar falls back to the old fixed-32KB guess.                */
++    uint32_t        rom_expected;
++
 +    /*  Writable scratch directory (--fujinet-bootdir).  A pushed .bin +   */
 +    /*  .cfg pair is staged here so jzIntv's own BIN+CFG loader can read   */
 +    /*  it -- see fujinet_apply_rom().  Also holds jlpsave/ for pushed     */
@@ -4777,7 +4834,7 @@
 +/*  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.             */
 +/* ======================================================================== */
 --- a/src/fujinet/mkconfigrom.py	1969-12-31 18:00:00.000000000 -0600
-+++ b/src/fujinet/mkconfigrom.py	2026-08-19 18:45:14.000000000 -0500
++++ b/src/fujinet/mkconfigrom.py	2026-08-19 21:51:46.000000000 -0500
 @@ -0,0 +1,113 @@
 +#!/usr/bin/env python3
 +"""mkconfigrom.py -- pack fujinet-config/intv/config.rom into a C source
@@ -4893,7 +4950,7 @@
 +if __name__ == "__main__":
 +    sys.exit(main())
 --- a/src/fujinet/subMakefile	1969-12-31 18:00:00.000000000 -0600
-+++ b/src/fujinet/subMakefile	2026-08-19 18:45:14.000000000 -0500
++++ b/src/fujinet/subMakefile	2026-08-19 21:51:46.000000000 -0500
 @@ -0,0 +1,31 @@
 +##############################################################################
 +## subMakefile for FujiNet mailbox peripheral
@@ -4926,8 +4983,8 @@
 +fujinet-config-rom:
 +	python3 fujinet/mkconfigrom.py $(FUJINET_CONFIG_ROM) \
 +	    fujinet/fujinet_config_rom.c fujinet/fujinet_config_rom.h
---- a/src/icart/icart.c	2026-08-19 21:50:30.768826282 -0500
-+++ b/src/icart/icart.c	2026-08-19 21:50:30.780044232 -0500
+--- a/src/icart/icart.c	2026-08-20 07:33:06.013764973 -0500
++++ b/src/icart/icart.c	2026-08-20 07:33:06.025092335 -0500
 @@ -201,25 +201,35 @@
  }
  
@@ -5103,8 +5160,8 @@
  /*  This program is free software; you can redistribute it and/or modify    */
  /*  it under the terms of the GNU General Public License as published by    */
  /*  the Free Software Foundation; either version 2 of the License, or       */
---- a/src/icart/icart.h	2026-08-19 21:50:30.768792881 -0500
-+++ b/src/icart/icart.h	2026-08-19 21:50:30.780009539 -0500
+--- a/src/icart/icart.h	2026-08-20 07:33:06.013731121 -0500
++++ b/src/icart/icart.h	2026-08-20 07:33:06.025041948 -0500
 @@ -138,6 +138,18 @@
  );
  
@@ -5151,8 +5208,8 @@
  #endif
  /* ======================================================================== */
  /*  This program is free software; you can redistribute it and/or modify    */
---- a/src/jzintv.c	2026-08-19 21:50:30.763000962 -0500
-+++ b/src/jzintv.c	2026-08-19 21:50:30.774626995 -0500
+--- a/src/jzintv.c	2026-08-20 07:33:06.008325810 -0500
++++ b/src/jzintv.c	2026-08-20 07:33:06.019590676 -0500
 @@ -38,6 +38,7 @@
  #include "event/event.h"
  #include "ivoice/ivoice.h"
@@ -5161,8 +5218,8 @@
  #include "locutus/locutus_adapt.h"
  #include "cheat/cheat.h"
  #include "cfg/mapping.h"
---- a/src/jzintv_em.c	2026-08-19 21:50:30.762898155 -0500
-+++ b/src/jzintv_em.c	2026-08-19 21:50:30.774502485 -0500
+--- a/src/jzintv_em.c	2026-08-20 07:33:06.008220399 -0500
++++ b/src/jzintv_em.c	2026-08-20 07:33:06.019475651 -0500
 @@ -35,6 +35,7 @@
  #include "event/event.h"
  #include "ivoice/ivoice.h"
@@ -5172,7 +5229,7 @@
  #include "cheat/cheat.h"
  #include "cfg/mapping.h"
 --- a/src/Makefile.common	2026-08-19 21:32:24.574912791 -0500
-+++ b/src/Makefile.common	2026-08-19 18:45:14.000000000 -0500
++++ b/src/Makefile.common	2026-08-19 21:51:46.000000000 -0500
 @@ -57,6 +57,7 @@
   include name/subMakefile       # Name database
   include serializer/subMakefile # Serializer (save/load)
@@ -5182,7 +5239,7 @@
   include locutus/subMakefile    # Locutus / LUIGI support
   include zlib/subMakefile       # deflate compression for AVI support
 --- a/src/Makefile.emscripten_sdl1	2026-08-19 21:32:24.574933273 -0500
-+++ b/src/Makefile.emscripten_sdl1	2026-08-19 18:45:14.000000000 -0500
++++ b/src/Makefile.emscripten_sdl1	2026-08-19 21:51:46.000000000 -0500
 @@ -109,5 +109,6 @@
  jzintv_em.$(O): bincfg/legacy.h bincfg/bincfg.h pads/pads_intv2pc.h
  jzintv_em.$(O): demo/demo.h cfg/cfg.h cfg/mapping.h misc/jzprint.h avi/avi.h
@@ -5191,7 +5248,7 @@
  jzintv_em.$(O): emscripten/web_files.h
  
 --- a/src/Makefile.emscripten_sdl2	2026-08-19 21:32:24.574950909 -0500
-+++ b/src/Makefile.emscripten_sdl2	2026-08-19 18:45:14.000000000 -0500
++++ b/src/Makefile.emscripten_sdl2	2026-08-19 21:51:46.000000000 -0500
 @@ -109,5 +109,6 @@
  jzintv_em.$(O): bincfg/legacy.h bincfg/bincfg.h pads/pads_intv2pc.h
  jzintv_em.$(O): demo/demo.h cfg/cfg.h cfg/mapping.h misc/jzprint.h avi/avi.h
@@ -5199,8 +5256,8 @@
 +jzintv_em.$(O): fujinet/fujinet.h fujinet/fuji_mailbox.h fujinet/fn_sock.h
  jzintv_em.$(O): emscripten/web_files.h
  
---- a/src/periph/periph.c	2026-08-19 21:50:30.766321289 -0500
-+++ b/src/periph/periph.c	2026-08-19 21:50:30.777352664 -0500
+--- a/src/periph/periph.c	2026-08-20 07:33:06.011297736 -0500
++++ b/src/periph/periph.c	2026-08-20 07:33:06.022325471 -0500
 @@ -308,6 +308,47 @@
              addr_lo & bus->addr_mask, addr_hi & bus->addr_mask);
  }
@@ -5249,8 +5306,8 @@
  
  /*
   * ============================================================================
---- a/src/periph/periph.h	2026-08-19 21:50:30.766276050 -0500
-+++ b/src/periph/periph.h	2026-08-19 21:50:30.777302297 -0500
+--- a/src/periph/periph.h	2026-08-20 07:33:06.011252848 -0500
++++ b/src/periph/periph.h	2026-08-20 07:33:06.022279040 -0500
 @@ -159,6 +159,28 @@
  );
  
@@ -5280,8 +5337,8 @@
  /*  PERIPH_READ      -- Perform a read on a peripheral bus as a CPU.        */
  /*  PERIPH_PEEK      -- Perform a read on a peripheral bus via backdoor.    */
  /* ======================================================================== */
---- a/src/plat/plat_lib.c	2026-08-19 21:50:30.766041863 -0500
-+++ b/src/plat/plat_lib.c	2026-08-19 21:50:30.777149554 -0500
+--- a/src/plat/plat_lib.c	2026-08-20 07:33:06.011022937 -0500
++++ b/src/plat/plat_lib.c	2026-08-20 07:33:06.022124524 -0500
 @@ -18,7 +18,7 @@
  #include "plat/plat_lib_config.h"
  

@@ -356,6 +356,11 @@ add_executable(symtab_test tests/symtab_test.c)
 target_link_libraries(symtab_test jzintv_core)
 target_include_directories(symtab_test PRIVATE debugger)
 
+# Pure bus test -- no ROMs, no emulator boot, so it runs in every build
+# configuration. Guards the FujiNet hot-swap's address-decode teardown.
+add_executable(periph_test tests/periph_test.c)
+target_link_libraries(periph_test jzintv_core)
+
 add_test(NAME no_sdl_link COMMAND no_sdl_link_test)
 add_test(NAME boot_smoke COMMAND boot_smoke)
 add_test(NAME pad_test COMMAND pad_test)
@@ -371,6 +376,7 @@ add_test(NAME fujibus_smoke COMMAND fujibus_smoke)
 add_test(NAME debug COMMAND debug_test)
 add_test(NAME stic COMMAND stic_test)
 add_test(NAME symtab COMMAND symtab_test)
+add_test(NAME periph COMMAND periph_test)
 set_tests_properties(fujibus_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
                      RUN_SERIAL ON)
 set_tests_properties(debug stic PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)

@@ -33,6 +33,25 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.4.7" date="2026-08-19">
+      <description>
+        <p>
+          Larger cartridges loaded from FujiNet came up corrupted. The
+          transfer itself completed and the game started, but its graphics
+          and code were subtly wrong -- most of the 32K and 48K
+          Intellivision-era titles were affected, since nearly all of them
+          share the same memory layout.
+        </p>
+        <p>
+          When a pushed cartridge replaced the FujiNet boot menu, the boot
+          menu's own memory stayed mapped alongside the new game's rather
+          than being released, and the console ended up reading both at once.
+          Where the two overlapped, half of every value the game read was
+          quietly lost. The outgoing cartridge is now unmapped before the new
+          one takes its place.
+        </p>
+      </description>
+    </release>
     <release version="0.4.6" date="2026-08-19">
       <description>
         <p>

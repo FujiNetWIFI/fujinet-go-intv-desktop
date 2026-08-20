@@ -1592,7 +1592,7 @@
 +#endif /* FUJI_MAILBOX_H */
 --- a/src/fujinet/fujinet.c	1969-12-31 18:00:00.000000000 -0600
 +++ b/src/fujinet/fujinet.c	2026-08-15 09:49:33.571541000 -0500
-@@ -0,0 +1,1201 @@
+@@ -0,0 +1,1210 @@
 +/*
 + * ============================================================================
 + *  Title:    FujiNet mailbox peripheral
@@ -2439,6 +2439,15 @@
 +            if (boot_ok)
 +            {
 +                fn->ram[OFS(FUJI_MB_BOOT_PCT)] = 100;
++                /* Drop the outgoing cart's address decode bindings first.
++                 * periph_register() only ever adds, so without this the
++                 * config ROM's own map keeps answering next to the new
++                 * game's -- and on the Intellivision's wire-AND bus the CPU
++                 * gets the AND of the two. The config ROM declares 8-bit
++                 * RAM over $8000-$9BFF, so every pushed game with a segment
++                 * there (the 12K-at-$9000 shape most 32K/48K carts use)
++                 * came back with its high byte silently masked off. */
++                icart_unregister((icart_t *)fn->icart, fn->bus);
 +                icart_register((icart_t *)fn->icart, fn->bus,
 +                               (cp1600_t *)fn->cpu, fn->cache_flags);
 +                /* icart_register() just repointed the ROM address decoder
@@ -4532,6 +4541,41 @@
  /*  ICART_REGISTER   -- The Intellicart is unique in that it will register  */
  /*                      itself on the peripheral bus.                       */
  /* ======================================================================== */
+@@ -470,6 +508,34 @@
+ }
+ 
+ /* ======================================================================== */
++/*  ICART_UNREGISTER -- Undoes icart_register()'s address decode bindings.  */
++/*                      See icart.h for why.                                */
++/* ======================================================================== */
++void icart_unregister
++(
++    icart_t      *const ic,
++    periph_bus_t *const bus
++)
++{
++    if (!ic || !bus)
++        return;
++
++    /*  Same set icart_register() picks from, plus the base/bankswitch      */
++    /*  peripheral it always registers.                                     */
++    periph_t *const p[13] =
++    {
++        &(ic->base),
++        &(ic->r),   &(ic->w),   &(ic->rw),
++        &(ic->rn),  &(ic->wn),  &(ic->rwn),
++        &(ic->rb),  &(ic->wb),  &(ic->rwb),
++        &(ic->rnb), &(ic->wnb), &(ic->rwnb)
++    };
++
++    for (unsigned i = 0; i < sizeof(p) / sizeof(p[0]); i++)
++        periph_unregister(bus, p[i]);
++}
++
++/* ======================================================================== */
+ /*  This program is free software; you can redistribute it and/or modify    */
+ /*  it under the terms of the GNU General Public License as published by    */
+ /*  the Free Software Foundation; either version 2 of the License, or       */
 --- a/src/icart/icart.h	2026-08-10 13:59:54.946353544 -0500
 +++ b/src/icart/icart.h	2026-08-10 13:59:54.974710524 -0500
 @@ -138,6 +138,18 @@
@@ -4553,6 +4597,33 @@
  /*  ICART_REGISTER   -- The Intellicart is unique in that it will register  */
  /*                      itself on the peripheral bus.                       */
  /* ======================================================================== */
+@@ -149,6 +161,26 @@
+     uint32_t      const cache_flags
+ );
+ 
++/* ======================================================================== */
++/*  ICART_UNREGISTER -- Undoes icart_register()'s address decode bindings,  */
++/*                      every attribute flavor of them.                     */
++/*                                                                          */
++/*                      Only needed when the same icart_t gets re-          */
++/*                      registered over a different memory map, i.e. the    */
++/*                      FujiNet hot-swap in fujinet_apply_rom().  Without   */
++/*                      it the previous cart's ranges keep answering        */
++/*                      alongside the new ones, and since the Intellivision */
++/*                      bus is wire-AND, the CPU sees the AND of the two --  */
++/*                      the FujiNet config ROM's 8-bit RAM window at        */
++/*                      $8000-$9BFF quietly truncating a pushed game's      */
++/*                      16-bit ROM in the same range.                       */
++/* ======================================================================== */
++void icart_unregister
++(
++    icart_t      *const ic,
++    periph_bus_t *const bus
++);
++
+ #endif
+ /* ======================================================================== */
+ /*  This program is free software; you can redistribute it and/or modify    */
 --- a/src/jzintv.c	2026-08-10 13:59:54.944736066 -0500
 +++ b/src/jzintv.c	2026-08-10 13:59:54.949004550 -0500
 @@ -38,6 +38,7 @@
@@ -4601,6 +4672,87 @@
 +jzintv_em.$(O): fujinet/fujinet.h fujinet/fuji_mailbox.h fujinet/fn_sock.h
  jzintv_em.$(O): emscripten/web_files.h
  
+--- a/src/periph/periph.c	2026-08-10 13:59:54.943000000 -0500
++++ b/src/periph/periph.c	2026-08-19 19:45:00.000000000 -0500
+@@ -308,6 +308,47 @@
+             addr_lo & bus->addr_mask, addr_hi & bus->addr_mask);
+ }
+ 
++/*
++ * ============================================================================
++ *  PERIPH_UNREGISTER -- Drops a peripheral out of the address decode bins.
++ *                       See periph.h for why this exists at all.
++ * ============================================================================
++ */
++void periph_unregister
++(
++    periph_bus_t    *bus,       /*  Peripheral bus to remove it from.   */
++    periph_t        *periph     /*  Peripheral being unregistered.      */
++)
++{
++    if (!bus || !periph)
++        return;
++
++    const uint32_t bins = (bus->addr_mask >> bus->decode_shift) + 1;
++
++    /* ---------------------------------------------------------------------- */
++    /*  Each bin is a column terminated by the first NULL -- that's how both  */
++    /*  periph_read()/periph_write() and periph_register() itself walk it --  */
++    /*  so entries have to be squeezed together rather than just punched out, */
++    /*  or a hole would hide every device behind it.                          */
++    /* ---------------------------------------------------------------------- */
++    for (uint32_t bin = 0; bin < bins; bin++)
++    {
++        int r, w;
++
++        for (r = w = 0; r < MAX_PERIPH_BIN && bus->rd[r][bin]; r++)
++            if (bus->rd[r][bin] != periph)
++                bus->rd[w++][bin] = bus->rd[r][bin];
++        while (w < r)
++            bus->rd[w++][bin] = NULL;
++
++        for (r = w = 0; r < MAX_PERIPH_BIN && bus->wr[r][bin]; r++)
++            if (bus->wr[r][bin] != periph)
++                bus->wr[w++][bin] = bus->wr[r][bin];
++        while (w < r)
++            bus->wr[w++][bin] = NULL;
++    }
++}
++
+ 
+ /*
+  * ============================================================================
+--- a/src/periph/periph.h	2026-08-10 13:59:54.943000000 -0500
++++ b/src/periph/periph.h	2026-08-19 19:45:00.000000000 -0500
+@@ -159,6 +159,28 @@
+ );
+ 
+ /* ======================================================================== */
++/*  PERIPH_UNREGISTER -- Drops a peripheral out of the bus' address decode  */
++/*                      bins.  The device stays on the bus' linked list,    */
++/*                      so it keeps ticking and still gets serialized and   */
++/*                      destructed; it just stops answering reads/writes    */
++/*                      until the next periph_register().                   */
++/*                                                                          */
++/*                      periph_register() only ever ORs a device into the   */
++/*                      decode bins, which is all a machine built once at   */
++/*                      startup ever needs.  The FujiNet peripheral, on the */
++/*                      other hand, re-registers the very same icart_t over */
++/*                      a brand new memory map when a pushed cart hot-swaps */
++/*                      the running one (see fujinet_apply_rom()), and the  */
++/*                      ranges the old map claimed would otherwise stay     */
++/*                      bound forever.                                      */
++/* ======================================================================== */
++void periph_unregister
++(
++    periph_bus_t    *bus,       /*  Peripheral bus to remove it from.   */
++    periph_t        *periph     /*  Peripheral being unregistered.      */
++);
++
++/* ======================================================================== */
+ /*  PERIPH_READ      -- Perform a read on a peripheral bus as a CPU.        */
+ /*  PERIPH_PEEK      -- Perform a read on a peripheral bus via backdoor.    */
+ /* ======================================================================== */
 --- a/src/plat/plat_lib.c	2026-08-10 13:59:54.986733905 -0500
 +++ b/src/plat/plat_lib.c	2026-08-10 13:59:54.973728305 -0500
 @@ -18,7 +18,7 @@

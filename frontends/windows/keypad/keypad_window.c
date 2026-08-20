@@ -29,6 +29,22 @@
  * messages from the same place (see key_forward.h) and no session-wide
  * keyboard hook is needed after all.
  *
+ * MAP MODE: a bottom row (map_select_target and friends, near the end of
+ * this file) lets a click on any of the 15 digit/action buttons above be
+ * rebound to a different keyboard key or gamepad button, through
+ * core/src/bindings.c's remappable layer -- see intvsession.h's own
+ * "remappable bindings" section for the contract. While armed,
+ * map_intercept_key_msg (checked ahead of intv_forward_key_msg in every
+ * proc below) swallows the next keystroke for the mapping instead of
+ * letting it reach the machine, and key_btn_proc's own WM_LBUTTONDOWN
+ * handling picks the map target instead of injecting a pad key. Highlight
+ * is BM_SETSTATE (the native "pressed" look, driven programmatically,
+ * rather than an owner-draw custom style) on the Map button and whichever
+ * keypad button is the current target. A gamepad button press is polled
+ * for on a short WM_TIMER (IDT_GAMEPAD_POLL below) since
+ * core/src/gamepad_sdl.c's capture result lands on its own background
+ * thread, not this window's.
+ *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -38,6 +54,7 @@
 #include "key_forward.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -69,6 +86,152 @@ typedef struct {
 } disc_state;
 
 static HWND g_win;
+
+/* ---- Map mode (see this file's own header) --------------------------------
+ * File-static, like g_win above: this window is a singleton, so there is
+ * never more than one map sequence in flight. */
+typedef enum {
+    MAP_IDLE = 0,       /* normal play */
+    MAP_PICK_TARGET,    /* Map armed, waiting for a keypad button click */
+    MAP_WAIT_INPUT,     /* target picked, waiting for a key/pad press */
+} map_state_t;
+
+#define IDC_KEYPAD_MAP   2001
+#define IDC_KEYPAD_RESET 2002
+#define IDT_GAMEPAD_POLL 1
+
+static map_state_t g_map_state = MAP_IDLE;
+static intvsession_pad_side g_map_side;
+static intvsession_key g_map_key;
+static intvsession *g_map_session;
+static HWND g_map_btn;
+static HWND g_status_label;
+/* [side][key] -- only INTVSESSION_PAD_LEFT/_RIGHT are ever populated, the
+ * two panels this window builds. */
+static HWND g_key_buttons[2][INTVSESSION_KEY_COUNT];
+
+/* BM_SETSTATE forces a BUTTON control's native "pressed" rendering without
+ * changing any check state or simulating a click -- exactly the
+ * programmatic highlight this needs, with no owner-draw plumbing. */
+static void set_highlighted(HWND btn, int on)
+{
+    if (!btn)
+        return;
+    SendMessageA(btn, BM_SETSTATE, on ? TRUE : FALSE, 0);
+}
+
+static void map_set_status(const char *text)
+{
+    if (g_status_label)
+        SetWindowTextA(g_status_label, text ? text : "");
+}
+
+/* Back to MAP_IDLE from any state, undoing whatever highlight is showing
+ * and disarming gamepad capture -- shared by Map-to-abort, Reset, and the
+ * window being hidden/closed mid-sequence. */
+static void map_reset_ui(void)
+{
+    if (g_map_state == MAP_WAIT_INPUT)
+        set_highlighted(g_key_buttons[g_map_side][g_map_key], 0);
+    set_highlighted(g_map_btn, 0);
+    g_map_state = MAP_IDLE;
+    map_set_status("");
+    if (g_map_session)
+        intvsession_gamepad_capture_cancel(g_map_session);
+    if (g_win)
+        KillTimer(g_win, IDT_GAMEPAD_POLL);
+}
+
+static void map_select_target(intvsession_pad_side side, intvsession_key key)
+{
+    char desc[128], status[256];
+    intvsession_binding b = intvsession_binding_get(g_map_session, side, key);
+
+    g_map_side = side;
+    g_map_key = key;
+    g_map_state = MAP_WAIT_INPUT;
+    set_highlighted(g_key_buttons[side][key], 1);
+    intvsession_binding_describe(b, desc, sizeof(desc));
+    snprintf(status, sizeof(status),
+            "Currently mapped to %s. Press target key or gamepad button, "
+            "or press MAP to abort.",
+            desc);
+    map_set_status(status);
+    intvsession_gamepad_capture_begin(g_map_session);
+    if (g_win)
+        SetTimer(g_win, IDT_GAMEPAD_POLL, 66 /* ~15Hz */, NULL);
+}
+
+/* Completes the mapping, keyboard or gamepad half alike -- both land here
+ * once bindings.c has already made the change, just with a different verb
+ * for the status line. */
+static void map_finish(const char *bound_to, const char *stolen)
+{
+    char status[256];
+
+    if (stolen && stolen[0])
+        snprintf(status, sizeof(status), "%s %s mapped to %s (taken from %s)",
+                intvsession_pad_side_name(g_map_side),
+                intvsession_pad_key_name(g_map_key), bound_to, stolen);
+    else
+        snprintf(status, sizeof(status), "%s %s mapped to %s",
+                intvsession_pad_side_name(g_map_side),
+                intvsession_pad_key_name(g_map_key), bound_to);
+
+    set_highlighted(g_key_buttons[g_map_side][g_map_key], 0);
+    set_highlighted(g_map_btn, 0);
+    g_map_state = MAP_IDLE;
+    if (g_win)
+        KillTimer(g_win, IDT_GAMEPAD_POLL);
+    map_set_status(status);
+}
+
+static void map_complete_key(uint32_t keysym)
+{
+    char stolen[128], namebuf[64];
+
+    intvsession_binding_set_key(g_map_session, g_map_side, g_map_key, keysym,
+                                stolen, sizeof(stolen));
+    intvsession_gamepad_capture_cancel(g_map_session);
+    intvsession_keysym_name(keysym, namebuf, sizeof(namebuf));
+    map_finish(namebuf, stolen);
+}
+
+static void map_complete_button(intvsession_pad_button button)
+{
+    char stolen[128], boundto[64];
+
+    intvsession_binding_set_button(g_map_session, g_map_side, g_map_key,
+                                   button, stolen, sizeof(stolen));
+    snprintf(boundto, sizeof(boundto), "Gamepad %s",
+             intvsession_pad_button_name(button));
+    map_finish(boundto, stolen);
+}
+
+/* Consumes WM_KEYDOWN/UP/SYSKEYDOWN/UP while Map mode wants the *next*
+ * keyboard press for itself instead of letting it reach the machine -- same
+ * contract as intv_forward_key_msg (see key_forward.h), so every proc below
+ * just OR's the two checks together, this one first. */
+static int map_intercept_key_msg(UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (g_map_state == MAP_IDLE)
+        return 0;
+    switch (msg) {
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+        if (g_map_state == MAP_WAIT_INPUT) {
+            uint32_t keysym = intv_keysym_from_msg(wp, lp);
+            if (keysym)
+                map_complete_key(keysym);
+        }
+        return 1;
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+        return 1;
+    default:
+        return 0;
+    }
+}
 
 /* ---- disc window class -------------------------------------------------
  * Angles below are ordinary compass/math degrees (0 = East, growing
@@ -183,7 +346,10 @@ static LRESULT CALLBACK disc_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     disc_state *s = (disc_state *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
 
     /* Same reason as key_btn_proc: this custom control takes focus when
-     * clicked, so keystrokes land here (see key_forward.h). */
+     * clicked, so keystrokes land here (see key_forward.h and, for Map
+     * mode's own capture, this file's own header). */
+    if (map_intercept_key_msg(msg, wp, lp))
+        return 0;
     if (intv_forward_key_msg(msg, wp, lp))
         return 0;
 
@@ -231,6 +397,13 @@ static LRESULT CALLBACK disc_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 static WNDPROC g_btn_proc;
 
+/* WM_LBUTTONDOWN/UP are intercepted for Map mode too (see this file's own
+ * header): PICK_TARGET turns a press into "select this button as the map
+ * target" instead of an injection (and returns without reaching the
+ * default BUTTON proc at all, so it never shows the normal pressed-look --
+ * only map_select_target's own set_highlighted should), and WAIT_INPUT
+ * swallows clicks outright -- at that point the window wants a *keyboard
+ * or gamepad* press, not another mouse click reinterpreted as one. */
 static LRESULT CALLBACK key_btn_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     key_binding *kb = (key_binding *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
@@ -239,14 +412,24 @@ static LRESULT CALLBACK key_btn_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
      * than at the main window -- forward them instead of swallowing them
      * (see key_forward.h). Claiming the message also stops the BUTTON's own
      * default handling from treating Space/Enter as "press me". */
+    if (map_intercept_key_msg(msg, wp, lp))
+        return 0;
     if (intv_forward_key_msg(msg, wp, lp))
         return 0;
 
     if (kb) {
         if (msg == WM_LBUTTONDOWN) {
+            if (g_map_state == MAP_PICK_TARGET) {
+                map_select_target(kb->side, kb->key);
+                return 0;
+            }
+            if (g_map_state == MAP_WAIT_INPUT)
+                return 0;
             SetCapture(hwnd);
             intvsession_pad_key(kb->session, kb->side, kb->key, 1);
         } else if (msg == WM_LBUTTONUP) {
+            if (g_map_state != MAP_IDLE)
+                return 0;
             ReleaseCapture();
             intvsession_pad_key(kb->session, kb->side, kb->key, 0);
         } else if (msg == WM_DESTROY) {
@@ -270,6 +453,7 @@ static HWND make_key(HWND parent, HINSTANCE inst, const char *text,
     SetWindowLongPtrA(btn, GWLP_USERDATA, (LONG_PTR)kb);
     g_btn_proc = (WNDPROC)SetWindowLongPtrA(btn, GWLP_WNDPROC,
                                             (LONG_PTR)key_btn_proc);
+    g_key_buttons[side][key] = btn;
     return btn;
 }
 
@@ -329,16 +513,70 @@ static void build_controller(HWND parent, HINSTANCE inst, intvsession *session,
     SetWindowLongPtrA(disc, GWLP_USERDATA, (LONG_PTR)s);
 }
 
+/* The Map/Reset row beneath both controller panels, which end around
+ * y=366 (see build_controller's own arithmetic: oy=8, plus 26 title + 4*36
+ * digit rows + 8 + 28 action row + 44 + DISC_SIZE(150) disc). See this
+ * file's own header for the state machine map_select_target/map_complete_*
+ * and keypad_wnd_proc's WM_COMMAND handling implement together. */
+static void build_map_row(HWND parent, HINSTANCE inst)
+{
+    g_map_btn = CreateWindowExA(0, "BUTTON", "Map",
+                                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 170,
+                                380, 80, 28, parent,
+                                (HMENU)(INT_PTR)IDC_KEYPAD_MAP, inst, NULL);
+    CreateWindowExA(0, "BUTTON", "Reset Bindings",
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 258, 380, 140, 28,
+                    parent, (HMENU)(INT_PTR)IDC_KEYPAD_RESET, inst, NULL);
+    g_status_label =
+        CreateWindowExA(0, "STATIC", "",
+                        WS_CHILD | WS_VISIBLE | SS_CENTER, 8, 416, 464, 48,
+                        parent, NULL, inst, NULL);
+}
+
 /* ---- top-level window -------------------------------------------------------- */
 
 static LRESULT CALLBACK keypad_wnd_proc(HWND hwnd, UINT msg, WPARAM wp,
                                         LPARAM lp)
 {
+    if (map_intercept_key_msg(msg, wp, lp))
+        return 0;
     if (intv_forward_key_msg(msg, wp, lp))
         return 0;
 
     switch (msg) {
+    case WM_COMMAND:
+        if (HIWORD(wp) == BN_CLICKED) {
+            int id = LOWORD(wp);
+            if (id == IDC_KEYPAD_MAP) {
+                if (g_map_state != MAP_IDLE) {
+                    map_reset_ui();
+                } else {
+                    g_map_state = MAP_PICK_TARGET;
+                    set_highlighted(g_map_btn, 1);
+                    map_set_status("Press button to map");
+                }
+            } else if (id == IDC_KEYPAD_RESET) {
+                map_reset_ui();
+                if (g_map_session) {
+                    intvsession_bindings_reset(g_map_session);
+                    map_set_status("Bindings reset to default");
+                }
+            }
+        }
+        return 0;
+    case WM_TIMER:
+        if (wp == IDT_GAMEPAD_POLL) {
+            intvsession_pad_button button;
+            if (g_map_state == MAP_WAIT_INPUT && g_map_session &&
+                intvsession_gamepad_capture_poll(g_map_session, &button))
+                map_complete_button(button);
+        }
+        return 0;
     case WM_CLOSE:
+        /* A Map sequence left armed behind a hidden window would still be
+         * capturing gamepad input on the next show -- abort it, same as
+         * clicking Map again to cancel. */
+        map_reset_ui();
         ShowWindow(hwnd, SW_HIDE);
         return 0; /* singleton: hide and reuse, matching the GNOME port */
     }
@@ -352,6 +590,7 @@ void intv_keypad_window_toggle(HWND parent, intvsession *session)
 
     if (g_win) {
         if (IsWindowVisible(g_win)) {
+            map_reset_ui(); /* see keypad_wnd_proc's WM_CLOSE comment */
             ShowWindow(g_win, SW_HIDE);
         } else {
             ShowWindow(g_win, SW_SHOW);
@@ -380,14 +619,17 @@ void intv_keypad_window_toggle(HWND parent, intvsession *session)
         registered = 1;
     }
 
+    g_map_session = session;
+
     g_win = CreateWindowExA(0, "IntvKeypadWindow", "Keypad", WS_OVERLAPPEDWINDOW,
-                            CW_USEDEFAULT, CW_USEDEFAULT, 480, 420, parent,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 480, 560, parent,
                             NULL, inst, NULL);
 
     build_controller(g_win, inst, session, INTVSESSION_PAD_LEFT, 8, 8,
                      "Left Controller");
     build_controller(g_win, inst, session, INTVSESSION_PAD_RIGHT, 240, 8,
                      "Right Controller");
+    build_map_row(g_win, inst);
 
     ShowWindow(g_win, SW_SHOW);
 }

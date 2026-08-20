@@ -24,6 +24,19 @@
  * instead of fighting that, typing still drives the machine correctly
  * whichever window the window manager currently has focused.
  *
+ * MAP MODE: a bottom row (map_select_target and friends, near the end of
+ * this file) lets a click on any of the 15 digit/action buttons above be
+ * rebound to a different keyboard key or gamepad button, through
+ * core/src/bindings.c's remappable layer -- see intvsession.h's own
+ * "remappable bindings" section for the contract. While armed, the same
+ * GtkGestureClick press/release pair that would normally inject a pad key
+ * instead picks the map target (key_pressed/key_released both check
+ * g_map_state first), and forward_key's own keyboard capture (also gated on
+ * g_map_state) intercepts the next keystroke instead of forwarding it to
+ * the machine. A gamepad button press is polled for on a short GLib timeout
+ * (g_gamepad_poll below) since core/src/gamepad_sdl.c's capture result
+ * lands on its own background thread, not this one.
+ *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -51,6 +64,178 @@ typedef struct {
 
 static GtkWindow *g_win;
 static intvsession *g_session;
+
+/* ---- Map mode (see this file's own header) -------------------------------
+ * g_key_buttons[side][key] lets map_select_target/map_complete_* find and
+ * highlight the button for whichever (side,key) is currently the map
+ * target, indexed directly by intvsession_pad_side/intvsession_key -- only
+ * INTVSESSION_PAD_LEFT/_RIGHT are ever populated here, the two panels this
+ * window builds. */
+typedef enum {
+    INTV_MAP_IDLE = 0,        /* normal play */
+    INTV_MAP_PICK_TARGET,     /* Map armed, waiting for a keypad button click */
+    INTV_MAP_WAIT_INPUT,      /* target picked, waiting for a key/pad press */
+} IntvMapState;
+
+static IntvMapState g_map_state = INTV_MAP_IDLE;
+static intvsession_pad_side g_map_side;
+static intvsession_key g_map_key;
+static GtkWidget *g_map_btn;
+static GtkWidget *g_status_label;
+static GtkWidget *g_key_buttons[2][INTVSESSION_KEY_COUNT];
+static guint g_gamepad_poll_id;
+
+/* "suggested-action" is libadwaita's own accent style class (used elsewhere
+ * for e.g. dialog default buttons) -- reused here rather than defining a
+ * custom CSS provider just for this one highlight. */
+static void set_highlighted(GtkWidget *w, gboolean on)
+{
+    if (!w)
+        return;
+    if (on)
+        gtk_widget_add_css_class(w, "suggested-action");
+    else
+        gtk_widget_remove_css_class(w, "suggested-action");
+}
+
+static void map_set_status(const char *text)
+{
+    if (g_status_label)
+        gtk_label_set_text(GTK_LABEL(g_status_label), text ? text : "");
+}
+
+static gboolean gamepad_poll_tick(gpointer user_data)
+{
+    intvsession_pad_button button;
+    (void)user_data;
+
+    if (g_map_state != INTV_MAP_WAIT_INPUT)
+        return G_SOURCE_REMOVE;
+    if (!g_session || !intvsession_gamepad_capture_poll(g_session, &button))
+        return G_SOURCE_CONTINUE;
+
+    {
+        char stolen[128], status[256];
+        intvsession_binding_set_button(g_session, g_map_side, g_map_key,
+                                       button, stolen, sizeof(stolen));
+        if (stolen[0])
+            g_snprintf(status, sizeof(status),
+                      "%s %s mapped to Gamepad %s (taken from %s)",
+                      intvsession_pad_side_name(g_map_side),
+                      intvsession_pad_key_name(g_map_key),
+                      intvsession_pad_button_name(button), stolen);
+        else
+            g_snprintf(status, sizeof(status), "%s %s mapped to Gamepad %s",
+                      intvsession_pad_side_name(g_map_side),
+                      intvsession_pad_key_name(g_map_key),
+                      intvsession_pad_button_name(button));
+        set_highlighted(g_key_buttons[g_map_side][g_map_key], FALSE);
+        set_highlighted(g_map_btn, FALSE);
+        g_map_state = INTV_MAP_IDLE;
+        map_set_status(status);
+    }
+    g_gamepad_poll_id = 0;
+    return G_SOURCE_REMOVE;
+}
+
+/* ~15Hz -- fast enough that a press feels immediate, cheap enough to leave
+ * running for as long as a Map sequence is waiting on input. */
+static void ensure_gamepad_poll(void)
+{
+    if (!g_gamepad_poll_id)
+        g_gamepad_poll_id = g_timeout_add(66, gamepad_poll_tick, NULL);
+}
+
+/* Back to INTV_MAP_IDLE from any state, undoing whatever highlight is
+ * showing and disarming gamepad capture -- shared by Map-to-abort, Reset,
+ * and the window being hidden/closed mid-sequence. */
+static void map_reset_ui(void)
+{
+    if (g_map_state == INTV_MAP_WAIT_INPUT)
+        set_highlighted(g_key_buttons[g_map_side][g_map_key], FALSE);
+    set_highlighted(g_map_btn, FALSE);
+    g_map_state = INTV_MAP_IDLE;
+    map_set_status("");
+    if (g_session)
+        intvsession_gamepad_capture_cancel(g_session);
+    if (g_gamepad_poll_id) {
+        g_source_remove(g_gamepad_poll_id);
+        g_gamepad_poll_id = 0;
+    }
+}
+
+static void map_select_target(intvsession_pad_side side, intvsession_key key)
+{
+    char desc[128], status[256];
+    intvsession_binding b = intvsession_binding_get(g_session, side, key);
+
+    g_map_side = side;
+    g_map_key = key;
+    g_map_state = INTV_MAP_WAIT_INPUT;
+    set_highlighted(g_key_buttons[side][key], TRUE);
+    intvsession_binding_describe(b, desc, sizeof(desc));
+    g_snprintf(status, sizeof(status),
+              "Currently mapped to %s. Press target key or gamepad "
+              "button, or press MAP to abort.",
+              desc);
+    map_set_status(status);
+    intvsession_gamepad_capture_begin(g_session);
+    ensure_gamepad_poll();
+}
+
+/* Called from forward_key when a keystroke arrives during
+ * INTV_MAP_WAIT_INPUT -- completes the keyboard half of the pair the table
+ * above (bindings.c) header describes. */
+static void map_complete_key(uint32_t keysym)
+{
+    char stolen[128], namebuf[64], status[256];
+
+    intvsession_binding_set_key(g_session, g_map_side, g_map_key, keysym,
+                                stolen, sizeof(stolen));
+    intvsession_keysym_name(keysym, namebuf, sizeof(namebuf));
+    if (stolen[0])
+        g_snprintf(status, sizeof(status), "%s %s mapped to %s (taken from %s)",
+                  intvsession_pad_side_name(g_map_side),
+                  intvsession_pad_key_name(g_map_key), namebuf, stolen);
+    else
+        g_snprintf(status, sizeof(status), "%s %s mapped to %s",
+                  intvsession_pad_side_name(g_map_side),
+                  intvsession_pad_key_name(g_map_key), namebuf);
+
+    set_highlighted(g_key_buttons[g_map_side][g_map_key], FALSE);
+    set_highlighted(g_map_btn, FALSE);
+    g_map_state = INTV_MAP_IDLE;
+    intvsession_gamepad_capture_cancel(g_session);
+    if (g_gamepad_poll_id) {
+        g_source_remove(g_gamepad_poll_id);
+        g_gamepad_poll_id = 0;
+    }
+    map_set_status(status);
+}
+
+static void on_map_clicked(GtkButton *btn, gpointer user_data)
+{
+    (void)btn;
+    (void)user_data;
+    if (g_map_state != INTV_MAP_IDLE) {
+        map_reset_ui();
+        return;
+    }
+    g_map_state = INTV_MAP_PICK_TARGET;
+    set_highlighted(g_map_btn, TRUE);
+    map_set_status("Press button to map");
+}
+
+static void on_reset_clicked(GtkButton *btn, gpointer user_data)
+{
+    (void)btn;
+    (void)user_data;
+    map_reset_ui();
+    if (g_session) {
+        intvsession_bindings_reset(g_session);
+        map_set_status("Bindings reset to default");
+    }
+}
 
 /* ---- disc ----------------------------------------------------------------
  * Hit testing lives in the core (intvsession_disc_from_point) so all four
@@ -214,6 +399,11 @@ typedef struct {
 
 static void key_binding_free(gpointer p) { g_free(p); }
 
+/* Both handlers check g_map_state first (see this file's own header):
+ * INTV_MAP_PICK_TARGET turns a press into "select this button as the map
+ * target" instead of an injection, and INTV_MAP_WAIT_INPUT swallows clicks
+ * outright -- at that point the window wants a *keyboard or gamepad* press,
+ * not another mouse click reinterpreted as one. */
 static void key_pressed(GtkGestureClick *g, int n_press, double x, double y,
                         gpointer user_data)
 {
@@ -222,6 +412,12 @@ static void key_pressed(GtkGestureClick *g, int n_press, double x, double y,
     (void)n_press;
     (void)x;
     (void)y;
+    if (g_map_state == INTV_MAP_PICK_TARGET) {
+        map_select_target(kb->side, kb->key);
+        return;
+    }
+    if (g_map_state == INTV_MAP_WAIT_INPUT)
+        return;
     intvsession_pad_key(kb->session, kb->side, kb->key, 1);
 }
 
@@ -233,6 +429,8 @@ static void key_released(GtkGestureClick *g, int n_press, double x, double y,
     (void)n_press;
     (void)x;
     (void)y;
+    if (g_map_state != INTV_MAP_IDLE)
+        return;
     intvsession_pad_key(kb->session, kb->side, kb->key, 0);
 }
 
@@ -255,6 +453,7 @@ static GtkWidget *make_key(const char *label, intvsession *session,
     gtk_widget_add_controller(btn, GTK_EVENT_CONTROLLER(click));
 
     gtk_widget_set_size_request(btn, 44, 40);
+    g_key_buttons[side][key] = btn;
     return btn;
 }
 
@@ -324,6 +523,20 @@ static gboolean forward_key(GtkEventControllerKey *c, guint keyval,
 
     keysym = intv_keysym_from_key_event(c, keyval, keycode, state);
 
+    /* Map mode's keyboard half: a press while waiting for input completes
+     * the mapping instead of reaching the machine at all (see this file's
+     * own header). Only the press matters -- ignore the matching release
+     * the same way a mouse click's own release is swallowed in key_pressed/
+     * _released above, so releasing the just-mapped key doesn't also get
+     * forwarded as a live keystroke. */
+    if (g_map_state == INTV_MAP_WAIT_INPUT) {
+        if (down)
+            map_complete_key(keysym);
+        return TRUE;
+    }
+    if (g_map_state == INTV_MAP_PICK_TARGET)
+        return TRUE; /* still swallow -- waiting for a button click, not this */
+
     /* Honour "ECS Keyboard" input mode here exactly as window.c's own
      * forward_key does. Without this branch, typing while THIS window holds
      * focus drove the hand controllers even with ECS keyboard mode on --
@@ -336,7 +549,9 @@ static gboolean forward_key(GtkEventControllerKey *c, guint keyval,
         return TRUE;
     }
 
-    m = intvsession_key_from_keysym(keysym);
+    /* _bound, not the pure table: a remap made here (or in any other
+     * window) has to take effect here too. */
+    m = intvsession_key_from_keysym_bound(g_session, keysym);
     if (m.kind == INTVSESSION_MAP_KEY)
         intvsession_pad_key(g_session, m.side, m.key, down);
     else if (m.kind == INTVSESSION_MAP_DISC)
@@ -363,13 +578,48 @@ static void on_key_released(GtkEventControllerKey *c, guint keyval,
 static gboolean on_close_request(GtkWindow *win, gpointer user_data)
 {
     (void)user_data;
+    /* A Map sequence left armed behind a hidden window would still be
+     * capturing gamepad input on the next show -- abort it, same as
+     * clicking Map again to cancel. */
+    map_reset_ui();
     gtk_widget_set_visible(GTK_WIDGET(win), FALSE);
     return TRUE; /* don't destroy -- this is a singleton, hide and reuse */
 }
 
+/* The Map/Reset row beneath both controller panels -- see this file's own
+ * header for the state machine on_map_clicked/on_reset_clicked/
+ * map_select_target/map_complete_* implement together. */
+static GtkWidget *build_map_row(void)
+{
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+
+    g_map_btn = gtk_button_new_with_label("Map");
+    g_signal_connect(g_map_btn, "clicked", G_CALLBACK(on_map_clicked), NULL);
+    gtk_box_append(GTK_BOX(buttons), g_map_btn);
+
+    {
+        GtkWidget *reset_btn = gtk_button_new_with_label("Reset Bindings");
+        g_signal_connect(reset_btn, "clicked", G_CALLBACK(on_reset_clicked),
+                         NULL);
+        gtk_box_append(GTK_BOX(buttons), reset_btn);
+    }
+    gtk_widget_set_halign(buttons, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(row), buttons);
+
+    g_status_label = gtk_label_new("");
+    gtk_widget_add_css_class(g_status_label, "dim-label");
+    gtk_label_set_wrap(GTK_LABEL(g_status_label), TRUE);
+    gtk_label_set_justify(GTK_LABEL(g_status_label), GTK_JUSTIFY_CENTER);
+    gtk_box_append(GTK_BOX(row), g_status_label);
+
+    gtk_widget_set_halign(row, GTK_ALIGN_CENTER);
+    return row;
+}
+
 static void ensure_window(GtkWindow *parent, intvsession *session)
 {
-    GtkWidget *root, *header, *tb;
+    GtkWidget *outer, *panels, *header, *tb;
     GtkEventController *keys;
 
     if (g_win)
@@ -378,29 +628,33 @@ static void ensure_window(GtkWindow *parent, intvsession *session)
     g_session = session;
     g_win = GTK_WINDOW(adw_window_new());
     gtk_window_set_title(g_win, "Keypad");
-    gtk_window_set_default_size(g_win, 560, 360);
+    gtk_window_set_default_size(g_win, 560, 420);
     gtk_window_set_resizable(g_win, FALSE);
     gtk_window_set_transient_for(g_win, parent);
     /* Not modal: the main window keeps taking input while this is open. */
     gtk_window_set_modal(g_win, FALSE);
 
-    root = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 24);
-    gtk_widget_set_margin_start(root, 16);
-    gtk_widget_set_margin_end(root, 16);
-    gtk_widget_set_margin_top(root, 12);
-    gtk_widget_set_margin_bottom(root, 16);
-    gtk_widget_set_halign(root, GTK_ALIGN_CENTER);
-    gtk_box_append(GTK_BOX(root),
+    panels = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 24);
+    gtk_widget_set_halign(panels, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(panels),
                    build_controller(session, INTVSESSION_PAD_LEFT,
                                    "Left Controller"));
-    gtk_box_append(GTK_BOX(root),
+    gtk_box_append(GTK_BOX(panels),
                    build_controller(session, INTVSESSION_PAD_RIGHT,
                                    "Right Controller"));
+
+    outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_set_margin_start(outer, 16);
+    gtk_widget_set_margin_end(outer, 16);
+    gtk_widget_set_margin_top(outer, 12);
+    gtk_widget_set_margin_bottom(outer, 16);
+    gtk_box_append(GTK_BOX(outer), panels);
+    gtk_box_append(GTK_BOX(outer), build_map_row());
 
     header = adw_header_bar_new();
     tb = adw_toolbar_view_new();
     adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(tb), header);
-    adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(tb), root);
+    adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(tb), outer);
     adw_window_set_content(ADW_WINDOW(g_win), tb);
 
     keys = gtk_event_controller_key_new();
@@ -415,10 +669,12 @@ static void ensure_window(GtkWindow *parent, intvsession *session)
 void intv_keypad_window_toggle(GtkWindow *parent, intvsession *session)
 {
     ensure_window(parent, session);
-    if (gtk_widget_get_visible(GTK_WIDGET(g_win)))
+    if (gtk_widget_get_visible(GTK_WIDGET(g_win))) {
+        map_reset_ui(); /* see on_close_request's own comment */
         gtk_widget_set_visible(GTK_WIDGET(g_win), FALSE);
-    else
+    } else {
         gtk_window_present(g_win);
+    }
 }
 
 gboolean intv_keypad_window_is_visible(void)

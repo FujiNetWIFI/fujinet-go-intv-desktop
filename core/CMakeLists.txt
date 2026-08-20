@@ -271,6 +271,7 @@ add_library(intv_session STATIC
   src/paths.c
   src/session.c
   src/intv_keymap.c
+  src/bindings.c
   src/disc_geom.c
   src/gamepad_sdl.c
   src/audio_sdl.c
@@ -325,6 +326,14 @@ target_include_directories(session_test PRIVATE src)
 add_executable(keymap_test tests/keymap_test.c)
 target_link_libraries(keymap_test intv_session)
 
+add_executable(bindings_test tests/bindings_test.c)
+target_link_libraries(bindings_test intv_session)
+# bindings.h (src/) is private -- not part of intvsession.h's installed
+# surface -- so this test can exercise gamepad_sdl.c's own reverse-lookup
+# entry points directly, the same way gamepad_test.c reaches into
+# gamepad_sdl.h.
+target_include_directories(bindings_test PRIVATE src)
+
 add_executable(audio_test tests/audio_test.c)
 target_link_libraries(audio_test jzintv_core)
 target_include_directories(audio_test PRIVATE src)
@@ -368,6 +377,7 @@ add_test(NAME ecs_key COMMAND ecs_key_test)
 add_test(NAME hwopts COMMAND hwopts_test)
 add_test(NAME session COMMAND session_test)
 add_test(NAME keymap COMMAND keymap_test)
+add_test(NAME bindings COMMAND bindings_test)
 add_test(NAME audio COMMAND audio_test)
 add_test(NAME audio_ring COMMAND audio_ring_test)
 add_test(NAME gamepad COMMAND gamepad_test)

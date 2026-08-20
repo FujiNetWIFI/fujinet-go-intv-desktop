@@ -39,6 +39,18 @@
  * -keyDown:/-keyUp:/-flagsChanged: and forwards from there. No
  * session-wide keyboard hook is needed after all.
  *
+ * MAP MODE: a bottom row (MapSelectTarget and friends, near the end of
+ * this file) lets a click on any of the 15 digit/action buttons above be
+ * rebound to a different keyboard key or gamepad button, through
+ * core/src/bindings.c's remappable layer -- see intvsession.h's own
+ * "remappable bindings" section for the contract. While armed,
+ * PadKeyButton's own -mouseDown:/-mouseUp: (which would normally inject a
+ * pad key) instead picks the map target, and IntvKeyWindow's keyInterceptor
+ * hook (IntvKeyForward.h) intercepts the next keystroke instead of letting
+ * it reach the machine. A gamepad button press is polled for on a short
+ * NSTimer (gGamepadPollTimer below) since core/src/gamepad_sdl.c's capture
+ * result lands on its own background thread, not this one.
+ *
  * NOT BUILT OR RUN-VERIFIED -- see ../main.m's file header.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
@@ -57,6 +69,33 @@
  * -drawRect:. */
 #define DISC_WEDGE_STEPS 6
 
+/* ---- Map mode (see this file's own header) --------------------------------
+ * File-static, same reasoning as the singleton g_keypad below: there is
+ * never more than one KeypadWindow instance, so plain C globals let
+ * PadKeyButton's -mouseDown:/-mouseUp: (which have no reference back to the
+ * owning KeypadWindow) reach the shared state directly. */
+typedef NS_ENUM(NSInteger, IntvMapState) {
+    IntvMapIdle = 0,       /* normal play */
+    IntvMapPickTarget,     /* Map armed, waiting for a keypad button click */
+    IntvMapWaitInput,      /* target picked, waiting for a key/pad press */
+};
+
+static IntvMapState gMapState = IntvMapIdle;
+static intvsession_pad_side gMapSide;
+static intvsession_key gMapKey;
+static intvsession *gMapSession;
+static NSButton *gMapBtn;
+static NSTextField *gStatusLabel;
+static NSTimer *gGamepadPollTimer;
+/* [side][key] -- only INTVSESSION_PAD_LEFT/_RIGHT are ever populated, the
+ * two panels this window builds. */
+static NSButton *gKeyButtons[2][INTVSESSION_KEY_COUNT];
+
+static void MapSelectTarget(intvsession_pad_side side, intvsession_key key);
+static void MapResetUi(void);
+static void MapCompleteButton(intvsession_pad_button button);
+static void MapCompleteKey(uint32_t keysym);
+
 /* ---- digit/action buttons ---------------------------------------------- */
 
 @interface PadKeyButton : NSButton
@@ -65,15 +104,28 @@
 @property(nonatomic, assign) intvsession_key key;
 @end
 
+/* Map mode intercepts both -mouseDown:/-mouseUp: (see this file's own
+ * header): PickTarget turns a press into "select this button as the map
+ * target" instead of an injection, and WaitInput swallows clicks outright
+ * -- at that point the window wants a *keyboard or gamepad* press, not
+ * another mouse click reinterpreted as one. */
 @implementation PadKeyButton
 - (void)mouseDown:(NSEvent *)event
 {
     (void)event;
+    if (gMapState == IntvMapPickTarget) {
+        MapSelectTarget(self.side, self.key);
+        return;
+    }
+    if (gMapState == IntvMapWaitInput)
+        return;
     intvsession_pad_key(self.session, self.side, self.key, 1);
 }
 - (void)mouseUp:(NSEvent *)event
 {
     (void)event;
+    if (gMapState != IntvMapIdle)
+        return;
     intvsession_pad_key(self.session, self.side, self.key, 0);
 }
 @end
@@ -240,6 +292,117 @@ static const struct {
     {"0", INTVSESSION_KEY_0}, {"Enter", INTVSESSION_KEY_ENTER},
 };
 
+/* ---- Map mode helpers (see this file's own header) ------------------------
+ * Free functions rather than KeypadWindow methods, matching PadKeyButton's
+ * own reach into the file-static state above -- there is only ever one
+ * KeypadWindow, so a method dispatch through it would buy nothing. */
+
+/* controlAccentColor tracks the user's own accent-color preference and
+ * light/dark appearance automatically -- simplest way to get a "selected"
+ * look without hand-picking a color per appearance. */
+static void SetHighlighted(NSButton *btn, BOOL on)
+{
+    if (!btn)
+        return;
+    btn.bezelColor = on ? [NSColor controlAccentColor] : nil;
+}
+
+static void MapSetStatus(NSString *text)
+{
+    if (gStatusLabel)
+        gStatusLabel.stringValue = text ?: @"";
+}
+
+/* Back to IntvMapIdle from any state, undoing whatever highlight is showing
+ * and disarming gamepad capture -- shared by Map-to-abort, Reset, and the
+ * window being hidden mid-sequence. */
+static void MapResetUi(void)
+{
+    if (gMapState == IntvMapWaitInput)
+        SetHighlighted(gKeyButtons[gMapSide][gMapKey], NO);
+    SetHighlighted(gMapBtn, NO);
+    gMapState = IntvMapIdle;
+    MapSetStatus(@"");
+    if (gMapSession)
+        intvsession_gamepad_capture_cancel(gMapSession);
+    [gGamepadPollTimer invalidate];
+    gGamepadPollTimer = nil;
+}
+
+static void MapSelectTarget(intvsession_pad_side side, intvsession_key key)
+{
+    char desc[128];
+    intvsession_binding b = intvsession_binding_get(gMapSession, side, key);
+
+    gMapSide = side;
+    gMapKey = key;
+    gMapState = IntvMapWaitInput;
+    SetHighlighted(gKeyButtons[side][key], YES);
+    intvsession_binding_describe(b, desc, sizeof(desc));
+    MapSetStatus([NSString
+        stringWithFormat:@"Currently mapped to %s. Press target key or "
+                         @"gamepad button, or press MAP to abort.",
+                         desc]);
+    intvsession_gamepad_capture_begin(gMapSession);
+    if (!gGamepadPollTimer)
+        gGamepadPollTimer = [NSTimer
+            scheduledTimerWithTimeInterval:0.066 /* ~15Hz */
+                                    repeats:YES
+                                      block:^(NSTimer *timer) {
+                                          intvsession_pad_button button;
+                                          (void)timer;
+                                          if (gMapState != IntvMapWaitInput)
+                                              return;
+                                          if (intvsession_gamepad_capture_poll(
+                                                  gMapSession, &button))
+                                              MapCompleteButton(button);
+                                      }];
+}
+
+/* Completes the mapping, keyboard or gamepad half alike -- both land here
+ * once bindings.c has already made the change, just with a different verb
+ * for the status line. */
+static void MapFinish(NSString *boundTo, const char *stolen)
+{
+    NSString *status = [NSString
+        stringWithFormat:@"%s %s mapped to %@",
+                         intvsession_pad_side_name(gMapSide),
+                         intvsession_pad_key_name(gMapKey), boundTo];
+    if (stolen && stolen[0])
+        status = [status
+            stringByAppendingFormat:@" (taken from %s)", stolen];
+
+    SetHighlighted(gKeyButtons[gMapSide][gMapKey], NO);
+    SetHighlighted(gMapBtn, NO);
+    gMapState = IntvMapIdle;
+    [gGamepadPollTimer invalidate];
+    gGamepadPollTimer = nil;
+    MapSetStatus(status);
+}
+
+static void MapCompleteKey(uint32_t keysym)
+{
+    char stolen[128];
+    char namebuf[64];
+
+    intvsession_binding_set_key(gMapSession, gMapSide, gMapKey, keysym,
+                                stolen, sizeof(stolen));
+    intvsession_gamepad_capture_cancel(gMapSession);
+    intvsession_keysym_name(keysym, namebuf, sizeof(namebuf));
+    MapFinish([NSString stringWithUTF8String:namebuf], stolen);
+}
+
+static void MapCompleteButton(intvsession_pad_button button)
+{
+    char stolen[128];
+
+    intvsession_binding_set_button(gMapSession, gMapSide, gMapKey, button,
+                                   stolen, sizeof(stolen));
+    MapFinish([NSString stringWithFormat:@"Gamepad %s",
+                                        intvsession_pad_button_name(button)],
+             stolen);
+}
+
 @implementation KeypadWindow {
     intvsession *_session;
     IntvKeyWindow *_window;
@@ -250,6 +413,10 @@ static const struct {
     if (!g_keypad)
         g_keypad = [[KeypadWindow alloc] initWithSession:session];
     if (g_keypad->_window.visible) {
+        MapResetUi(); /* a Map sequence left armed behind a hidden window
+                       * would still be capturing gamepad input on the
+                       * next show -- abort it, same as clicking Map again
+                       * to cancel. */
         [g_keypad->_window orderOut:nil];
     } else {
         [g_keypad->_window makeKeyAndOrderFront:nil];
@@ -262,6 +429,7 @@ static const struct {
     if (!self)
         return nil;
     _session = session;
+    gMapSession = session;
     [self buildWindow];
     return self;
 }
@@ -282,7 +450,64 @@ static const struct {
     b.key = key;
     [b.widthAnchor constraintEqualToConstant:48].active = YES;
     [b.heightAnchor constraintEqualToConstant:30].active = YES;
+    gKeyButtons[side][key] = b;
     return b;
+}
+
+/* The Map/Reset row beneath both controller panels -- see this file's own
+ * header for the state machine MapSelectTarget/MapComplete* and
+ * -onMapClicked:/-onResetClicked: below implement together. */
+- (NSView *)buildMapRow
+{
+    NSButton *mapBtn = [NSButton buttonWithTitle:@"Map"
+                                          target:self
+                                          action:@selector(onMapClicked:)];
+    NSButton *resetBtn =
+        [NSButton buttonWithTitle:@"Reset Bindings"
+                            target:self
+                            action:@selector(onResetClicked:)];
+    gMapBtn = mapBtn;
+
+    NSStackView *buttonRow =
+        [NSStackView stackViewWithViews:@[ mapBtn, resetBtn ]];
+    buttonRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    buttonRow.spacing = 8;
+
+    gStatusLabel = [NSTextField labelWithString:@""];
+    gStatusLabel.alignment = NSTextAlignmentCenter;
+    gStatusLabel.lineBreakMode = NSLineBreakByWordWrapping;
+    gStatusLabel.maximumNumberOfLines = 2;
+    [gStatusLabel.widthAnchor constraintEqualToConstant:440].active = YES;
+
+    NSStackView *row =
+        [NSStackView stackViewWithViews:@[ buttonRow, gStatusLabel ]];
+    row.orientation = NSUserInterfaceLayoutOrientationVertical;
+    row.alignment = NSLayoutAttributeCenterX;
+    row.spacing = 6;
+    row.edgeInsets = NSEdgeInsetsMake(4, 8, 8, 8);
+    return row;
+}
+
+- (void)onMapClicked:(id)sender
+{
+    (void)sender;
+    if (gMapState != IntvMapIdle) {
+        MapResetUi();
+        return;
+    }
+    gMapState = IntvMapPickTarget;
+    SetHighlighted(gMapBtn, YES);
+    MapSetStatus(@"Press button to map");
+}
+
+- (void)onResetClicked:(id)sender
+{
+    (void)sender;
+    MapResetUi();
+    if (gMapSession) {
+        intvsession_bindings_reset(gMapSession);
+        MapSetStatus(@"Bindings reset to default");
+    }
 }
 
 /* Every row here is centered within the panel (via NSStackView's default
@@ -358,14 +583,20 @@ static const struct {
     NSView *right = [self buildControllerForSide:INTVSESSION_PAD_RIGHT
                                            title:@"Right Controller"];
 
-    NSStackView *root = [NSStackView stackViewWithViews:@[ left, right ]];
-    root.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    root.alignment = NSLayoutAttributeTop;
-    root.spacing = 16;
+    NSStackView *panels = [NSStackView stackViewWithViews:@[ left, right ]];
+    panels.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    panels.alignment = NSLayoutAttributeTop;
+    panels.spacing = 16;
+
+    NSStackView *root =
+        [NSStackView stackViewWithViews:@[ panels, [self buildMapRow] ]];
+    root.orientation = NSUserInterfaceLayoutOrientationVertical;
+    root.alignment = NSLayoutAttributeCenterX;
+    root.spacing = 4;
     root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
 
     _window = [[IntvKeyWindow alloc]
-        initWithContentRect:NSMakeRect(0, 0, 480, 420)
+        initWithContentRect:NSMakeRect(0, 0, 480, 480)
                   styleMask:NSWindowStyleMaskTitled |
                             NSWindowStyleMaskClosable |
                             NSWindowStyleMaskMiniaturizable
@@ -377,8 +608,30 @@ static const struct {
     _window.session = _session;
     _window.releasedWhenClosed = NO;
     _window.contentView = root;
-    [_window setContentSize:NSMakeSize(480, 420)];
+    [_window setContentSize:NSMakeSize(480, 480)];
     [_window center];
+
+    /* Map mode's keyboard half: a press while waiting for input completes
+     * the mapping instead of reaching the machine at all (see this file's
+     * own header). Only the press matters -- ignore the matching release
+     * the same way a mouse click's own release is swallowed in
+     * PadKeyButton's -mouseUp: above, so releasing the just-mapped key
+     * doesn't also get forwarded as a live keystroke. PickTarget still
+     * consumes the event (returns YES) -- waiting for a button click, not
+     * this. */
+    _window.keyInterceptor = ^BOOL(NSEvent *event, int down) {
+        if (gMapState == IntvMapWaitInput) {
+            if (down) {
+                uint32_t keysym = IntvKeysymForEvent(event);
+                if (keysym)
+                    MapCompleteKey(keysym);
+            }
+            return YES;
+        }
+        if (gMapState == IntvMapPickTarget)
+            return YES;
+        return NO;
+    };
 }
 
 @end

@@ -123,6 +123,31 @@ int main(void)
               intv_pad_for_port(bindings, 2, INTVSESSION_PAD_LEFT) == 0);
     }
 
+    /* ---- pad_button_from_sdl ----
+     * Raw values below are SDL3's own SDL_GamepadButton numbering
+     * (SDL_GAMEPAD_BUTTON_SOUTH=0, EAST=1, ... DPAD_RIGHT=14) -- written as
+     * literals rather than pulling in <SDL3/SDL.h> here, so this test (like
+     * the rest of this file) stays buildable without the SDL3 include path
+     * intv_session only exposes privately (see core/CMakeLists.txt: SDL3 is
+     * PRIVATE to intv_session, by design -- jzintv_core stays SDL-free).
+     * pad_button_from_sdl is an explicit translation table for exactly this
+     * reason: intvsession_pad_button's own numbering happens to match SDL's
+     * today, but nothing here relies on that beyond this one function. */
+    check("SDL SOUTH -> INTVSESSION_PAD_BTN_SOUTH",
+          pad_button_from_sdl(0) == INTVSESSION_PAD_BTN_SOUTH);
+    check("SDL EAST -> INTVSESSION_PAD_BTN_EAST",
+          pad_button_from_sdl(1) == INTVSESSION_PAD_BTN_EAST);
+    check("SDL WEST -> INTVSESSION_PAD_BTN_WEST",
+          pad_button_from_sdl(2) == INTVSESSION_PAD_BTN_WEST);
+    check("SDL NORTH -> INTVSESSION_PAD_BTN_NORTH",
+          pad_button_from_sdl(3) == INTVSESSION_PAD_BTN_NORTH);
+    check("SDL DPAD_UP -> INTVSESSION_PAD_BTN_DPAD_UP",
+          pad_button_from_sdl(11) == INTVSESSION_PAD_BTN_DPAD_UP);
+    check("SDL DPAD_RIGHT -> INTVSESSION_PAD_BTN_DPAD_RIGHT",
+          pad_button_from_sdl(14) == INTVSESSION_PAD_BTN_DPAD_RIGHT);
+    check("an SDL button this project doesn't name maps to NONE",
+          pad_button_from_sdl(255) == INTVSESSION_PAD_BTN_NONE);
+
     /* ---- SDL subsystem lifecycle, no hardware required ---- */
     check("gamepad subsystem starts", intv_gamepad_start() == 0);
     check("no pads on a CI machine with none attached",

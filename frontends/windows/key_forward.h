@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <stdint.h>
 #include <windows.h>
 
 /* `down` is 1 for a press, 0 for a release. Both matter: jzIntv's pad_t
@@ -32,6 +33,16 @@
  * the same thing either way. */
 void intv_forward_key(WPARAM vk, LPARAM lp, int down);
 void intv_forward_ecs_key(WPARAM vk, LPARAM lp, int down);
+
+/* Translate-only half of intv_forward_key, exported for the keypad window's
+ * own Map mode (frontends/windows/keypad/keypad_window.c): it needs the
+ * VK+lParam -> intvsession.h keysym translation to know WHICH key was
+ * pressed while capturing, without intv_forward_key's own dispatch (which
+ * would inject the keystroke into the machine, exactly what capturing is
+ * supposed to prevent). 0 for a key the emulated machine has no use for.
+ * Defined in main.c, next to the VK translation tables it wraps
+ * (special_keysym/base_char/resolve_side). */
+uint32_t intv_keysym_from_msg(WPARAM vk, LPARAM lp);
 
 /* Handle WM_KEYDOWN/WM_KEYUP/WM_SYSKEYDOWN/WM_SYSKEYUP, returning 1 if the
  * message was consumed. Anything else returns 0 and should be passed on as

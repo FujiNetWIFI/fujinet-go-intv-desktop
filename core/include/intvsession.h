@@ -194,6 +194,9 @@ typedef enum {
     INTVSESSION_ACTION_TOP,
     INTVSESSION_ACTION_LOWER_LEFT,
     INTVSESSION_ACTION_LOWER_RIGHT,
+    INTVSESSION_KEY_COUNT /* not a real key -- trailing count, for bindings.c's
+                          * per-side table and any frontend that wants to walk
+                          * every mappable button. */
 } intvsession_key;
 
 void intvsession_pad_key(intvsession *s, intvsession_pad_side side,
@@ -360,6 +363,97 @@ intvsession_key_mapping intvsession_key_from_keysym(uint32_t keysym);
  * F10/F11/F12 stay reserved for the frontends here too. Pure function;
  * unit-tested in core/tests/keymap_test.c. */
 intvsession_ecs_key intvsession_ecs_key_from_keysym(uint32_t keysym);
+
+/* ---- remappable bindings (core/src/bindings.c) -----------------------------
+ * intvsession_key_from_keysym above and the gamepad face buttons (core/src/
+ * gamepad_sdl.c) are both fixed defaults transcribed from upstream jzIntv.
+ * This layer sits above them: a per-(side,key) table, one keyboard slot and
+ * one gamepad slot each, seeded from those same defaults and overridable at
+ * runtime -- e.g. by a keypad window's "Map" mode. Shared process-wide
+ * (jzIntv's own machine is a process singleton, see core/jzintv/intv_host.h)
+ * and persisted in the settings store, so a mapping chosen in one frontend is
+ * what every other frontend sees.
+ *
+ * The disc is deliberately NOT remappable here -- it stays on its fixed
+ * keyboard/stick/D-pad bindings. */
+
+/* Mirrors SDL3's SDL_GamepadButton numbering (gamepad_sdl.c translates
+ * explicitly rather than casting) but declared here so this header, and
+ * anything persisted through it, stays SDL-free. */
+typedef enum {
+    INTVSESSION_PAD_BTN_NONE = -1,
+    INTVSESSION_PAD_BTN_SOUTH = 0, INTVSESSION_PAD_BTN_EAST,
+    INTVSESSION_PAD_BTN_WEST, INTVSESSION_PAD_BTN_NORTH,
+    INTVSESSION_PAD_BTN_BACK, INTVSESSION_PAD_BTN_GUIDE,
+    INTVSESSION_PAD_BTN_START,
+    INTVSESSION_PAD_BTN_LEFT_STICK, INTVSESSION_PAD_BTN_RIGHT_STICK,
+    INTVSESSION_PAD_BTN_LEFT_SHOULDER, INTVSESSION_PAD_BTN_RIGHT_SHOULDER,
+    INTVSESSION_PAD_BTN_DPAD_UP, INTVSESSION_PAD_BTN_DPAD_DOWN,
+    INTVSESSION_PAD_BTN_DPAD_LEFT, INTVSESSION_PAD_BTN_DPAD_RIGHT,
+    INTVSESSION_PAD_BTN_COUNT
+} intvsession_pad_button;
+
+typedef struct {
+    uint32_t               keysym; /* 0 = no keyboard binding */
+    intvsession_pad_button button; /* INTVSESSION_PAD_BTN_NONE = no gamepad
+                                    * binding */
+} intvsession_binding;
+
+intvsession_binding intvsession_binding_get(intvsession *s,
+        intvsession_pad_side side, intvsession_key key);
+
+/* Binds keysym/button to (side,key), first clearing it from wherever it was
+ * previously bound (a keysym/button drives exactly one pad key at a time).
+ * If `stolen` is non-NULL, writes a description of what it was taken from
+ * ("" if it was unbound) -- e.g. "Left disc East" or "Right 5" -- null
+ * terminated within stolensz. Persists immediately. */
+void intvsession_binding_set_key(intvsession *s, intvsession_pad_side side,
+        intvsession_key key, uint32_t keysym, char *stolen, int stolensz);
+void intvsession_binding_set_button(intvsession *s, intvsession_pad_side side,
+        intvsession_key key, intvsession_pad_button button,
+        char *stolen, int stolensz);
+
+/* Restores every binding to its upstream default and persists that. */
+void intvsession_bindings_reset(intvsession *s);
+
+/* Same contract as intvsession_key_from_keysym, but honouring the bindings
+ * table: returns the pad key currently bound to keysym (MAP_KEY), or the
+ * fixed disc mapping (MAP_DISC, never remapped), or MAP_NONE -- including
+ * when keysym's *default* pad-key target has been remapped away to a
+ * different input, unlike the pure function above which would still report
+ * it. Frontends should call this one; intvsession_key_from_keysym remains
+ * the pure default-table lookup bindings.c itself seeds from. */
+intvsession_key_mapping intvsession_key_from_keysym_bound(intvsession *s,
+                                                          uint32_t keysym);
+
+/* Human-readable names, for a Map mode's status line. keysym_name returns the
+ * string length (0 for an unnamed keysym, dst untouched); the rest are
+ * NUL-terminated statics, never NULL. */
+int         intvsession_keysym_name(uint32_t keysym, char *dst, int dstsz);
+const char *intvsession_pad_button_name(intvsession_pad_button button);
+const char *intvsession_pad_key_name(intvsession_key key);        /* "5", "Clear", "Top" */
+const char *intvsession_pad_side_name(intvsession_pad_side side); /* "Left" */
+
+/* Describes a full binding pair, e.g. "Numpad 5 / Gamepad A", "Numpad 5",
+ * "Gamepad A", or "nothing" if both slots are empty. Returns the string
+ * length. */
+int intvsession_binding_describe(intvsession_binding b, char *dst, int dstsz);
+
+/* ---- gamepad capture (for a Map mode's "press a gamepad button" step) -----
+ * SDL's gamepad events arrive on gamepad_sdl.c's own background thread, which
+ * cannot safely call into a UI toolkit -- so capture is poll-based instead of
+ * callback-based. While armed, button events are recorded here instead of
+ * being injected into the emulated machine, so a mapping press/release can't
+ * leak through to whatever pad key the button used to drive. */
+void intvsession_gamepad_capture_begin(intvsession *s);
+/* Disarms without consuming a result -- call when a Map sequence is aborted
+ * or the window closes, so a stray later press doesn't resume mid-capture. */
+void intvsession_gamepad_capture_cancel(intvsession *s);
+/* 1 and writes *button once some gamepad button has been pressed since
+ * capture began (also disarms); 0 while still waiting. Poll on a short
+ * timer. */
+int intvsession_gamepad_capture_poll(intvsession *s,
+                                     intvsession_pad_button *button);
 
 /* ---- FujiNet ---------------------------------------------------------
  * The runtime (libfujinet.{so,dylib}/fujinet.dll, built by

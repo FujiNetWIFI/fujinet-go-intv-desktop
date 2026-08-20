@@ -10,6 +10,7 @@
 
 #include <stdio.h>
 
+#include "bindings.h"
 #include "gamepad_sdl.h"
 #include "intv_audio.h"
 #include "intv_frame.h"
@@ -34,6 +35,13 @@ intvsession *intvsession_new(const intvsession_paths *paths)
         return NULL;
     }
     settings_init(s);
+    /* Reloads the remappable-bindings table from this session's own
+     * settings store -- process-global (like gamepad_sdl.c's own pad
+     * table), but every intvsession_new should still see whatever this
+     * particular config dir has persisted, matching session_test.c's own
+     * "re-open sees the persisted setting" expectation for everything else
+     * in the store. */
+    bindings_init(s);
     s->fujinet_port = INTVSESSION_BOIP_PORT;
     return s;
 }

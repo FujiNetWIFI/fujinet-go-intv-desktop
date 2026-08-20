@@ -6,10 +6,14 @@
  * separate "gamepad injection" path in intv_host, by design (see that
  * header's own comment on why direct pad injection is the one mechanism).
  *
- * Left stick -> the disc (whichever controller side the pad is bound to);
- * SOUTH/EAST/WEST face buttons -> the three action buttons (top/lower-right/
- * lower-left). No keypad digit mapping -- a physical gamepad has nowhere
- * near 12 buttons to spare for that, and the keypad window covers it.
+ * Left stick/D-pad -> the disc (whichever controller side the pad is bound
+ * to). Every named button (face, shoulders, sticks, D-pad, start/back/guide)
+ * is looked up in bindings.c's remappable table instead of being hardwired
+ * here -- SOUTH/EAST/WEST -> the three action buttons is only that table's
+ * *default*, seeded once in bindings.c and editable from a keypad window's
+ * Map mode from then on, same as the keyboard. A D-pad button remapped to a
+ * keypad key stops contributing to the disc too (see poll_sticks' own
+ * bindings_button_is_free guard) so the same press can't do both at once.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -22,6 +26,8 @@
 
 #include <SDL3/SDL.h>
 
+#include "bindings.h"
+#include "gamepad_sdl.h"
 #include "intv_host.h"
 #include "session_internal.h"
 
@@ -141,6 +147,17 @@ static int s_pad_count = 0;
 static volatile int s_running = 0;
 static volatile int s_stop_requested = 0;
 
+/* ---- Map-mode capture (intvsession_gamepad_capture_*, intvsession.h) -----
+ * While s_cap_active, every gamepad button event is swallowed here instead
+ * of reaching handle_button -- not just the one eventually captured, ALL of
+ * them, so a Map dialog waiting for a press can't have some other button on
+ * the same pad leak a keystroke into the machine underneath it. The first
+ * named DOWN latches s_cap_result and s_cap_have; capture_poll consumes it
+ * and disarms, same as capture_cancel without a result. */
+static volatile int s_cap_active = 0;
+static volatile int s_cap_have = 0;
+static int s_cap_result = -1;
+
 /* Two thresholds, not one: the stick must cross the wider ENTER radius to
  * newly count as pushed in some direction, but once pushed, small in/out
  * wobble near that boundary (an analog stick basically never sits at a
@@ -155,21 +172,42 @@ static volatile int s_stop_requested = 0;
 #define DEADZONE_ENTER 0.35f
 #define DEADZONE_EXIT  0.15f
 
+/* Looks `button` up in bindings.c's remappable table for `side` and injects
+ * whatever pad key (if any) it currently drives there -- the table's own
+ * defaults reproduce the old hardcoded SOUTH/EAST/WEST switch this replaced,
+ * but any named button on intvsession_pad_button can end up bound to any
+ * keypad digit or action button, not just those three. */
 static void handle_button(intv_pad_side side, Uint8 button, int pressed)
 {
-    switch (button)
-    {
-    case SDL_GAMEPAD_BUTTON_SOUTH:
-        intv_host_pad_key(side, INTV_PAD_ACTION_TOP, pressed);
-        break;
-    case SDL_GAMEPAD_BUTTON_EAST:
-        intv_host_pad_key(side, INTV_PAD_ACTION_LOWER_RIGHT, pressed);
-        break;
-    case SDL_GAMEPAD_BUTTON_WEST:
-        intv_host_pad_key(side, INTV_PAD_ACTION_LOWER_LEFT, pressed);
-        break;
-    default:
-        break;
+    intvsession_pad_button b = pad_button_from_sdl(button);
+    intvsession_key_mapping m;
+
+    if (b == INTVSESSION_PAD_BTN_NONE)
+        return;
+    m = bindings_key_from_button((intvsession_pad_side)side, b);
+    if (m.kind == INTVSESSION_MAP_KEY)
+        intv_host_pad_key(side, (intv_pad_key)m.key, pressed);
+}
+
+intvsession_pad_button pad_button_from_sdl(uint8_t button)
+{
+    switch (button) {
+    case SDL_GAMEPAD_BUTTON_SOUTH:          return INTVSESSION_PAD_BTN_SOUTH;
+    case SDL_GAMEPAD_BUTTON_EAST:           return INTVSESSION_PAD_BTN_EAST;
+    case SDL_GAMEPAD_BUTTON_WEST:           return INTVSESSION_PAD_BTN_WEST;
+    case SDL_GAMEPAD_BUTTON_NORTH:          return INTVSESSION_PAD_BTN_NORTH;
+    case SDL_GAMEPAD_BUTTON_BACK:           return INTVSESSION_PAD_BTN_BACK;
+    case SDL_GAMEPAD_BUTTON_GUIDE:          return INTVSESSION_PAD_BTN_GUIDE;
+    case SDL_GAMEPAD_BUTTON_START:          return INTVSESSION_PAD_BTN_START;
+    case SDL_GAMEPAD_BUTTON_LEFT_STICK:     return INTVSESSION_PAD_BTN_LEFT_STICK;
+    case SDL_GAMEPAD_BUTTON_RIGHT_STICK:    return INTVSESSION_PAD_BTN_RIGHT_STICK;
+    case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:  return INTVSESSION_PAD_BTN_LEFT_SHOULDER;
+    case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: return INTVSESSION_PAD_BTN_RIGHT_SHOULDER;
+    case SDL_GAMEPAD_BUTTON_DPAD_UP:        return INTVSESSION_PAD_BTN_DPAD_UP;
+    case SDL_GAMEPAD_BUTTON_DPAD_DOWN:      return INTVSESSION_PAD_BTN_DPAD_DOWN;
+    case SDL_GAMEPAD_BUTTON_DPAD_LEFT:      return INTVSESSION_PAD_BTN_DPAD_LEFT;
+    case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:     return INTVSESSION_PAD_BTN_DPAD_RIGHT;
+    default:                               return INTVSESSION_PAD_BTN_NONE;
     }
 }
 
@@ -232,12 +270,26 @@ static void poll_sticks(void)
         /* The D-pad wins when pressed: it is a set of plain digital
          * buttons, no wobble to reason about, and a player reaching for
          * it clearly wants precise control. Falls through to the analog
-         * stick when the D-pad is neutral. */
+         * stick when the D-pad is neutral.
+         *
+         * Each direction only counts if bindings.c doesn't have that D-pad
+         * button claimed for a keypad key on this side -- a button remapped
+         * to drive a digit stops also nudging the disc every poll, so the
+         * same physical press can't do both at once (see this file's own
+         * header). */
         int dir = intv_disc_from_dpad(
-            SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_UP),
-            SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_DOWN),
-            SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_LEFT),
-            SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_RIGHT));
+            bindings_button_is_free((intvsession_pad_side)side,
+                                    INTVSESSION_PAD_BTN_DPAD_UP) &&
+                SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_UP),
+            bindings_button_is_free((intvsession_pad_side)side,
+                                    INTVSESSION_PAD_BTN_DPAD_DOWN) &&
+                SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_DOWN),
+            bindings_button_is_free((intvsession_pad_side)side,
+                                    INTVSESSION_PAD_BTN_DPAD_LEFT) &&
+                SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_LEFT),
+            bindings_button_is_free((intvsession_pad_side)side,
+                                    INTVSESSION_PAD_BTN_DPAD_RIGHT) &&
+                SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_RIGHT));
 
         if (dir == -1)
         {
@@ -295,18 +347,36 @@ static void *thread_main(void *arg)
             case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
             case SDL_EVENT_GAMEPAD_BUTTON_UP:
             {
-                pthread_mutex_lock(&s_lock);
-                int idx = slot_for_id(ev.gbutton.which);
+                int down = ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
+                int idx;
                 int bindings[MAX_PADS];
+                int capturing;
+
+                pthread_mutex_lock(&s_lock);
+                capturing = s_cap_active;
+                if (capturing && down && !s_cap_have) {
+                    intvsession_pad_button b =
+                        pad_button_from_sdl(ev.gbutton.button);
+                    if (b != INTVSESSION_PAD_BTN_NONE) {
+                        s_cap_result = (int)b;
+                        s_cap_have = 1;
+                    }
+                }
+                idx = slot_for_id(ev.gbutton.which);
                 for (int i = 0; i < s_pad_count; i++)
                     bindings[i] = s_pads[i].bound_side;
                 pthread_mutex_unlock(&s_lock);
-                if (idx < 0)
+
+                /* Swallow every button event while capturing (see this
+                 * file's own header on why ALL of them, not just the one
+                 * eventually recorded) -- normal injection resumes only
+                 * once a Map dialog consumes the result or aborts. */
+                if (capturing || idx < 0)
                     break;
                 for (int side = 0; side < NUM_SIDES; side++)
                     if (intv_pad_for_port(bindings, s_pad_count, side) == idx)
                         handle_button((intv_pad_side)side, ev.gbutton.button,
-                                     ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN);
+                                     down);
                 break;
             }
             default:
@@ -391,4 +461,40 @@ void intvsession_gamepad_assign(intvsession *s, int idx, int side)
     if (idx >= 0 && idx < s_pad_count)
         s_pads[idx].bound_side = side;
     pthread_mutex_unlock(&s_lock);
+}
+
+void intvsession_gamepad_capture_begin(intvsession *s)
+{
+    (void)s;
+    pthread_mutex_lock(&s_lock);
+    s_cap_active = 1;
+    s_cap_have = 0;
+    s_cap_result = -1;
+    pthread_mutex_unlock(&s_lock);
+}
+
+void intvsession_gamepad_capture_cancel(intvsession *s)
+{
+    (void)s;
+    pthread_mutex_lock(&s_lock);
+    s_cap_active = 0;
+    s_cap_have = 0;
+    pthread_mutex_unlock(&s_lock);
+}
+
+int intvsession_gamepad_capture_poll(intvsession *s,
+                                     intvsession_pad_button *button)
+{
+    int got;
+    (void)s;
+    pthread_mutex_lock(&s_lock);
+    got = s_cap_have;
+    if (got) {
+        if (button)
+            *button = (intvsession_pad_button)s_cap_result;
+        s_cap_have = 0;
+        s_cap_active = 0;
+    }
+    pthread_mutex_unlock(&s_lock);
+    return got;
 }

@@ -60,4 +60,13 @@ BOOL IntvModifierKeyState(NSEvent *event, int *down);
 @interface IntvKeyWindow : NSWindow
 @property(nonatomic, assign) intvsession *session;
 @property(nonatomic, assign) BOOL ecsOnly;
+/* Optional first-refusal hook for a keystroke, e.g. the keypad window's own
+ * Map mode capturing the next key press instead of letting it reach the
+ * emulated machine (see frontends/macos/keypad/KeypadWindow.m). Called
+ * before the normal ECS/hand-controller dispatch below; returning YES
+ * consumes the event outright. `down` is 1 for a key-down (or a
+ * flagsChanged edge that just went down), 0 for a key-up. nil (the
+ * default) means no interception -- what the ECS keyboard window leaves
+ * this as. */
+@property(nonatomic, copy) BOOL (^keyInterceptor)(NSEvent *event, int down);
 @end

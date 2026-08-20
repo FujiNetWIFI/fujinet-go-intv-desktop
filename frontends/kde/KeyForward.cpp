@@ -222,7 +222,10 @@ void intvForwardKey(intvsession *session, const QKeyEvent *event, int down)
         return;
     }
 
-    intvsession_key_mapping m = intvsession_key_from_keysym(keysym);
+    /* _bound, not the pure table: a keypad window "Map" remap has to reach
+     * every keyboard-driven window, not just the one the remap happened
+     * in -- see intvsession.h's own comment on why. */
+    intvsession_key_mapping m = intvsession_key_from_keysym_bound(session, keysym);
     if (m.kind == INTVSESSION_MAP_KEY)
         intvsession_pad_key(session, m.side, m.key, down);
     else if (m.kind == INTVSESSION_MAP_DISC)

@@ -69,7 +69,11 @@ static gboolean forward_key(IntvWindow *self, GtkEventControllerKey *ctrl,
         return TRUE;
     }
 
-    intvsession_key_mapping m = intvsession_key_from_keysym(keysym);
+    /* _bound, not the pure table: a keypad window "Map" remap has to take
+     * effect here too, since typing while the main window holds focus is
+     * the common case, not the exception. */
+    intvsession_key_mapping m = intvsession_key_from_keysym_bound(self->session,
+                                                                  keysym);
     if (m.kind == INTVSESSION_MAP_KEY)
         intvsession_pad_key(self->session, m.side, m.key, down);
     else if (m.kind == INTVSESSION_MAP_DISC)

@@ -34,6 +34,27 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.4.9" date="2026-08-20">
+      <description>
+        <p>
+          The keypad window's buttons and disc were fixed in place: a
+          keyboard layout that didn't match Mattel's original 1979 numpad
+          assignment had no way to be changed, and a physical gamepad had no
+          access to the numeric keypad at all -- only the disc and three
+          action buttons.
+        </p>
+        <p>
+          A Map button in the keypad window fixes both. Click Map, click any
+          of the fifteen digit or action buttons on either controller, then
+          press whichever keyboard key or gamepad button should drive it.
+          The window shows what it's currently bound to and confirms the new
+          binding once made, saying what it took the input from if that
+          input was already in use elsewhere. Reset Bindings restores every
+          default at once. Mappings are shared across all four frontends and
+          saved between sessions.
+        </p>
+      </description>
+    </release>
     <release version="0.4.8" date="2026-08-19">
       <description>
         <p>

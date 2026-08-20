@@ -162,7 +162,10 @@ void IntvForwardKeyEvent(intvsession *session, NSEvent *event, int down)
         return;
     }
 
-    m = intvsession_key_from_keysym(keysym);
+    /* _bound, not the pure table: a keypad window "Map" remap has to reach
+     * every keyboard-driven window, not just the one the remap happened
+     * in -- see intvsession.h's own comment on why. */
+    m = intvsession_key_from_keysym_bound(session, keysym);
     if (m.kind == INTVSESSION_MAP_KEY)
         intvsession_pad_key(session, m.side, m.key, down);
     else if (m.kind == INTVSESSION_MAP_DISC)
@@ -217,6 +220,8 @@ BOOL IntvModifierKeyState(NSEvent *event, int *down)
 - (void)forward:(NSEvent *)event down:(int)down
 {
     if (!_session)
+        return;
+    if (_keyInterceptor && _keyInterceptor(event, down))
         return;
     if (_ecsOnly)
         IntvForwardEcsKeyEvent(_session, event, down);

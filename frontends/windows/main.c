@@ -257,6 +257,14 @@ static uint32_t resolve_keysym(WPARAM vk, LPARAM lp)
     return keysym ? keysym : base_char(rvk);
 }
 
+/* Exported wrapper -- see key_forward.h's own comment on why the keypad
+ * window's Map mode needs the translation half of intv_forward_key without
+ * its dispatch half. */
+uint32_t intv_keysym_from_msg(WPARAM vk, LPARAM lp)
+{
+    return resolve_keysym(vk, lp);
+}
+
 /* The translate-and-dispatch half of on_key, without any of its hotkey
  * handling -- shared with the keypad window, whose child controls take
  * focus on click and so must forward keystrokes here rather than letting
@@ -280,7 +288,10 @@ void intv_forward_key(WPARAM vk, LPARAM lp, int down)
         return;
     }
 
-    m = intvsession_key_from_keysym(keysym);
+    /* _bound, not the pure table: a keypad window "Map" remap has to reach
+     * every keyboard-driven window, not just the one the remap happened
+     * in -- see intvsession.h's own comment on why. */
+    m = intvsession_key_from_keysym_bound(g_session, keysym);
     if (m.kind == INTVSESSION_MAP_KEY)
         intvsession_pad_key(g_session, m.side, m.key, down);
     else if (m.kind == INTVSESSION_MAP_DISC)

@@ -30,6 +30,18 @@
  * this window focused the numpad, the modifiers/action buttons and
  * "keyboard_mode" were all quietly ignored.
  *
+ * MAP MODE: a bottom row (buildMapRow, onMapClicked and friends, near the
+ * end of this file) lets a click on any of the 15 digit/action buttons
+ * above be rebound to a different keyboard key or gamepad button, through
+ * core/src/bindings.c's remappable layer -- see intvsession.h's own
+ * "remappable bindings" section for the contract. While armed, the same
+ * pressed()/released() pair that would normally inject a pad key instead
+ * picks the map target, and forwardKey's own keyboard capture intercepts
+ * the next keystroke instead of forwarding it to the machine. A gamepad
+ * button press is polled for on a short QTimer (g_gamepadPollTimer below)
+ * since core/src/gamepad_sdl.c's capture result lands on its own
+ * background thread, not this one.
+ *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -47,6 +59,7 @@
 #include <QPolygonF>
 #include <QPointer>
 #include <QPushButton>
+#include <QTimer>
 #include <QVBoxLayout>
 
 #include <cmath>
@@ -174,8 +187,131 @@ private:
     bool m_held = false;
 };
 
+/* ---- Map mode (see this file's own header) --------------------------------
+ * File-static, same as g_singleton/g_topLevel below: this window is a
+ * singleton, so there is never more than one map sequence in flight, and
+ * plain statics let makeKey's per-button lambdas (which capture by value,
+ * not `this`) reach the shared state without threading a KeypadWindow*
+ * through every helper. */
+enum class MapState { Idle, PickTarget, WaitInput };
+
+MapState g_mapState = MapState::Idle;
+intvsession_pad_side g_mapSide = INTVSESSION_PAD_LEFT;
+intvsession_key g_mapKey = INTVSESSION_KEY_0;
+intvsession *g_mapSession = nullptr;
+QPushButton *g_mapBtn = nullptr;
+QLabel *g_statusLabel = nullptr;
+/* [side][key] -- only INTVSESSION_PAD_LEFT/_RIGHT are ever populated, the
+ * two panels this window builds. */
+QPushButton *g_keyButtons[2][INTVSESSION_KEY_COUNT] = {};
+QTimer *g_gamepadPollTimer = nullptr;
+
+void setHighlighted(QPushButton *btn, bool on)
+{
+    if (!btn)
+        return;
+    /* Qt has no CSS-class idiom as convenient as GTK's add_css_class for a
+     * one-off highlight, so this reaches for the palette directly --
+     * palette(highlight)/palette(highlighted-text) track whatever the
+     * user's light/dark theme already uses for a selected item, same as
+     * this button would look selected in a list view. */
+    btn->setStyleSheet(on ? QStringLiteral(
+                               "background-color: palette(highlight); "
+                               "color: palette(highlighted-text);")
+                          : QString());
+}
+
+void mapSetStatus(const QString &text)
+{
+    if (g_statusLabel)
+        g_statusLabel->setText(text);
+}
+
+/* Back to MapState::Idle from any state, undoing whatever highlight is
+ * showing and disarming gamepad capture -- shared by Map-to-abort, Reset,
+ * and the window being hidden/closed mid-sequence. */
+void mapResetUi()
+{
+    if (g_mapState == MapState::WaitInput)
+        setHighlighted(g_keyButtons[g_mapSide][g_mapKey], false);
+    setHighlighted(g_mapBtn, false);
+    g_mapState = MapState::Idle;
+    mapSetStatus(QString());
+    if (g_mapSession)
+        intvsession_gamepad_capture_cancel(g_mapSession);
+    if (g_gamepadPollTimer) {
+        g_gamepadPollTimer->stop();
+    }
+}
+
+void mapSelectTarget(intvsession_pad_side side, intvsession_key key)
+{
+    char desc[128];
+    intvsession_binding b = intvsession_binding_get(g_mapSession, side, key);
+
+    g_mapSide = side;
+    g_mapKey = key;
+    g_mapState = MapState::WaitInput;
+    setHighlighted(g_keyButtons[side][key], true);
+    intvsession_binding_describe(b, desc, sizeof(desc));
+    mapSetStatus(QStringLiteral("Currently mapped to %1. Press target key "
+                                "or gamepad button, or press MAP to abort.")
+                    .arg(QString::fromUtf8(desc)));
+    intvsession_gamepad_capture_begin(g_mapSession);
+    if (g_gamepadPollTimer)
+        g_gamepadPollTimer->start(66); /* ~15Hz, see the timer's own setup */
+}
+
+/* Completes the mapping, keyboard or gamepad half alike -- both land here
+ * once bindings.c has already made the change, just with a different verb
+ * for the status line. */
+void mapFinish(const QString &boundTo, const char *stolen)
+{
+    QString status = QStringLiteral("%1 %2 mapped to %3")
+                         .arg(intvsession_pad_side_name(g_mapSide),
+                             intvsession_pad_key_name(g_mapKey), boundTo);
+    if (stolen && stolen[0])
+        status += QStringLiteral(" (taken from %1)")
+                     .arg(QString::fromUtf8(stolen));
+
+    setHighlighted(g_keyButtons[g_mapSide][g_mapKey], false);
+    setHighlighted(g_mapBtn, false);
+    g_mapState = MapState::Idle;
+    if (g_gamepadPollTimer)
+        g_gamepadPollTimer->stop();
+    mapSetStatus(status);
+}
+
+void mapCompleteKey(quint32 keysym)
+{
+    char stolen[128];
+    char namebuf[64];
+
+    intvsession_binding_set_key(g_mapSession, g_mapSide, g_mapKey, keysym,
+                                stolen, sizeof(stolen));
+    intvsession_gamepad_capture_cancel(g_mapSession);
+    intvsession_keysym_name(keysym, namebuf, sizeof(namebuf));
+    mapFinish(QString::fromUtf8(namebuf), stolen);
+}
+
+void mapCompleteButton(intvsession_pad_button button)
+{
+    char stolen[128];
+
+    intvsession_binding_set_button(g_mapSession, g_mapSide, g_mapKey, button,
+                                   stolen, sizeof(stolen));
+    mapFinish(QStringLiteral("Gamepad %1")
+                 .arg(intvsession_pad_button_name(button)),
+             stolen);
+}
+
 /* A keypad digit/action button: real hardware holds while pressed, which
- * QAbstractButton's own pressed()/released() signals give directly. */
+ * QAbstractButton's own pressed()/released() signals give directly. Map
+ * mode intercepts both (see this file's own header): PickTarget turns a
+ * press into "select this button as the map target" instead of an
+ * injection, and WaitInput swallows clicks outright -- at that point the
+ * window wants a *keyboard or gamepad* press, not another mouse click
+ * reinterpreted as one. */
 QPushButton *makeKey(const QString &label, intvsession *session,
                     intvsession_pad_side side, intvsession_key key)
 {
@@ -183,13 +319,86 @@ QPushButton *makeKey(const QString &label, intvsession *session,
     btn->setFixedSize(48, 40);
     QObject::connect(btn, &QPushButton::pressed, btn,
                      [session, side, key] {
+                         if (g_mapState == MapState::PickTarget) {
+                             mapSelectTarget(side, key);
+                             return;
+                         }
+                         if (g_mapState == MapState::WaitInput)
+                             return;
                          intvsession_pad_key(session, side, key, 1);
                      });
     QObject::connect(btn, &QPushButton::released, btn,
                      [session, side, key] {
+                         if (g_mapState != MapState::Idle)
+                             return;
                          intvsession_pad_key(session, side, key, 0);
                      });
+    g_keyButtons[side][key] = btn;
     return btn;
+}
+
+void onMapClicked()
+{
+    if (g_mapState != MapState::Idle) {
+        mapResetUi();
+        return;
+    }
+    g_mapState = MapState::PickTarget;
+    setHighlighted(g_mapBtn, true);
+    mapSetStatus(QStringLiteral("Press button to map"));
+}
+
+void onResetClicked()
+{
+    mapResetUi();
+    if (g_mapSession) {
+        intvsession_bindings_reset(g_mapSession);
+        mapSetStatus(QStringLiteral("Bindings reset to default"));
+    }
+}
+
+/* The Map/Reset row beneath both controller panels -- see this file's own
+ * header for the state machine onMapClicked/onResetClicked/mapSelectTarget/
+ * mapComplete* implement together. Polls for a captured gamepad button on
+ * g_gamepadPollTimer since core/src/gamepad_sdl.c's own capture result
+ * lands on its background thread, not this one -- same reasoning as
+ * DisplayWidget's repaint QTimer (see this file's own header). */
+QWidget *buildMapRow(intvsession *session)
+{
+    auto *row = new QVBoxLayout;
+    auto *buttons = new QHBoxLayout;
+
+    g_mapBtn = new QPushButton(QStringLiteral("Map"));
+    QObject::connect(g_mapBtn, &QPushButton::clicked, g_mapBtn, onMapClicked);
+    buttons->addWidget(g_mapBtn);
+
+    auto *resetBtn = new QPushButton(QStringLiteral("Reset Bindings"));
+    QObject::connect(resetBtn, &QPushButton::clicked, resetBtn, onResetClicked);
+    buttons->addWidget(resetBtn);
+
+    auto *buttonsWrap = new QHBoxLayout;
+    buttonsWrap->addStretch();
+    buttonsWrap->addLayout(buttons);
+    buttonsWrap->addStretch();
+    row->addLayout(buttonsWrap);
+
+    g_statusLabel = new QLabel;
+    g_statusLabel->setAlignment(Qt::AlignHCenter);
+    g_statusLabel->setWordWrap(true);
+    row->addWidget(g_statusLabel);
+
+    g_gamepadPollTimer = new QTimer(g_mapBtn);
+    QObject::connect(g_gamepadPollTimer, &QTimer::timeout, g_mapBtn, [session] {
+        intvsession_pad_button button;
+        if (g_mapState != MapState::WaitInput)
+            return;
+        if (intvsession_gamepad_capture_poll(session, &button))
+            mapCompleteButton(button);
+    });
+
+    auto *wrap = new QWidget;
+    wrap->setLayout(row);
+    return wrap;
 }
 
 QPointer<KeypadWindow> g_singleton;
@@ -201,6 +410,7 @@ void KeypadWindow::showFor(QWidget *parent, intvsession *session)
 {
     if (g_singleton) {
         if (g_topLevel->isVisible()) {
+            mapResetUi(); /* see closeEvent's own comment */
             g_topLevel->hide();
         } else {
             g_topLevel->show();
@@ -219,12 +429,17 @@ KeypadWindow::KeypadWindow(QWidget *parent, intvsession *session)
 {
     setAttribute(Qt::WA_DeleteOnClose, false);
     setWindowTitle(QStringLiteral("Keypad"));
+    g_mapSession = session;
 
-    auto *root = new QHBoxLayout(this);
-    root->addWidget(buildController(INTVSESSION_PAD_LEFT,
-                                    QStringLiteral("Left Controller")));
-    root->addWidget(buildController(INTVSESSION_PAD_RIGHT,
-                                    QStringLiteral("Right Controller")));
+    auto *panels = new QHBoxLayout;
+    panels->addWidget(buildController(INTVSESSION_PAD_LEFT,
+                                      QStringLiteral("Left Controller")));
+    panels->addWidget(buildController(INTVSESSION_PAD_RIGHT,
+                                      QStringLiteral("Right Controller")));
+
+    auto *outer = new QVBoxLayout(this);
+    outer->addLayout(panels);
+    outer->addWidget(buildMapRow(session));
 }
 
 QWidget *KeypadWindow::buildController(intvsession_pad_side side,
@@ -282,6 +497,23 @@ QWidget *KeypadWindow::buildController(intvsession_pad_side side,
 
 void KeypadWindow::forwardKey(const QKeyEvent *event, int down)
 {
+    /* Map mode's keyboard half: a press while waiting for input completes
+     * the mapping instead of reaching the machine at all (see this file's
+     * own header). Only the press matters -- ignore the matching release
+     * the same way a mouse click's own release is swallowed in makeKey's
+     * lambdas above, so releasing the just-mapped key doesn't also get
+     * forwarded as a live keystroke. */
+    if (g_mapState == MapState::WaitInput) {
+        if (down) {
+            const quint32 keysym = intvKeysymForKeyEvent(event);
+            if (keysym != 0)
+                mapCompleteKey(keysym);
+        }
+        return;
+    }
+    if (g_mapState == MapState::PickTarget)
+        return; /* still swallow -- waiting for a button click, not this */
+
     intvForwardKey(m_session, event, down);
 }
 
@@ -301,6 +533,10 @@ void KeypadWindow::keyReleaseEvent(QKeyEvent *event)
 
 void KeypadWindow::closeEvent(QCloseEvent *event)
 {
+    /* A Map sequence left armed behind a hidden window would still be
+     * capturing gamepad input on the next show -- abort it, same as
+     * clicking Map again to cancel. */
+    mapResetUi();
     /* Singleton: hide and reuse, matching the GNOME port's own window. */
     hide();
     event->ignore();

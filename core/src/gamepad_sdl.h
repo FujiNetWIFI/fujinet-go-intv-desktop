@@ -10,6 +10,10 @@
 #ifndef INTV_GAMEPAD_SDL_H
 #define INTV_GAMEPAD_SDL_H
 
+#include <stdint.h>
+
+#include "intvsession.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -24,6 +28,16 @@ void intv_gamepad_stop(void);
 int intv_disc_from_stick(float x, float y, float deadzone);
 int intv_disc_from_dpad(int up, int down, int left, int right);
 int intv_pad_for_port(const int *bindings, int npads, int side);
+
+/* Translates one of SDL3's SDL_GamepadButton values (its underlying type is
+ * Uint8, i.e. uint8_t -- taken as a plain uint8_t here so this header stays
+ * SDL-free, same reasoning as intvsession_pad_button itself) to the public
+ * intvsession_pad_button numbering. An explicit table rather than a cast, so
+ * a future SDL header reordering can't silently desync the two (see
+ * intvsession.h's own comment on this enum). INTVSESSION_PAD_BTN_NONE for
+ * any SDL button this project doesn't name (paddles, misc, touchpad, etc.).
+ * Pure function; unit-tested in gamepad_test.c. */
+intvsession_pad_button pad_button_from_sdl(uint8_t button);
 
 #ifdef __cplusplus
 }

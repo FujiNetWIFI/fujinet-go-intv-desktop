@@ -202,7 +202,7 @@ static int push_arg(const char *s)
 int intv_host_start(const intv_host_opts *opts)
 {
     char exec_path[4096], grom_path[4096], fujinet_arg[256], e_arg[4160],
-         g_arg[4160];
+         g_arg[4160], bootdir_arg[4160];
     FILE *f;
 
     pthread_mutex_lock(&s_lock);
@@ -274,6 +274,19 @@ int intv_host_start(const intv_host_opts *opts)
     {
         free_argv();
         return -1;
+    }
+
+    /* Where jzIntv stages a FujiNet-pushed .bin + .cfg pair so its own
+     * BIN+CFG loader can read it, and where pushed JLP titles keep their
+     * saves (state_dir/jlpsave). jzIntv falls back to $TMPDIR then /tmp on
+     * its own, which is fine for a standalone run but not for us: the
+     * Android build has neither, and a JLP save belongs beside the rest of
+     * the session's state anyway, not in a directory the OS may clear. */
+    if (opts->state_dir && opts->state_dir[0])
+    {
+        snprintf(bootdir_arg, sizeof(bootdir_arg), "--fujinet-bootdir=%s",
+                 opts->state_dir);
+        if (push_arg(bootdir_arg) != 0) { free_argv(); return -1; }
     }
 
     /* ECS/Intellivoice are tri-state (INTV_HW_AUTO/OFF/ON): only emit the

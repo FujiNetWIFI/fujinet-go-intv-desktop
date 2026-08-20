@@ -147,6 +147,7 @@ int intvsession_start(intvsession *s, const intvsession_start_opts *opts)
 
     intv_host_opts host_opts = {
         .rom_dir = s->roms_dir,
+        .state_dir = s->data_dir,
         .fujinet_host = "127.0.0.1",
         .fujinet_port = s->fujinet_port,
         .ecs = hw_to_intv(opts->ecs),

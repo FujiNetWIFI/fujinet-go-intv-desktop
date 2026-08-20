@@ -33,6 +33,14 @@ typedef struct {
                               * provisioned from the embedded table first if
                               * either is missing there (see
                               * core/src/roms_embedded.h). Required. */
+    const char *state_dir;    /* Writable directory jzIntv may keep session
+                               * state in: a FujiNet-pushed .bin + .cfg pair
+                               * is staged here for its own BIN+CFG loader to
+                               * read, and a pushed JLP title's save file
+                               * lives in <state_dir>/jlpsave. NULL/"" leaves
+                               * jzIntv to its own $TMPDIR//tmp fallback,
+                               * which is fine standalone but not on Android
+                               * (no TMPDIR, no writable cwd). */
     const char *fujinet_host; /* NULL/"" -> 127.0.0.1 */
     int         fujinet_port; /* 0 -> jzIntv's own default (1985); the
                               * session always passes an explicit value (see

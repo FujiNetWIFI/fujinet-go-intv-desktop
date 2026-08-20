@@ -34,6 +34,28 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.4.8" date="2026-08-19">
+      <description>
+        <p>
+          Some cartridges refused to load from FujiNet at all, stopping on
+          the boot screen with "TRUNCATED XFER". These were the larger
+          homebrew titles -- Cloudfire, frantic 4 and Pacmanthology among
+          them -- which describe their memory layout in far more detail than
+          an original Intellivision cartridge does, use bank switching to
+          reach past the console's address space, and add the JLP expansion
+          for extra memory and save games.
+        </p>
+        <p>
+          The loader that handled cartridges arriving over FujiNet was a
+          simplified one and understood none of that. It now hands them to
+          the emulator's own cartridge loader instead -- the same one used
+          when you open a game from disk -- so a game pushed from FujiNet
+          and the same game opened locally now behave identically. Save
+          games for JLP titles are kept per title and survive between
+          sessions.
+        </p>
+      </description>
+    </release>
     <release version="0.4.7" date="2026-08-19">
       <description>
         <p>

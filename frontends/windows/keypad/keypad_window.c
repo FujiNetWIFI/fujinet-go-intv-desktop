@@ -23,27 +23,31 @@
  * FOCUS: like the GNOME/KDE keypad windows, this one forwards keyboard
  * input to the session rather than letting it fall on the floor. Win32
  * child controls (BUTTON, the custom disc class) take keyboard focus on
- * click by default, so WM_KEYDOWN/WM_KEYUP arrive at the child rather than
- * at the main window -- but each of those child procs is already
- * subclassed here for its own mouse handling, so they forward the key
- * messages from the same place (see key_forward.h) and no session-wide
- * keyboard hook is needed after all.
+ * click by default, so WM_KEYDOWN/WM_KEYUP arrive at whichever child last
+ * took focus rather than at the top-level window -- and Win32 does not
+ * bubble those messages back up to the parent on its own. Rather than
+ * subclassing every child (which a control added later could easily
+ * forget -- the Map/Reset buttons below did, until keyboard remapping
+ * turned out to be unreachable through them), intv_keypad_pretranslate is
+ * called from the frontend's own message pump (see key_forward.h and
+ * main.c) for every message whose window belongs to this one, keyed off
+ * GetAncestor(..., GA_ROOT) rather than which child currently has focus.
  *
  * MAP MODE: a bottom row (map_select_target and friends, near the end of
  * this file) lets a click on any of the 15 digit/action buttons above be
  * rebound to a different keyboard key or gamepad button, through
  * core/src/bindings.c's remappable layer -- see intvsession.h's own
  * "remappable bindings" section for the contract. While armed,
- * map_intercept_key_msg (checked ahead of intv_forward_key_msg in every
- * proc below) swallows the next keystroke for the mapping instead of
- * letting it reach the machine, and key_btn_proc's own WM_LBUTTONDOWN
- * handling picks the map target instead of injecting a pad key. Highlight
- * is BM_SETSTATE (the native "pressed" look, driven programmatically,
- * rather than an owner-draw custom style) on the Map button and whichever
- * keypad button is the current target. A gamepad button press is polled
- * for on a short WM_TIMER (IDT_GAMEPAD_POLL below) since
- * core/src/gamepad_sdl.c's capture result lands on its own background
- * thread, not this window's.
+ * map_intercept_key_msg (checked ahead of intv_forward_key_msg in
+ * intv_keypad_pretranslate below) swallows the next keystroke for the
+ * mapping instead of letting it reach the machine, and key_btn_proc's own
+ * WM_LBUTTONDOWN handling picks the map target instead of injecting a pad
+ * key. Highlight is BM_SETSTATE (the native "pressed" look, driven
+ * programmatically, rather than an owner-draw custom style) on the Map
+ * button and whichever keypad button is the current target. A gamepad
+ * button press is polled for on a short WM_TIMER (IDT_GAMEPAD_POLL below)
+ * since core/src/gamepad_sdl.c's capture result lands on its own
+ * background thread, not this window's.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -345,14 +349,6 @@ static LRESULT CALLBACK disc_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     disc_state *s = (disc_state *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
 
-    /* Same reason as key_btn_proc: this custom control takes focus when
-     * clicked, so keystrokes land here (see key_forward.h and, for Map
-     * mode's own capture, this file's own header). */
-    if (map_intercept_key_msg(msg, wp, lp))
-        return 0;
-    if (intv_forward_key_msg(msg, wp, lp))
-        return 0;
-
     switch (msg) {
     case WM_PAINT:
         if (s) disc_paint(hwnd, s);
@@ -407,15 +403,6 @@ static WNDPROC g_btn_proc;
 static LRESULT CALLBACK key_btn_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     key_binding *kb = (key_binding *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
-
-    /* A clicked BUTTON keeps the focus, so keystrokes arrive here rather
-     * than at the main window -- forward them instead of swallowing them
-     * (see key_forward.h). Claiming the message also stops the BUTTON's own
-     * default handling from treating Space/Enter as "press me". */
-    if (map_intercept_key_msg(msg, wp, lp))
-        return 0;
-    if (intv_forward_key_msg(msg, wp, lp))
-        return 0;
 
     if (kb) {
         if (msg == WM_LBUTTONDOWN) {
@@ -538,11 +525,6 @@ static void build_map_row(HWND parent, HINSTANCE inst)
 static LRESULT CALLBACK keypad_wnd_proc(HWND hwnd, UINT msg, WPARAM wp,
                                         LPARAM lp)
 {
-    if (map_intercept_key_msg(msg, wp, lp))
-        return 0;
-    if (intv_forward_key_msg(msg, wp, lp))
-        return 0;
-
     switch (msg) {
     case WM_COMMAND:
         if (HIWORD(wp) == BN_CLICKED) {
@@ -581,6 +563,15 @@ static LRESULT CALLBACK keypad_wnd_proc(HWND hwnd, UINT msg, WPARAM wp,
         return 0; /* singleton: hide and reuse, matching the GNOME port */
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+int intv_keypad_pretranslate(MSG *msg)
+{
+    if (!g_win || GetAncestor(msg->hwnd, GA_ROOT) != g_win)
+        return 0;
+    if (map_intercept_key_msg(msg->message, msg->wParam, msg->lParam))
+        return 1;
+    return intv_forward_key_msg(msg->message, msg->wParam, msg->lParam);
 }
 
 void intv_keypad_window_toggle(HWND parent, intvsession *session)

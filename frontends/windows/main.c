@@ -789,6 +789,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     while (GetMessageA(&msg, NULL, 0, 0) > 0) {
         if (intv_debugger_pretranslate(&msg))
             continue;
+        if (intv_keypad_pretranslate(&msg))
+            continue;
+        if (intv_ecskbd_pretranslate(&msg))
+            continue;
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }

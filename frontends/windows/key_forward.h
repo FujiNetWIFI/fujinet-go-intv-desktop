@@ -6,10 +6,15 @@
  *
  * The keypad and ECS keyboard windows need this because their child
  * controls -- BUTTON, and the custom disc class -- take keyboard focus on
- * click, so WM_KEYDOWN/WM_KEYUP land there rather than on the main window.
- * Each of those child procs is already subclassed for its own mouse
- * handling, so forwarding the key messages from the same place costs
- * nothing and avoids a global keyboard hook.
+ * click, so WM_KEYDOWN/WM_KEYUP land there rather than on the main window,
+ * and Win32 does not bubble those messages back up to the parent on its
+ * own. Rather than subclassing every child that could end up with focus
+ * (easy to forget -- see keypad_window.c's own FOCUS note), each window
+ * calls its own *_pretranslate (intv_keypad_pretranslate,
+ * intv_ecskbd_pretranslate) from the frontend's message pump in main.c,
+ * ahead of TranslateMessage/DispatchMessageA, keyed off which top-level
+ * window owns msg->hwnd rather than which child currently has focus. This
+ * is a filter in the app's own loop, not a system-wide keyboard hook.
  *
  * Hotkeys (F9/F10/F11/F12, Ctrl-R) are deliberately NOT handled here --
  * they stay in main.c's own on_key, since only the main window should

@@ -3,18 +3,28 @@
  * table and gamepad_sdl.c's fixed face-button table. See intvsession.h's own
  * "remappable bindings" section for the contract; this file owns the
  * process-global table backing it (one intvsession_binding -- a keyboard
- * keysym slot and a gamepad button slot -- per (side, pad key)) plus the
+ * keysym slot and a gamepad button slot -- per (side, target)) plus the
  * settings-store persistence and the human-readable name tables a Map mode
  * needs for its status line.
+ *
+ * A "target" is either one of the 15 keypad/action buttons or one of the
+ * disc's 16 clock positions, per side -- see intvsession_key_mapping and
+ * intvsession_target_key/_target_disc in intvsession.h. Internally both
+ * kinds live in the same per-side array, keypad/action buttons at slots
+ * 0..INTVSESSION_KEY_COUNT-1 and disc positions at DISC_SLOT(0..15) right
+ * after them (slot_for_target/target_for_slot below convert). Appended, not
+ * inserted: the persisted "bindings" string names a slot by number, so an
+ * older build's parser (whose range check tops out at the old
+ * INTVSESSION_KEY_COUNT) simply ignores the disc slots it doesn't know about
+ * instead of misreading them as some other keypad key.
  *
  * Two tables, not one: s_defaults is computed once per bindings_init call and
  * never mutated again, s_table is the live, user-editable copy. Diffing the
  * two is what makes persistence (only non-default entries are written) and
  * reset (copy defaults back over the live table) both trivial, and is why
- * intvsession_key_from_keysym_bound has to fall back to the pure
- * intvsession_key_from_keysym only for the disc case: every keyboard MAP_KEY
- * default is already sitting in s_table from the moment bindings_init ran,
- * so a plain table scan finds it wherever it currently lives, moved or not.
+ * resolve_keysym_locked has to fall back to the pure intvsession_key_from_
+ * keysym at all -- see that function's own comment on the disc's secondary
+ * defaults.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -27,20 +37,97 @@
 #include "bindings.h"
 
 #define NUM_SIDES 4
-#define PACKED_BUF_SIZE 4096
+#define PACKED_BUF_SIZE 8192
 
-static intvsession_binding s_defaults[NUM_SIDES][INTVSESSION_KEY_COUNT];
-static intvsession_binding s_table[NUM_SIDES][INTVSESSION_KEY_COUNT];
+/* See this file's own header: slots 0..INTVSESSION_KEY_COUNT-1 are the
+ * keypad/action buttons (index == intvsession_key), slots DISC_SLOT(0)
+ * .. DISC_SLOT(15) are the disc's 16 clock positions. */
+#define DISC_SLOT(dir) (INTVSESSION_KEY_COUNT + (dir))
+#define NUM_SLOTS (INTVSESSION_KEY_COUNT + INTVSESSION_DISC_POSITIONS)
+
+static intvsession_binding s_defaults[NUM_SIDES][NUM_SLOTS];
+static intvsession_binding s_table[NUM_SIDES][NUM_SLOTS];
 static pthread_mutex_t s_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-/* Compass names for the fixed disc, indexed by direction/2 -- direction is
- * always one of the 8 even clock positions here (0=E .. 14=SE), matching
- * intv_keymap.c's own DIR_* enum; the odd half-steps are unreachable from a
- * keyboard at all (see intvsession.h's own comment on that). */
-static const char *const disc_dir_names[8] = {
-    "East", "Northeast", "North", "Northwest",
-    "West", "Southwest", "South", "Southeast",
+/* All 16 clock positions' names, 0 = East going counter-clockwise -- the
+ * same numbering intv_host.c's disc_codes and intvsession_disc_from_point
+ * use. Unlike the 8-name table this replaced (indexed by direction/2, which
+ * mislabelled every odd half-step -- direction 1 printed as plain "East"),
+ * every position gets its own name. */
+static const char *const disc_dir_names[INTVSESSION_DISC_POSITIONS] = {
+    "East", "ENE", "Northeast", "NNE",
+    "North", "NNW", "Northwest", "WNW",
+    "West", "WSW", "Southwest", "SSW",
+    "South", "SSE", "Southeast", "ESE",
 };
+
+/* intvsession_key_from_keysym is case-insensitive by construction (letters
+ * are uppercased before its switch, see intv_keymap.c); the table below is
+ * an exact-match scan over stored keysym bytes, so it has to be fed the same
+ * canonical case or 'd' and 'D' become two different bindings that can never
+ * see each other. That was harmless while only digits/modifiers were ever
+ * stored (compute_defaults_locked used to skip every MAP_DISC result), but
+ * every one of this project's four frontends delivers a LOWERCASE keysym for
+ * an unshifted letter key (see e.g. frontends/gnome/keysym_map.h's own
+ * comment on GDK's ASCII-valued keyvals), while the ASCII default-seeding
+ * loop below happens to store UPPERCASE (it walks 'A'..'Z' before 'a'..'z').
+ * Without normalising here, an explicit remap onto a letter key would store
+ * whatever case the frontend delivered, an old default it displaced (stored
+ * uppercase) would stop byte-matching any live keystroke, and the "stolen"
+ * slot would never actually clear -- see intvsession_target_set_key's own
+ * comment on why the clear is conditional on an exact match. */
+static uint32_t norm_keysym(uint32_t k)
+{
+    return (k >= 'a' && k <= 'z') ? k - ('a' - 'A') : k;
+}
+
+/* ---- target <-> slot conversion ---------------------------------------- */
+
+static int slot_for_target(intvsession_key_mapping t)
+{
+    if (t.kind == INTVSESSION_MAP_KEY) {
+        if (t.key < 0 || t.key >= INTVSESSION_KEY_COUNT)
+            return -1;
+        return (int)t.key;
+    }
+    if (t.kind == INTVSESSION_MAP_DISC) {
+        if (t.direction < 0 || t.direction >= INTVSESSION_DISC_POSITIONS)
+            return -1;
+        return DISC_SLOT(t.direction);
+    }
+    return -1;
+}
+
+static intvsession_key_mapping target_for_slot(int side, int slot)
+{
+    intvsession_key_mapping m;
+
+    m.side = (intvsession_pad_side)side;
+    if (slot < INTVSESSION_KEY_COUNT) {
+        m.kind = INTVSESSION_MAP_KEY;
+        m.key = (intvsession_key)slot;
+        m.direction = 0;
+    } else {
+        m.kind = INTVSESSION_MAP_DISC;
+        m.key = 0;
+        m.direction = slot - INTVSESSION_KEY_COUNT;
+    }
+    return m;
+}
+
+intvsession_key_mapping intvsession_target_key(intvsession_pad_side side,
+                                                intvsession_key key)
+{
+    intvsession_key_mapping m = { INTVSESSION_MAP_KEY, side, key, 0 };
+    return m;
+}
+
+intvsession_key_mapping intvsession_target_disc(intvsession_pad_side side,
+                                                 int direction)
+{
+    intvsession_key_mapping m = { INTVSESSION_MAP_DISC, side, 0, direction };
+    return m;
+}
 
 /* ---- defaults --------------------------------------------------------- */
 
@@ -49,7 +136,16 @@ static const char *const disc_dir_names[8] = {
  * than assuming the enum's values are contiguous from
  * INTVSESSION_KEYSYM_UP: safer against that enum being reordered or
  * extended later, and it costs nothing since this list is only walked once
- * per bindings_init. */
+ * per bindings_init.
+ *
+ * Walked BEFORE the printable-ASCII sweep below (see seed_default_locked's
+ * first-wins rule): the arrow keys need first claim on the left disc's four
+ * cardinal defaults, ahead of the letters ('K'/'I'/'J'/'M') that mapping.c
+ * binds to the very same four positions as a second, keyboard-only way to
+ * reach them (see intv_keymap.c's own comment on that). Losing the
+ * first-wins race doesn't unbind a letter -- resolve_keysym_locked's own
+ * fallback keeps it working as a secondary default for as long as the
+ * segment it lands on still carries its own default. */
 static const uint32_t special_keysyms[] = {
     INTVSESSION_KEYSYM_UP, INTVSESSION_KEYSYM_DOWN,
     INTVSESSION_KEYSYM_LEFT, INTVSESSION_KEYSYM_RIGHT,
@@ -65,35 +161,43 @@ static const uint32_t special_keysyms[] = {
     INTVSESSION_KEYSYM_BACKSPACE,
 };
 
+/* Stores keysym's default target, iff it has one and that target's slot
+ * isn't already claimed -- first wins, see special_keysyms's own comment on
+ * why special_keysyms is probed first. Every keypad/action button target has
+ * exactly one default keysym in intv_keymap.c (no collisions there, so
+ * first-wins changes nothing for those 15 slots); only the disc's four
+ * cardinal positions on the left side have two -- an arrow key and a
+ * letter -- which is the case this ordering exists for. */
+static void seed_default_locked(uint32_t keysym)
+{
+    intvsession_key_mapping m = intvsession_key_from_keysym(keysym);
+    int slot = slot_for_target(m);
+
+    if (slot >= 0 && s_defaults[m.side][slot].keysym == 0)
+        s_defaults[m.side][slot].keysym = norm_keysym(keysym);
+}
+
 /* Walks every keysym intvsession_key_from_keysym could possibly resolve --
- * the printable ASCII range plus the private special-keysym range above --
- * and stores each MAP_KEY result's keysym into its (side,key) slot. There is
- * deliberately no second, hand-transcribed copy of intv_keymap.c's table
- * here: this derives the defaults from the one pure function that already
- * carries them, so the two cannot drift apart. MAP_DISC results are skipped
- * (the disc is not remappable -- see intvsession.h) and so is MAP_NONE. */
+ * the special range first, then printable ASCII -- and stores each result's
+ * keysym into its (side,slot) default, first claim wins (seed_default_locked).
+ * There is deliberately no second, hand-transcribed copy of intv_keymap.c's
+ * table here: this derives the defaults from the one pure function that
+ * already carries them, so the two cannot drift apart. */
 static void compute_defaults_locked(void)
 {
     uint32_t c;
     size_t i;
-    int side, key;
+    int side, slot;
 
     memset(s_defaults, 0, sizeof(s_defaults));
     for (side = 0; side < NUM_SIDES; side++)
-        for (key = 0; key < INTVSESSION_KEY_COUNT; key++)
-            s_defaults[side][key].button = INTVSESSION_PAD_BTN_NONE;
+        for (slot = 0; slot < NUM_SLOTS; slot++)
+            s_defaults[side][slot].button = INTVSESSION_PAD_BTN_NONE;
 
-    for (c = 0x20; c <= 0x7E; c++) {
-        intvsession_key_mapping m = intvsession_key_from_keysym(c);
-        if (m.kind == INTVSESSION_MAP_KEY)
-            s_defaults[m.side][m.key].keysym = c;
-    }
-    for (i = 0; i < sizeof(special_keysyms) / sizeof(special_keysyms[0]); i++) {
-        intvsession_key_mapping m =
-            intvsession_key_from_keysym(special_keysyms[i]);
-        if (m.kind == INTVSESSION_MAP_KEY)
-            s_defaults[m.side][m.key].keysym = special_keysyms[i];
-    }
+    for (i = 0; i < sizeof(special_keysyms) / sizeof(special_keysyms[0]); i++)
+        seed_default_locked(special_keysyms[i]);
+    for (c = 0x20; c <= 0x7E; c++)
+        seed_default_locked(c);
 
     /* Gamepad defaults: every side's own SOUTH/EAST/WEST face buttons drive
      * that side's three action buttons -- the historical hardcoded mapping
@@ -118,8 +222,8 @@ static void reset_to_defaults_locked(void)
 
 /* ---- persistence -------------------------------------------------------
  * One packed settings key ("bindings"), only the entries that differ from
- * s_defaults: "<side>.<key>.k:<keysym>" for a keyboard override,
- * "<side>.<key>.p:<button>" for a gamepad one, ';'-separated. An entry whose
+ * s_defaults: "<side>.<slot>.k:<keysym>" for a keyboard override,
+ * "<side>.<slot>.p:<button>" for a gamepad one, ';'-separated. An entry whose
  * value is 0 (keysym) or -1 (button, INTVSESSION_PAD_BTN_NONE) means
  * "explicitly unbound", distinct from "not listed" (still default) -- that
  * distinction matters when a slot's default input was stolen by some other
@@ -127,27 +231,27 @@ static void reset_to_defaults_locked(void)
 
 static void pack_locked(char *buf, size_t bufsz)
 {
-    int side, key;
+    int side, slot;
     size_t used = 0;
 
     if (bufsz > 0)
         buf[0] = '\0';
     for (side = 0; side < NUM_SIDES; side++) {
-        for (key = 0; key < INTVSESSION_KEY_COUNT; key++) {
-            const intvsession_binding *cur = &s_table[side][key];
-            const intvsession_binding *def = &s_defaults[side][key];
+        for (slot = 0; slot < NUM_SLOTS; slot++) {
+            const intvsession_binding *cur = &s_table[side][slot];
+            const intvsession_binding *def = &s_defaults[side][slot];
             int n;
 
             if (cur->keysym != def->keysym) {
                 n = snprintf(buf + used, used < bufsz ? bufsz - used : 0,
-                            "%s%d.%d.k:%u", used ? ";" : "", side, key,
+                            "%s%d.%d.k:%u", used ? ";" : "", side, slot,
                             (unsigned)cur->keysym);
                 if (n > 0)
                     used += (size_t)n;
             }
             if (cur->button != def->button) {
                 n = snprintf(buf + used, used < bufsz ? bufsz - used : 0,
-                            "%s%d.%d.p:%d", used ? ";" : "", side, key,
+                            "%s%d.%d.p:%d", used ? ";" : "", side, slot,
                             (int)cur->button);
                 if (n > 0)
                     used += (size_t)n;
@@ -168,19 +272,18 @@ static void apply_persisted_locked(struct intvsession *s)
 
     for (tok = strtok_r(buf, ";", &saveptr); tok;
         tok = strtok_r(NULL, ";", &saveptr)) {
-        int side, key;
+        int side, slot;
         char kind;
         long val;
 
-        if (sscanf(tok, "%d.%d.%c:%ld", &side, &key, &kind, &val) != 4)
+        if (sscanf(tok, "%d.%d.%c:%ld", &side, &slot, &kind, &val) != 4)
             continue;
-        if (side < 0 || side >= NUM_SIDES || key < 0 ||
-            key >= INTVSESSION_KEY_COUNT)
+        if (side < 0 || side >= NUM_SIDES || slot < 0 || slot >= NUM_SLOTS)
             continue;
         if (kind == 'k')
-            s_table[side][key].keysym = (uint32_t)val;
+            s_table[side][slot].keysym = norm_keysym((uint32_t)val);
         else if (kind == 'p')
-            s_table[side][key].button = (intvsession_pad_button)val;
+            s_table[side][slot].button = (intvsession_pad_button)val;
     }
 }
 
@@ -209,32 +312,49 @@ static intvsession_key_mapping none_mapping(void)
     return m;
 }
 
-/* keysym's current target: a table scan (finds a MAP_KEY default wherever it
- * has been moved to, or a non-default override), falling back to the pure
- * default table only to recognise a still-fixed disc keysym -- see the file
- * header on why a MAP_KEY result from that fallback means "moved away", not
- * "still here". Caller holds s_mtx. */
+/* keysym's current target: a table scan (finds a MAP_KEY/MAP_DISC default
+ * wherever it has been moved to, or a non-default override), falling back to
+ * the pure default table only to recognise a still-unclaimed disc secondary
+ * default -- see the file header on why. Caller holds s_mtx. */
 static intvsession_key_mapping resolve_keysym_locked(uint32_t keysym)
 {
-    int side, key;
+    int side, slot;
     intvsession_key_mapping def;
 
+    /* norm_keysym: the table stores canonical (uppercase) letters, so the
+     * scan below needs the same case a live keystroke won't otherwise
+     * match -- see that function's own comment. */
+    keysym = norm_keysym(keysym);
     if (keysym != 0) {
         for (side = 0; side < NUM_SIDES; side++) {
-            for (key = 0; key < INTVSESSION_KEY_COUNT; key++) {
-                if (s_table[side][key].keysym == keysym) {
-                    intvsession_key_mapping m;
-                    m.kind = INTVSESSION_MAP_KEY;
-                    m.side = (intvsession_pad_side)side;
-                    m.key = (intvsession_key)key;
-                    m.direction = 0;
-                    return m;
-                }
+            for (slot = 0; slot < NUM_SLOTS; slot++) {
+                if (s_table[side][slot].keysym == keysym)
+                    return target_for_slot(side, slot);
             }
         }
     }
+
+    /* Not in the table under this keysym. The only way it can still resolve
+     * to anything is as one of the disc's secondary defaults (see
+     * intv_keymap.c: the left disc's four cardinals each have a second,
+     * letter keysym alongside the arrow key that won compute_defaults_locked's
+     * first-wins race -- 'K' for East, 'I' for North, and so on).
+     *
+     * A secondary default survives only while its segment's own table slot
+     * still holds ITS default keysym (untouched) or nothing at all (emptied
+     * by some other target stealing the winning keysym away, which is not a
+     * deliberate remap of this segment). The moment a user puts some other
+     * keysym on the segment, the secondary default goes dark along with the
+     * one it rode in on -- there is no world where two different keys both
+     * claim to drive the same disc position at once. */
     def = intvsession_key_from_keysym(keysym);
-    return def.kind == INTVSESSION_MAP_DISC ? def : none_mapping();
+    if (def.kind == INTVSESSION_MAP_DISC) {
+        int slot2 = DISC_SLOT(def.direction);
+        uint32_t held = s_table[def.side][slot2].keysym;
+        if (held == 0 || held == s_defaults[def.side][slot2].keysym)
+            return def;
+    }
+    return none_mapping();
 }
 
 intvsession_key_mapping intvsession_key_from_keysym_bound(intvsession *s,
@@ -248,34 +368,43 @@ intvsession_key_mapping intvsession_key_from_keysym_bound(intvsession *s,
     return m;
 }
 
-intvsession_binding intvsession_binding_get(intvsession *s,
-        intvsession_pad_side side, intvsession_key key)
+intvsession_binding intvsession_target_binding_get(intvsession *s,
+        intvsession_key_mapping target)
 {
     intvsession_binding b = { 0, INTVSESSION_PAD_BTN_NONE };
+    int slot;
     (void)s;
-    if (side < 0 || side >= NUM_SIDES || key < 0 || key >= INTVSESSION_KEY_COUNT)
+    if (target.side < 0 || target.side >= NUM_SIDES)
+        return b;
+    slot = slot_for_target(target);
+    if (slot < 0)
         return b;
     pthread_mutex_lock(&s_mtx);
-    b = s_table[side][key];
+    b = s_table[target.side][slot];
     pthread_mutex_unlock(&s_mtx);
     return b;
 }
 
-intvsession_key_mapping bindings_key_from_button(intvsession_pad_side side,
-                                                  intvsession_pad_button button)
+intvsession_binding intvsession_binding_get(intvsession *s,
+        intvsession_pad_side side, intvsession_key key)
 {
-    int key;
+    return intvsession_target_binding_get(s, intvsession_target_key(side, key));
+}
+
+/* Gamepad-button lookup, scoped to one side only -- see bindings.h. Now
+ * returns MAP_DISC too, since a button can drive a disc segment as well as a
+ * keypad key. */
+intvsession_key_mapping bindings_target_from_button(intvsession_pad_side side,
+                                                     intvsession_pad_button button)
+{
+    int slot;
 
     if (side < 0 || side >= NUM_SIDES || button == INTVSESSION_PAD_BTN_NONE)
         return none_mapping();
     pthread_mutex_lock(&s_mtx);
-    for (key = 0; key < INTVSESSION_KEY_COUNT; key++) {
-        if (s_table[side][key].button == button) {
-            intvsession_key_mapping m;
-            m.kind = INTVSESSION_MAP_KEY;
-            m.side = side;
-            m.key = (intvsession_key)key;
-            m.direction = 0;
+    for (slot = 0; slot < NUM_SLOTS; slot++) {
+        if (s_table[side][slot].button == button) {
+            intvsession_key_mapping m = target_for_slot(side, slot);
             pthread_mutex_unlock(&s_mtx);
             return m;
         }
@@ -287,7 +416,25 @@ intvsession_key_mapping bindings_key_from_button(intvsession_pad_side side,
 int bindings_button_is_free(intvsession_pad_side side,
                             intvsession_pad_button button)
 {
-    return bindings_key_from_button(side, button).kind == INTVSESSION_MAP_NONE;
+    return bindings_target_from_button(side, button).kind == INTVSESSION_MAP_NONE;
+}
+
+int bindings_disc_buttons(intvsession_pad_side side,
+                          intvsession_pad_button out[INTVSESSION_DISC_POSITIONS])
+{
+    int dir, n = 0;
+
+    if (side < 0 || side >= NUM_SIDES)
+        return 0;
+    pthread_mutex_lock(&s_mtx);
+    for (dir = 0; dir < INTVSESSION_DISC_POSITIONS; dir++) {
+        intvsession_pad_button b = s_table[side][DISC_SLOT(dir)].button;
+        out[dir] = b;
+        if (b != INTVSESSION_PAD_BTN_NONE)
+            n++;
+    }
+    pthread_mutex_unlock(&s_mtx);
+    return n;
 }
 
 /* ---- names --------------------------------------------------------------- */
@@ -326,6 +473,13 @@ const char *intvsession_pad_key_name(intvsession_key key)
     case INTVSESSION_ACTION_LOWER_RIGHT: return "R-Lower";
     default:                          return "?";
     }
+}
+
+const char *intvsession_disc_dir_name(int direction)
+{
+    if (direction < 0 || direction >= INTVSESSION_DISC_POSITIONS)
+        return "?";
+    return disc_dir_names[direction];
 }
 
 /* Xbox-style face-button letters -- SDL3's own SOUTH/EAST/WEST/NORTH names
@@ -406,20 +560,33 @@ int intvsession_keysym_name(uint32_t keysym, char *dst, int dstsz)
     return (int)strlen(name);
 }
 
+int intvsession_target_name(intvsession_key_mapping target, char *dst,
+                            int dstsz)
+{
+    char buf[128];
+
+    if (target.kind == INTVSESSION_MAP_KEY)
+        snprintf(buf, sizeof(buf), "%s %s",
+                intvsession_pad_side_name(target.side),
+                intvsession_pad_key_name(target.key));
+    else if (target.kind == INTVSESSION_MAP_DISC)
+        snprintf(buf, sizeof(buf), "%s disc %s",
+                intvsession_pad_side_name(target.side),
+                intvsession_disc_dir_name(target.direction));
+    else
+        buf[0] = '\0';
+
+    if (dst && dstsz > 0)
+        snprintf(dst, (size_t)dstsz, "%s", buf);
+    return (int)strlen(buf);
+}
+
 static void describe_mapping_locked(intvsession_key_mapping m, char *dst,
                                     int dstsz)
 {
     if (!dst || dstsz <= 0)
         return;
-    if (m.kind == INTVSESSION_MAP_KEY)
-        snprintf(dst, (size_t)dstsz, "%s %s", intvsession_pad_side_name(m.side),
-                intvsession_pad_key_name(m.key));
-    else if (m.kind == INTVSESSION_MAP_DISC)
-        snprintf(dst, (size_t)dstsz, "%s disc %s",
-                intvsession_pad_side_name(m.side),
-                disc_dir_names[m.direction / 2]);
-    else
-        dst[0] = '\0';
+    intvsession_target_name(m, dst, dstsz);
 }
 
 int intvsession_binding_describe(intvsession_binding b, char *dst, int dstsz)
@@ -449,63 +616,94 @@ int intvsession_binding_describe(intvsession_binding b, char *dst, int dstsz)
 /* ---- mutation -------------------------------------------------------------
  * Both setters follow the same shape: resolve what (if anything) currently
  * owns the input being bound, describe that for `stolen`, clear it from
- * there if it was a live pad-key slot, write the new binding, then persist
- * outside the lock (persist_locked_then unlocks s_mtx itself -- see its own
- * comment). Re-binding an input to the slot it already occupies is treated
- * as "nothing stolen" rather than reporting a button stealing from itself. */
+ * there if it was actually holding that input, write the new binding, then
+ * persist outside the lock (persist_locked_then unlocks s_mtx itself -- see
+ * its own comment). Re-binding an input to the target it already occupies is
+ * treated as "nothing stolen" rather than reporting a target stealing from
+ * itself. */
+
+void intvsession_target_set_key(intvsession *s, intvsession_key_mapping target,
+        uint32_t keysym, char *stolen, int stolensz)
+{
+    intvsession_key_mapping cur;
+    int slot, cur_slot;
+
+    if (stolen && stolensz > 0)
+        stolen[0] = '\0';
+    if (target.side < 0 || target.side >= NUM_SIDES)
+        return;
+    slot = slot_for_target(target);
+    if (slot < 0)
+        return;
+    /* norm_keysym: stored, scanned and compared canonically -- see that
+     * function's own comment. */
+    keysym = norm_keysym(keysym);
+
+    pthread_mutex_lock(&s_mtx);
+    cur = resolve_keysym_locked(keysym);
+    if (cur.kind != INTVSESSION_MAP_NONE && cur.side == target.side &&
+        slot_for_target(cur) == slot)
+        cur = none_mapping();
+    describe_mapping_locked(cur, stolen, stolensz);
+    /* Only clear the old slot if it is actually the one holding this keysym
+     * -- resolve_keysym_locked can also report a secondary default (e.g.
+     * 'K' resolving to Left disc East while the table slot itself still
+     * holds the Right Arrow that won the default race), and that slot must
+     * not be wiped out from under the input that legitimately owns it. */
+    cur_slot = slot_for_target(cur);
+    if (cur_slot >= 0 && s_table[cur.side][cur_slot].keysym == keysym)
+        s_table[cur.side][cur_slot].keysym = 0;
+    s_table[target.side][slot].keysym = keysym;
+    persist_locked_then(s); /* unlocks s_mtx */
+}
+
+void intvsession_target_set_button(intvsession *s, intvsession_key_mapping target,
+        intvsession_pad_button button, char *stolen, int stolensz)
+{
+    int slot, cur_slot = -1;
+    int k;
+
+    if (stolen && stolensz > 0)
+        stolen[0] = '\0';
+    if (target.side < 0 || target.side >= NUM_SIDES)
+        return;
+    slot = slot_for_target(target);
+    if (slot < 0)
+        return;
+
+    pthread_mutex_lock(&s_mtx);
+    if (button != INTVSESSION_PAD_BTN_NONE) {
+        for (k = 0; k < NUM_SLOTS; k++) {
+            if (s_table[target.side][k].button == button) {
+                cur_slot = k;
+                break;
+            }
+        }
+    }
+    if (cur_slot == slot)
+        cur_slot = -1;
+    if (cur_slot >= 0 && stolen && stolensz > 0)
+        intvsession_target_name(target_for_slot(target.side, cur_slot),
+                                stolen, stolensz);
+    if (cur_slot >= 0)
+        s_table[target.side][cur_slot].button = INTVSESSION_PAD_BTN_NONE;
+    s_table[target.side][slot].button = button;
+    persist_locked_then(s); /* unlocks s_mtx */
+}
 
 void intvsession_binding_set_key(intvsession *s, intvsession_pad_side side,
         intvsession_key key, uint32_t keysym, char *stolen, int stolensz)
 {
-    intvsession_key_mapping cur;
-
-    if (stolen && stolensz > 0)
-        stolen[0] = '\0';
-    if (side < 0 || side >= NUM_SIDES || key < 0 || key >= INTVSESSION_KEY_COUNT)
-        return;
-
-    pthread_mutex_lock(&s_mtx);
-    cur = resolve_keysym_locked(keysym);
-    if (cur.kind == INTVSESSION_MAP_KEY && cur.side == side && cur.key == key)
-        cur = none_mapping();
-    describe_mapping_locked(cur, stolen, stolensz);
-    if (cur.kind == INTVSESSION_MAP_KEY)
-        s_table[cur.side][cur.key].keysym = 0;
-    s_table[side][key].keysym = keysym;
-    persist_locked_then(s); /* unlocks s_mtx */
+    intvsession_target_set_key(s, intvsession_target_key(side, key), keysym,
+                               stolen, stolensz);
 }
 
 void intvsession_binding_set_button(intvsession *s, intvsession_pad_side side,
         intvsession_key key, intvsession_pad_button button,
         char *stolen, int stolensz)
 {
-    int cur_key = -1;
-    int k;
-
-    if (stolen && stolensz > 0)
-        stolen[0] = '\0';
-    if (side < 0 || side >= NUM_SIDES || key < 0 || key >= INTVSESSION_KEY_COUNT)
-        return;
-
-    pthread_mutex_lock(&s_mtx);
-    if (button != INTVSESSION_PAD_BTN_NONE) {
-        for (k = 0; k < INTVSESSION_KEY_COUNT; k++) {
-            if (s_table[side][k].button == button) {
-                cur_key = k;
-                break;
-            }
-        }
-    }
-    if (cur_key == (int)key)
-        cur_key = -1;
-    if (cur_key >= 0 && stolen && stolensz > 0)
-        snprintf(stolen, (size_t)stolensz, "%s %s",
-                intvsession_pad_side_name(side),
-                intvsession_pad_key_name((intvsession_key)cur_key));
-    if (cur_key >= 0)
-        s_table[side][cur_key].button = INTVSESSION_PAD_BTN_NONE;
-    s_table[side][key].button = button;
-    persist_locked_then(s); /* unlocks s_mtx */
+    intvsession_target_set_button(s, intvsession_target_key(side, key), button,
+                                  stolen, stolensz);
 }
 
 void intvsession_bindings_reset(intvsession *s)

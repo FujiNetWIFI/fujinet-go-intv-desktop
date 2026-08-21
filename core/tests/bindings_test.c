@@ -2,8 +2,9 @@
  * bindings_test -- exercises core/src/bindings.c's remappable-bindings layer
  * through intvsession's public API: defaults derived from
  * intvsession_key_from_keysym, steal-and-describe semantics for both the
- * keyboard and gamepad slots, intvsession_key_from_keysym_bound's "moved
- * away" behaviour, settings persistence, and reset.
+ * keyboard and gamepad slots (keypad/action buttons AND disc segments alike),
+ * intvsession_key_from_keysym_bound's "moved away" behaviour, the disc's
+ * secondary-default rule, settings persistence, and reset.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -67,6 +68,41 @@ int main(void)
     check("a never-mapped digit has no default gamepad binding",
           intvsession_binding_get(s, INTVSESSION_PAD_LEFT, INTVSESSION_KEY_5)
                   .button == INTVSESSION_PAD_BTN_NONE);
+
+    /* ---- the disc's 16 segments are now targets too --------------------- */
+    {
+        /* Left disc East's *displayed* default is the Right arrow, not 'K'
+         * -- compute_defaults_locked walks special_keysyms (the arrows)
+         * before the printable-ASCII sweep, so the arrow wins the
+         * first-wins race onto the segment's one table slot. 'K' still
+         * works (see the "secondary default" block further down) but is
+         * not what a fresh install shows. */
+        intvsession_binding east = intvsession_target_binding_get(
+            s, intvsession_target_disc(INTVSESSION_PAD_LEFT, 0));
+        intvsession_binding north = intvsession_target_binding_get(
+            s, intvsession_target_disc(INTVSESSION_PAD_LEFT, 4));
+        intvsession_binding right_east = intvsession_target_binding_get(
+            s, intvsession_target_disc(INTVSESSION_PAD_RIGHT, 0));
+        check("Left disc East's default is the Right arrow, not 'K'",
+              east.keysym == INTVSESSION_KEYSYM_RIGHT);
+        check("Left disc North's default is the Up arrow, not 'I'",
+              north.keysym == INTVSESSION_KEYSYM_UP);
+        check("Right disc East's default is 'D' (no arrow contender there)",
+              right_east.keysym == 'D');
+    }
+    {
+        /* Half-steps (odd clock positions) have no keyboard OR gamepad
+         * default at all -- widening compute_defaults_locked's
+         * PAD_BTN_NONE-seeding loop to the disc slots is what keeps this
+         * INTVSESSION_PAD_BTN_NONE rather than a stray SOUTH (button 0),
+         * which is what a memset-zeroed slot would otherwise read as. */
+        intvsession_binding ene = intvsession_target_binding_get(
+            s, intvsession_target_disc(INTVSESSION_PAD_LEFT, 1));
+        check("a half-step direction has no default keyboard binding",
+              ene.keysym == 0);
+        check("a half-step direction has no default gamepad binding",
+              ene.button == INTVSESSION_PAD_BTN_NONE);
+    }
 
     /* ---- bound keysym lookup matches the pure table before any remap ---- */
     {
@@ -171,7 +207,7 @@ int main(void)
          * exactly what handle_button and poll_sticks' D-pad gate call on
          * their own polling thread. */
         {
-            intvsession_key_mapping m = bindings_key_from_button(
+            intvsession_key_mapping m = bindings_target_from_button(
                 INTVSESSION_PAD_LEFT, INTVSESSION_PAD_BTN_SOUTH);
             check("reverse lookup: Left SOUTH now resolves to Left/5",
                   m.kind == INTVSESSION_MAP_KEY &&
@@ -208,6 +244,76 @@ int main(void)
         check("Right/Enter's keyboard slot ('K', bound above) survived "
               "with no gamepad binding touched",
               b.keysym == 'K' && b.button == INTVSESSION_PAD_BTN_NONE);
+    }
+
+    /* ---- disc segments are map targets too ------------------------------ */
+    {
+        char stolen[128] = "unset";
+        /* Direction 3 is NNE, a half-step with no default at all -- binding
+         * 'Q' onto it steals nothing. */
+        intvsession_target_set_key(s, intvsession_target_disc(INTVSESSION_PAD_LEFT, 3),
+                                   'Q', stolen, sizeof(stolen));
+        check("binding a half-step steals nothing", stolen[0] == '\0');
+        check("half-step now resolves 'Q' as MAP_DISC direction 3",
+              intvsession_key_from_keysym_bound(s, 'Q').kind ==
+                  INTVSESSION_MAP_DISC &&
+              intvsession_key_from_keysym_bound(s, 'Q').direction == 3);
+        check("half-step's slot reads back 'Q'",
+              intvsession_target_binding_get(
+                  s, intvsession_target_disc(INTVSESSION_PAD_LEFT, 3))
+                      .keysym == 'Q');
+    }
+    {
+        char stolen[128] = "unset";
+        /* Re-bind 'Q' onto the SAME disc segment it already occupies --
+         * "nothing stolen", the disc-target analogue of the existing
+         * same-slot check for keypad targets above. */
+        intvsession_target_set_key(s, intvsession_target_disc(INTVSESSION_PAD_LEFT, 3),
+                                   'Q', stolen, sizeof(stolen));
+        check("re-binding a disc target to itself reports nothing stolen",
+              stolen[0] == '\0');
+    }
+    {
+        char stolen[128] = "unset";
+        /* '3' still drives its own untouched default, Right/3 -- move it
+         * onto a disc segment instead; Right/3 should read back as
+         * stolen, and lose the keysym that used to drive it. Picked
+         * because nothing else in this file touches Right/3 or '3'. */
+        intvsession_target_set_key(s, intvsession_target_disc(INTVSESSION_PAD_RIGHT, 7),
+                                   '3', stolen, sizeof(stolen));
+        check("stealing a keypad key onto a disc target names the old key",
+              strstr(stolen, "Right") && strstr(stolen, "3") &&
+                  !strstr(stolen, "disc"));
+        check("Right/3's keyboard slot lost '3'",
+              intvsession_binding_get(s, INTVSESSION_PAD_RIGHT, INTVSESSION_KEY_3)
+                      .keysym != (uint32_t)'3');
+    }
+    {
+        /* A gamepad button can drive a disc segment too -- bind D-pad Left
+         * on the right side onto a half-step direction. */
+        char stolen[128] = "unset";
+        intvsession_pad_button btns[INTVSESSION_DISC_POSITIONS];
+
+        intvsession_target_set_button(
+            s, intvsession_target_disc(INTVSESSION_PAD_RIGHT, 6),
+            INTVSESSION_PAD_BTN_DPAD_LEFT, stolen, sizeof(stolen));
+        check("binding D-pad Left onto a disc segment steals nothing",
+              stolen[0] == '\0');
+        check("D-pad Left is no longer free on the right side",
+              bindings_button_is_free(INTVSESSION_PAD_RIGHT,
+                                      INTVSESSION_PAD_BTN_DPAD_LEFT) == 0);
+        {
+            intvsession_key_mapping m = bindings_target_from_button(
+                INTVSESSION_PAD_RIGHT, INTVSESSION_PAD_BTN_DPAD_LEFT);
+            check("reverse lookup finds the disc segment, not a keypad key",
+                  m.kind == INTVSESSION_MAP_DISC && m.direction == 6);
+        }
+        check("bindings_disc_buttons reports exactly one bound position",
+              bindings_disc_buttons(INTVSESSION_PAD_RIGHT, btns) == 1 &&
+                  btns[6] == INTVSESSION_PAD_BTN_DPAD_LEFT &&
+                  btns[0] == INTVSESSION_PAD_BTN_NONE);
+        check("a side with no disc-button bindings reports zero",
+              bindings_disc_buttons(INTVSESSION_PAD_ECS_LEFT, btns) == 0);
     }
 
     /* ---- persistence: a second session on the same config dir sees it -- */
@@ -255,6 +361,77 @@ int main(void)
                                       INTVSESSION_KEY_1)
                       .keysym == INTVSESSION_KEYSYM_KP_7);
 
+    /* ---- secondary defaults: 'K' survives losing the first-wins race ----
+     * From here on the table is back at defaults (the reopen above proved
+     * it), which is exactly the state this rule needs to be exercised from. */
+    {
+        char stolen[128] = "unset";
+        /* Steal the Right arrow -- Left disc East's *displayed* default --
+         * onto Right/9. Left disc East's own slot is now empty. */
+        intvsession_binding_set_key(s, INTVSESSION_PAD_RIGHT, INTVSESSION_KEY_9,
+                                    INTVSESSION_KEYSYM_RIGHT, stolen,
+                                    sizeof(stolen));
+        check("stealing the Right arrow names Left disc East",
+              strstr(stolen, "disc") && strstr(stolen, "East"));
+        check("Left disc East's slot is now empty",
+              intvsession_target_binding_get(
+                  s, intvsession_target_disc(INTVSESSION_PAD_LEFT, 0))
+                      .keysym == 0);
+        check("'K' still resolves to Left disc East -- the slot being "
+              "emptied by a steal is not a deliberate remap of the segment",
+              intvsession_key_from_keysym_bound(s, 'K').kind ==
+                  INTVSESSION_MAP_DISC &&
+              intvsession_key_from_keysym_bound(s, 'K').direction == 0);
+    }
+    {
+        /* NOW deliberately remap the segment itself, away from 'K' -- this
+         * is the case that should finally silence the secondary default. */
+        intvsession_target_set_key(s, intvsession_target_disc(INTVSESSION_PAD_LEFT, 0),
+                                   'G', NULL, 0);
+        check("'K' no longer resolves to anything once its segment is "
+              "explicitly remapped",
+              intvsession_key_from_keysym_bound(s, 'K').kind ==
+                  INTVSESSION_MAP_NONE);
+        check("'G' now drives Left disc East",
+              intvsession_key_from_keysym_bound(s, 'G').kind ==
+                  INTVSESSION_MAP_DISC &&
+              intvsession_key_from_keysym_bound(s, 'G').direction == 0);
+    }
+    {
+        /* Reset brings back both the Right arrow AND 'K' at once -- there
+         * was never a real second binding to restore, just the one slot
+         * and the fallback rule that reads it. */
+        intvsession_bindings_reset(s);
+        check("reset restores 'K' as Left disc East's secondary default",
+              intvsession_key_from_keysym_bound(s, 'K').kind ==
+                  INTVSESSION_MAP_DISC);
+        check("reset restores the Right arrow as Left disc East's slot",
+              intvsession_target_binding_get(
+                  s, intvsession_target_disc(INTVSESSION_PAD_LEFT, 0))
+                      .keysym == INTVSESSION_KEYSYM_RIGHT);
+    }
+    {
+        /* Regression guard for intvsession_target_set_key's conditional
+         * clear: stealing 'K' (a secondary default, resolved only via the
+         * pure-table fallback) onto some other target must NOT blow away
+         * the Right arrow actually sitting in Left disc East's slot --
+         * only a slot that genuinely holds the stolen keysym gets cleared. */
+        char stolen[128] = "unset";
+        intvsession_binding_set_key(s, INTVSESSION_PAD_RIGHT, INTVSESSION_KEY_6,
+                                    'K', stolen, sizeof(stolen));
+        check("stealing 'K' still names Left disc East",
+              strstr(stolen, "disc") && strstr(stolen, "East"));
+        check("...but leaves the Right arrow sitting in Left disc East's "
+              "slot untouched",
+              intvsession_target_binding_get(
+                  s, intvsession_target_disc(INTVSESSION_PAD_LEFT, 0))
+                      .keysym == INTVSESSION_KEYSYM_RIGHT);
+        check("...so the Right arrow still drives Left disc East",
+              intvsession_key_from_keysym_bound(s, INTVSESSION_KEYSYM_RIGHT)
+                      .kind == INTVSESSION_MAP_DISC);
+        intvsession_bindings_reset(s); /* leave a clean table behind */
+    }
+
     /* ---- name tables ---------------------------------------------------- */
     check("pad_key_name(5) is \"5\"",
           strcmp(intvsession_pad_key_name(INTVSESSION_KEY_5), "5") == 0);
@@ -292,6 +469,65 @@ int main(void)
         intvsession_binding_describe(none, desc, sizeof(desc));
         check("describe(none) is \"nothing\"",
               strcmp(desc, "nothing") == 0);
+    }
+    {
+        /* All 16 clock positions, replacing the old 8-entry table that was
+         * indexed by direction/2 -- direction 1 used to print "East"
+         * (the same name as direction 0) instead of its own half-step
+         * name. */
+        int i, ok = 1;
+        for (i = 0; i < INTVSESSION_DISC_POSITIONS; i++) {
+            const char *n = intvsession_disc_dir_name(i);
+            int j;
+            if (!n[0] || strcmp(n, "?") == 0)
+                ok = 0;
+            for (j = 0; j < i; j++)
+                if (strcmp(n, intvsession_disc_dir_name(j)) == 0)
+                    ok = 0;
+        }
+        check("all 16 disc_dir_names are non-empty and pairwise distinct", ok);
+        check("disc_dir_name(0) is \"East\"",
+              strcmp(intvsession_disc_dir_name(0), "East") == 0);
+        check("disc_dir_name(1) is \"ENE\", not \"East\" (the old /2 bug)",
+              strcmp(intvsession_disc_dir_name(1), "ENE") == 0);
+        check("disc_dir_name(2) is \"Northeast\" (matches the old table's "
+              "value at its new index)",
+              strcmp(intvsession_disc_dir_name(2), "Northeast") == 0);
+        check("disc_dir_name(14) is \"Southeast\" (matches the old table's "
+              "value at its new index)",
+              strcmp(intvsession_disc_dir_name(14), "Southeast") == 0);
+        check("disc_dir_name out of range is \"?\"",
+              strcmp(intvsession_disc_dir_name(16), "?") == 0 &&
+                  strcmp(intvsession_disc_dir_name(-1), "?") == 0);
+    }
+    {
+        char name[64];
+        int n;
+
+        n = intvsession_target_name(
+            intvsession_target_key(INTVSESSION_PAD_LEFT, INTVSESSION_KEY_5),
+            name, sizeof(name));
+        check("target_name(Left 5) is \"Left 5\"",
+              n == (int)strlen(name) && strcmp(name, "Left 5") == 0);
+
+        n = intvsession_target_name(
+            intvsession_target_disc(INTVSESSION_PAD_LEFT, 0), name,
+            sizeof(name));
+        check("target_name(Left disc East) is \"Left disc East\"",
+              n == (int)strlen(name) && strcmp(name, "Left disc East") == 0);
+
+        n = intvsession_target_name(
+            intvsession_target_disc(INTVSESSION_PAD_RIGHT, 1), name,
+            sizeof(name));
+        check("target_name of a half-step is \"Right disc ENE\"",
+              strcmp(name, "Right disc ENE") == 0);
+
+        name[0] = 'x';
+        n = intvsession_target_name(
+            (intvsession_key_mapping){ INTVSESSION_MAP_NONE, 0, 0, 0 }, name,
+            sizeof(name));
+        check("target_name(MAP_NONE) returns 0 and an empty string",
+              n == 0 && name[0] == '\0');
     }
 
     intvsession_free(s);

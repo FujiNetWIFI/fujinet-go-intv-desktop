@@ -148,6 +148,31 @@ int main(void)
     check("an SDL button this project doesn't name maps to NONE",
           pad_button_from_sdl(255) == INTVSESSION_PAD_BTN_NONE);
 
+    /* ---- sdl_button_from_pad: the inverse, for poll_sticks' explicitly-
+     * bound disc segments (see gamepad_sdl.h's own comment) ---- */
+    check("SOUTH -> SDL 0", sdl_button_from_pad(INTVSESSION_PAD_BTN_SOUTH) == 0);
+    check("DPAD_RIGHT -> SDL 14",
+          sdl_button_from_pad(INTVSESSION_PAD_BTN_DPAD_RIGHT) == 14);
+    check("NONE has no SDL button",
+          sdl_button_from_pad(INTVSESSION_PAD_BTN_NONE) == -1);
+    check("an out-of-range value has no SDL button",
+          sdl_button_from_pad((intvsession_pad_button)99) == -1);
+    {
+        /* Every named button round-trips through both tables -- the two
+         * are hand-written in opposite directions specifically so a typo
+         * in one doesn't silently mirror into the other; this is what
+         * actually catches that. */
+        int b, ok = 1;
+        for (b = 0; b < INTVSESSION_PAD_BTN_COUNT; b++) {
+            int sdl = sdl_button_from_pad((intvsession_pad_button)b);
+            if (sdl < 0 || pad_button_from_sdl((uint8_t)sdl) != (intvsession_pad_button)b)
+                ok = 0;
+        }
+        check("every named button round-trips pad_button_from_sdl <-> "
+              "sdl_button_from_pad",
+              ok);
+    }
+
     /* ---- SDL subsystem lifecycle, no hardware required ---- */
     check("gamepad subsystem starts", intv_gamepad_start() == 0);
     check("no pads on a CI machine with none attached",

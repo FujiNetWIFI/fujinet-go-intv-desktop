@@ -7,12 +7,14 @@
  * header's own comment on why direct pad injection is the one mechanism).
  *
  * Left stick/D-pad -> the disc (whichever controller side the pad is bound
- * to). Every named button (face, shoulders, sticks, D-pad, start/back/guide)
- * is looked up in bindings.c's remappable table instead of being hardwired
- * here -- SOUTH/EAST/WEST -> the three action buttons is only that table's
- * *default*, seeded once in bindings.c and editable from a keypad window's
- * Map mode from then on, same as the keyboard. A D-pad button remapped to a
- * keypad key stops contributing to the disc too (see poll_sticks' own
+ * to), unless some button has been explicitly bound to a disc segment (see
+ * poll_sticks), in which case that wins. Every named button (face,
+ * shoulders, sticks, D-pad, start/back/guide) is looked up in bindings.c's
+ * remappable table instead of being hardwired here -- SOUTH/EAST/WEST -> the
+ * three action buttons is only that table's *default*, seeded once in
+ * bindings.c and editable from a keypad window's Map mode from then on, same
+ * as the keyboard. A D-pad button remapped to a keypad key OR a disc segment
+ * stops contributing to the raw D-pad reading too (see poll_sticks' own
  * bindings_button_is_free guard) so the same press can't do both at once.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
@@ -184,7 +186,11 @@ static void handle_button(intv_pad_side side, Uint8 button, int pressed)
 
     if (b == INTVSESSION_PAD_BTN_NONE)
         return;
-    m = bindings_key_from_button((intvsession_pad_side)side, b);
+    /* Only acts on MAP_KEY -- a button bound to a disc segment (MAP_DISC) is
+     * resolved by poll_sticks instead, which is the single writer of the
+     * disc (see this file's own header and poll_sticks' own comment on why
+     * a second writer here would race it). */
+    m = bindings_target_from_button((intvsession_pad_side)side, b);
     if (m.kind == INTVSESSION_MAP_KEY)
         intv_host_pad_key(side, (intv_pad_key)m.key, pressed);
 }
@@ -208,6 +214,29 @@ intvsession_pad_button pad_button_from_sdl(uint8_t button)
     case SDL_GAMEPAD_BUTTON_DPAD_LEFT:      return INTVSESSION_PAD_BTN_DPAD_LEFT;
     case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:     return INTVSESSION_PAD_BTN_DPAD_RIGHT;
     default:                               return INTVSESSION_PAD_BTN_NONE;
+    }
+}
+
+/* Inverse of the table above -- see gamepad_sdl.h's own comment. */
+int sdl_button_from_pad(intvsession_pad_button button)
+{
+    switch (button) {
+    case INTVSESSION_PAD_BTN_SOUTH:          return SDL_GAMEPAD_BUTTON_SOUTH;
+    case INTVSESSION_PAD_BTN_EAST:           return SDL_GAMEPAD_BUTTON_EAST;
+    case INTVSESSION_PAD_BTN_WEST:           return SDL_GAMEPAD_BUTTON_WEST;
+    case INTVSESSION_PAD_BTN_NORTH:          return SDL_GAMEPAD_BUTTON_NORTH;
+    case INTVSESSION_PAD_BTN_BACK:           return SDL_GAMEPAD_BUTTON_BACK;
+    case INTVSESSION_PAD_BTN_GUIDE:          return SDL_GAMEPAD_BUTTON_GUIDE;
+    case INTVSESSION_PAD_BTN_START:          return SDL_GAMEPAD_BUTTON_START;
+    case INTVSESSION_PAD_BTN_LEFT_STICK:     return SDL_GAMEPAD_BUTTON_LEFT_STICK;
+    case INTVSESSION_PAD_BTN_RIGHT_STICK:    return SDL_GAMEPAD_BUTTON_RIGHT_STICK;
+    case INTVSESSION_PAD_BTN_LEFT_SHOULDER:  return SDL_GAMEPAD_BUTTON_LEFT_SHOULDER;
+    case INTVSESSION_PAD_BTN_RIGHT_SHOULDER: return SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER;
+    case INTVSESSION_PAD_BTN_DPAD_UP:        return SDL_GAMEPAD_BUTTON_DPAD_UP;
+    case INTVSESSION_PAD_BTN_DPAD_DOWN:      return SDL_GAMEPAD_BUTTON_DPAD_DOWN;
+    case INTVSESSION_PAD_BTN_DPAD_LEFT:      return SDL_GAMEPAD_BUTTON_DPAD_LEFT;
+    case INTVSESSION_PAD_BTN_DPAD_RIGHT:     return SDL_GAMEPAD_BUTTON_DPAD_RIGHT;
+    default:                                return -1;
     }
 }
 
@@ -266,30 +295,72 @@ static void poll_sticks(void)
             continue;
 
         pad_slot *slot = &s_pads[idx];
+        int dir = -1;
 
-        /* The D-pad wins when pressed: it is a set of plain digital
-         * buttons, no wobble to reason about, and a player reaching for
-         * it clearly wants precise control. Falls through to the analog
+        /* Priority, highest first:
+         *   1. a gamepad button the user has explicitly bound to a disc
+         *      segment via a keypad window's Map mode -- nothing is bound
+         *      here by default (bindings_disc_buttons returns 0), so this
+         *      rung is inert until someone opts in, and it is the ONLY way
+         *      to reach the 8 odd half-step positions from a gamepad (the
+         *      D-pad and the stick both resolve 8-way only -- see
+         *      intv_disc_from_stick's own comment on why).
+         *   2. the D-pad: plain digital buttons, no wobble to reason about,
+         *      and a player reaching for it clearly wants precise control.
+         *   3. the left analog stick.
+         * The disc holds exactly one position at a time
+         * (intv_host_pad_disc overwrites, it never ORs), so if two bound
+         * buttons are somehow held together, the lower clock position wins
+         * -- deterministic and documented rather than whichever SDL happens
+         * to poll first.
+         *
+         * Rung 2's own bindings_button_is_free gate already covers a D-pad
+         * button remapped to a disc segment (bindings_button_is_free counts
+         * both kinds of claim, see bindings.h), so rungs 1 and 2 can never
+         * both act on the same physical press. */
+        intvsession_pad_button disc_btn[INTVSESSION_DISC_POSITIONS];
+        if (bindings_disc_buttons((intvsession_pad_side)side, disc_btn) > 0)
+        {
+            for (int d = 0; d < INTVSESSION_DISC_POSITIONS; d++)
+            {
+                int sdl;
+                if (disc_btn[d] == INTVSESSION_PAD_BTN_NONE)
+                    continue;
+                sdl = sdl_button_from_pad(disc_btn[d]);
+                if (sdl >= 0 &&
+                    SDL_GetGamepadButton(slot->handle, (SDL_GamepadButton)sdl))
+                {
+                    dir = d;
+                    break;
+                }
+            }
+        }
+
+        /* The D-pad wins over the stick when pressed: it is a set of plain
+         * digital buttons, no wobble to reason about, and a player reaching
+         * for it clearly wants precise control. Falls through to the analog
          * stick when the D-pad is neutral.
          *
          * Each direction only counts if bindings.c doesn't have that D-pad
-         * button claimed for a keypad key on this side -- a button remapped
-         * to drive a digit stops also nudging the disc every poll, so the
-         * same physical press can't do both at once (see this file's own
+         * button claimed for a keypad key or a disc segment on this side --
+         * a button remapped to drive one of those stops also nudging the
+         * disc from its own raw D-pad state every poll, so the same
+         * physical press can't do both at once (see this file's own
          * header). */
-        int dir = intv_disc_from_dpad(
-            bindings_button_is_free((intvsession_pad_side)side,
-                                    INTVSESSION_PAD_BTN_DPAD_UP) &&
-                SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_UP),
-            bindings_button_is_free((intvsession_pad_side)side,
-                                    INTVSESSION_PAD_BTN_DPAD_DOWN) &&
-                SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_DOWN),
-            bindings_button_is_free((intvsession_pad_side)side,
-                                    INTVSESSION_PAD_BTN_DPAD_LEFT) &&
-                SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_LEFT),
-            bindings_button_is_free((intvsession_pad_side)side,
-                                    INTVSESSION_PAD_BTN_DPAD_RIGHT) &&
-                SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_RIGHT));
+        if (dir == -1)
+            dir = intv_disc_from_dpad(
+                bindings_button_is_free((intvsession_pad_side)side,
+                                        INTVSESSION_PAD_BTN_DPAD_UP) &&
+                    SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_UP),
+                bindings_button_is_free((intvsession_pad_side)side,
+                                        INTVSESSION_PAD_BTN_DPAD_DOWN) &&
+                    SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_DOWN),
+                bindings_button_is_free((intvsession_pad_side)side,
+                                        INTVSESSION_PAD_BTN_DPAD_LEFT) &&
+                    SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_LEFT),
+                bindings_button_is_free((intvsession_pad_side)side,
+                                        INTVSESSION_PAD_BTN_DPAD_RIGHT) &&
+                    SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_RIGHT));
 
         if (dir == -1)
         {

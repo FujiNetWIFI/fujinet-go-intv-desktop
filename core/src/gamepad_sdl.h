@@ -39,6 +39,14 @@ int intv_pad_for_port(const int *bindings, int npads, int side);
  * Pure function; unit-tested in gamepad_test.c. */
 intvsession_pad_button pad_button_from_sdl(uint8_t button);
 
+/* The inverse of pad_button_from_sdl -- poll_sticks needs it to turn a
+ * bindings.c disc-segment button (an intvsession_pad_button) back into the
+ * SDL_GamepadButton index SDL_GetGamepadButton wants. Returns -1 for
+ * INTVSESSION_PAD_BTN_NONE and for anything this project doesn't name; the
+ * two tables are kept in sync by gamepad_test.c round-tripping every named
+ * button through both. Pure function. */
+int sdl_button_from_pad(intvsession_pad_button button);
+
 #ifdef __cplusplus
 }
 #endif

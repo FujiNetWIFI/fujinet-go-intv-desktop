@@ -32,14 +32,15 @@
  *
  * MAP MODE: a bottom row (buildMapRow, onMapClicked and friends, near the
  * end of this file) lets a click on any of the 15 digit/action buttons
- * above be rebound to a different keyboard key or gamepad button, through
- * core/src/bindings.c's remappable layer -- see intvsession.h's own
- * "remappable bindings" section for the contract. While armed, the same
- * pressed()/released() pair that would normally inject a pad key instead
- * picks the map target, and forwardKey's own keyboard capture intercepts
- * the next keystroke instead of forwarding it to the machine. A gamepad
- * button press is polled for on a short QTimer (g_gamepadPollTimer below)
- * since core/src/gamepad_sdl.c's capture result lands on its own
+ * above, OR any of the 16 disc segments, be rebound to a different keyboard
+ * key or gamepad button, through core/src/bindings.c's remappable layer --
+ * see intvsession.h's own "remappable bindings" section for the contract.
+ * While armed, the same pressed()/released() pair (or DiscWidget's own
+ * mouse handlers) that would normally inject a pad key or disc direction
+ * instead picks the map target, and forwardKey's own keyboard capture
+ * intercepts the next keystroke instead of forwarding it to the machine. A
+ * gamepad button press is polled for on a short QTimer (g_gamepadPollTimer
+ * below) since core/src/gamepad_sdl.c's capture result lands on its own
  * background thread, not this one.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
@@ -72,6 +73,16 @@ constexpr int kDiscSize = 150;
  * paintEvent. */
 constexpr int kWedgeSteps = 6;
 
+/* ---- Map mode (see this file's own header) --------------------------------
+ * Hoisted above DiscWidget, unlike the rest of the Map-mode state further
+ * down: DiscWidget's own mouse handlers need to check g_mapState and call
+ * mapSelectTarget directly, the same way makeKey's button lambdas do
+ * (defined after DiscWidget, since it needs g_keyButtons/g_discs, both of
+ * which need a complete widget type to declare). */
+enum class MapState { Idle, PickTarget, WaitInput };
+MapState g_mapState = MapState::Idle;
+void mapSelectTarget(intvsession_key_mapping target);
+
 /* Angles here are ordinary compass/math degrees (0 = East, growing
  * counter-clockwise), converted to Qt's y-DOWN widget coordinates at the
  * point of use: cos for x, MINUS sin for y. */
@@ -90,6 +101,17 @@ public:
         setFixedSize(kDiscSize, kDiscSize);
     }
 
+    /* Map mode's target highlight for this disc -- -1 when this disc isn't
+     * (or is no longer) the map target. Distinct from m_direction, which is
+     * the live position actually being sent to the machine. */
+    void setMapTarget(int dir)
+    {
+        if (dir == m_mapTarget)
+            return;
+        m_mapTarget = dir;
+        update();
+    }
+
 protected:
     void paintEvent(QPaintEvent *) override
     {
@@ -103,31 +125,20 @@ protected:
         p.setPen(Qt::NoPen);
         p.drawEllipse(QPointF(cx, cy), r, r);
 
+        /* The Map-mode target sector, if this disc has one armed -- drawn
+         * before the live wedge below so the live wedge (which Map mode's
+         * own press guard prevents from ever landing on the same sector at
+         * the same time, but the ordering is cheap insurance either way)
+         * stays on top. */
+        if (m_mapTarget >= 0)
+            fillWedge(p, cx, cy, r, m_mapTarget, QColor(242, 166, 38));
+
         /* The held sector: exactly the 22.5 degrees centred on the
          * direction intvsession_disc_from_point returned, so the lit wedge
          * is always the one bounded by the two spokes the pointer is
-         * between -- never wider, never mirrored.
-         *
-         * Drawn as a filled polygon sampled along the arc rather than with
-         * QPainterPath::arcTo: every toolkit in this project has its own
-         * answer to which way an arc sweeps in a y-down surface, and each
-         * of those answers has been wrong in one of these four files at
-         * some point. A polygon has no such convention. At r ~= 71px a
-         * 3.75-degree chord bulges 0.04px inside the true arc. */
-        if (m_direction >= 0) {
-            const double centreDeg =
-                m_direction * INTVSESSION_DISC_SECTOR_DEG;
-            QPolygonF wedge;
-            wedge << QPointF(cx, cy);
-            for (int i = 0; i <= kWedgeSteps; i++) {
-                const double a = centreDeg -
-                                 INTVSESSION_DISC_SECTOR_DEG / 2.0 +
-                                 INTVSESSION_DISC_SECTOR_DEG * i / kWedgeSteps;
-                wedge << discPoint(cx, cy, r, a);
-            }
-            p.setBrush(QColor(77, 140, 230));
-            p.drawPolygon(wedge);
-        }
+         * between -- never wider, never mirrored. */
+        if (m_direction >= 0)
+            fillWedge(p, cx, cy, r, m_direction, QColor(77, 140, 230));
 
         /* One spoke per sector boundary -- 16 of them, at the half-way
          * angles BETWEEN the 16 positions, so each position gets a visible
@@ -146,25 +157,68 @@ protected:
         p.drawEllipse(QPointF(cx, cy), hub, hub);
     }
 
+    /* Map mode's disc half: the same PICK_TARGET/WAIT_INPUT guard the
+     * keypad buttons' makeKey lambdas have (see this file's own header). A
+     * click in the dead hub (intvsession_disc_from_point returning -1)
+     * picks nothing and leaves Map mode armed, the same as clicking the gap
+     * between two keypad buttons would; m_held is never set on that path,
+     * so mouseMoveEvent's own guard below is only a defensive backstop. */
     void mousePressEvent(QMouseEvent *event) override
     {
+        if (g_mapState == MapState::PickTarget) {
+            const double r = kDiscSize / 2.0;
+            const int dir = intvsession_disc_from_point(
+                event->position().x() - r, event->position().y() - r, r);
+            if (dir >= 0)
+                mapSelectTarget(intvsession_target_disc(m_side, dir));
+            return;
+        }
+        if (g_mapState == MapState::WaitInput)
+            return;
         m_held = true;
         updateDirection(event->position());
     }
 
     void mouseMoveEvent(QMouseEvent *event) override
     {
+        if (g_mapState != MapState::Idle)
+            return;
         if (m_held)
             updateDirection(event->position());
     }
 
     void mouseReleaseEvent(QMouseEvent *) override
     {
+        if (g_mapState != MapState::Idle)
+            return;
         m_held = false;
         setDirection(-1);
     }
 
 private:
+    /* Fills the 22.5-degree wedge centred on `dir` (0-15) -- shared by the
+     * live direction and the Map-mode target, drawn in different colours by
+     * paintEvent above. Drawn as a filled polygon sampled along the arc
+     * rather than with QPainterPath::arcTo: every toolkit in this project
+     * has its own answer to which way an arc sweeps in a y-down surface,
+     * and each of those answers has been wrong in one of these four files
+     * at some point. A polygon has no such convention. At r ~= 71px a
+     * 3.75-degree chord bulges 0.04px inside the true arc. */
+    static void fillWedge(QPainter &p, double cx, double cy, double r,
+                          int dir, QColor color)
+    {
+        const double centreDeg = dir * INTVSESSION_DISC_SECTOR_DEG;
+        QPolygonF wedge;
+        wedge << QPointF(cx, cy);
+        for (int i = 0; i <= kWedgeSteps; i++) {
+            const double a = centreDeg - INTVSESSION_DISC_SECTOR_DEG / 2.0 +
+                             INTVSESSION_DISC_SECTOR_DEG * i / kWedgeSteps;
+            wedge << discPoint(cx, cy, r, a);
+        }
+        p.setBrush(color);
+        p.drawPolygon(wedge);
+    }
+
     void updateDirection(QPointF pos)
     {
         const double r = kDiscSize / 2.0;
@@ -184,26 +238,29 @@ private:
     intvsession *m_session;
     intvsession_pad_side m_side;
     int m_direction = -1;
+    int m_mapTarget = -1;
     bool m_held = false;
 };
 
-/* ---- Map mode (see this file's own header) --------------------------------
+/* ---- Map mode continued (see this file's own header) ----------------------
  * File-static, same as g_singleton/g_topLevel below: this window is a
  * singleton, so there is never more than one map sequence in flight, and
  * plain statics let makeKey's per-button lambdas (which capture by value,
  * not `this`) reach the shared state without threading a KeypadWindow*
  * through every helper. */
-enum class MapState { Idle, PickTarget, WaitInput };
-
-MapState g_mapState = MapState::Idle;
-intvsession_pad_side g_mapSide = INTVSESSION_PAD_LEFT;
-intvsession_key g_mapKey = INTVSESSION_KEY_0;
+intvsession_key_mapping g_mapTarget =
+    intvsession_target_key(INTVSESSION_PAD_LEFT, INTVSESSION_KEY_0);
 intvsession *g_mapSession = nullptr;
 QPushButton *g_mapBtn = nullptr;
 QLabel *g_statusLabel = nullptr;
 /* [side][key] -- only INTVSESSION_PAD_LEFT/_RIGHT are ever populated, the
  * two panels this window builds. */
 QPushButton *g_keyButtons[2][INTVSESSION_KEY_COUNT] = {};
+/* [side] -- same two sides, the disc widget each panel builds. QPointer
+ * rather than a raw pointer only for its auto-null-on-destroy safety net;
+ * in practice these never get destroyed, since this window hides rather
+ * than closes (see KeypadWindow::showFor). */
+QPointer<DiscWidget> g_discs[2];
 QTimer *g_gamepadPollTimer = nullptr;
 
 void setHighlighted(QPushButton *btn, bool on)
@@ -227,13 +284,28 @@ void mapSetStatus(const QString &text)
         g_statusLabel->setText(text);
 }
 
+/* Highlights (or clears) whichever target g_mapTarget currently names,
+ * MAP_KEY or MAP_DISC alike -- every setHighlighted(g_keyButtons[...]) call
+ * site below that used to be scoped to a (side,key) pair now goes through
+ * this instead, so Map mode doesn't need two parallel code paths. */
+void mapHighlight(bool on)
+{
+    if (g_mapTarget.kind == INTVSESSION_MAP_KEY) {
+        setHighlighted(g_keyButtons[g_mapTarget.side][g_mapTarget.key], on);
+    } else if (g_mapTarget.kind == INTVSESSION_MAP_DISC) {
+        if (g_discs[g_mapTarget.side])
+            g_discs[g_mapTarget.side]->setMapTarget(on ? g_mapTarget.direction
+                                                       : -1);
+    }
+}
+
 /* Back to MapState::Idle from any state, undoing whatever highlight is
  * showing and disarming gamepad capture -- shared by Map-to-abort, Reset,
  * and the window being hidden/closed mid-sequence. */
 void mapResetUi()
 {
     if (g_mapState == MapState::WaitInput)
-        setHighlighted(g_keyButtons[g_mapSide][g_mapKey], false);
+        mapHighlight(false);
     setHighlighted(g_mapBtn, false);
     g_mapState = MapState::Idle;
     mapSetStatus(QString());
@@ -244,15 +316,14 @@ void mapResetUi()
     }
 }
 
-void mapSelectTarget(intvsession_pad_side side, intvsession_key key)
+void mapSelectTarget(intvsession_key_mapping target)
 {
     char desc[128];
-    intvsession_binding b = intvsession_binding_get(g_mapSession, side, key);
+    intvsession_binding b = intvsession_target_binding_get(g_mapSession, target);
 
-    g_mapSide = side;
-    g_mapKey = key;
+    g_mapTarget = target;
     g_mapState = MapState::WaitInput;
-    setHighlighted(g_keyButtons[side][key], true);
+    mapHighlight(true);
     intvsession_binding_describe(b, desc, sizeof(desc));
     mapSetStatus(QStringLiteral("Currently mapped to %1. Press target key "
                                 "or gamepad button, or press MAP to abort.")
@@ -267,14 +338,15 @@ void mapSelectTarget(intvsession_pad_side side, intvsession_key key)
  * for the status line. */
 void mapFinish(const QString &boundTo, const char *stolen)
 {
-    QString status = QStringLiteral("%1 %2 mapped to %3")
-                         .arg(intvsession_pad_side_name(g_mapSide),
-                             intvsession_pad_key_name(g_mapKey), boundTo);
+    char targetName[128];
+    intvsession_target_name(g_mapTarget, targetName, sizeof(targetName));
+    QString status = QStringLiteral("%1 mapped to %2")
+                         .arg(QString::fromUtf8(targetName), boundTo);
     if (stolen && stolen[0])
         status += QStringLiteral(" (taken from %1)")
                      .arg(QString::fromUtf8(stolen));
 
-    setHighlighted(g_keyButtons[g_mapSide][g_mapKey], false);
+    mapHighlight(false);
     setHighlighted(g_mapBtn, false);
     g_mapState = MapState::Idle;
     if (g_gamepadPollTimer)
@@ -287,8 +359,8 @@ void mapCompleteKey(quint32 keysym)
     char stolen[128];
     char namebuf[64];
 
-    intvsession_binding_set_key(g_mapSession, g_mapSide, g_mapKey, keysym,
-                                stolen, sizeof(stolen));
+    intvsession_target_set_key(g_mapSession, g_mapTarget, keysym, stolen,
+                               sizeof(stolen));
     intvsession_gamepad_capture_cancel(g_mapSession);
     intvsession_keysym_name(keysym, namebuf, sizeof(namebuf));
     mapFinish(QString::fromUtf8(namebuf), stolen);
@@ -298,8 +370,8 @@ void mapCompleteButton(intvsession_pad_button button)
 {
     char stolen[128];
 
-    intvsession_binding_set_button(g_mapSession, g_mapSide, g_mapKey, button,
-                                   stolen, sizeof(stolen));
+    intvsession_target_set_button(g_mapSession, g_mapTarget, button, stolen,
+                                  sizeof(stolen));
     mapFinish(QStringLiteral("Gamepad %1")
                  .arg(intvsession_pad_button_name(button)),
              stolen);
@@ -320,7 +392,7 @@ QPushButton *makeKey(const QString &label, intvsession *session,
     QObject::connect(btn, &QPushButton::pressed, btn,
                      [session, side, key] {
                          if (g_mapState == MapState::PickTarget) {
-                             mapSelectTarget(side, key);
+                             mapSelectTarget(intvsession_target_key(side, key));
                              return;
                          }
                          if (g_mapState == MapState::WaitInput)
@@ -487,8 +559,12 @@ QWidget *KeypadWindow::buildController(intvsession_pad_side side,
     layout->addLayout(actionRow);
 
     auto *discRow = new QHBoxLayout;
+    auto *disc = new DiscWidget(m_session, side);
+    /* Only LEFT/RIGHT panels are ever built (see g_discs' own comment). */
+    if (side == INTVSESSION_PAD_LEFT || side == INTVSESSION_PAD_RIGHT)
+        g_discs[side] = disc;
     discRow->addStretch();
-    discRow->addWidget(new DiscWidget(m_session, side));
+    discRow->addWidget(disc);
     discRow->addStretch();
     layout->addLayout(discRow);
 

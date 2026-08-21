@@ -33,6 +33,28 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.6.0" date="2026-08-21">
+      <description>
+        <p>
+          The keypad window's Map button could rebind any digit or action
+          button but not the direction disc itself: the disc's sixteen
+          positions stayed on their fixed keyboard/stick/D-pad bindings no
+          matter what, so a gamepad had no way to reach the eight half-step
+          positions between the compass directions, and a keyboard layout
+          that didn't suit a given game or player couldn't be changed there
+          either.
+        </p>
+        <p>
+          Map mode now covers all sixteen disc segments on both
+          controllers, the same way it already covers the fifteen digit and
+          action buttons: click Map, click a sector of the disc, then press
+          whichever keyboard key or gamepad button should drive it. The
+          armed sector lights up amber, separate from the blue wedge that
+          shows the disc's live position, and the status line and Reset
+          Bindings work exactly as they already did for keypad buttons.
+        </p>
+      </description>
+    </release>
     <release version="0.5.0" date="2026-08-21">
       <description>
         <p>

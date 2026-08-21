@@ -40,14 +40,15 @@
  * session-wide keyboard hook is needed after all.
  *
  * MAP MODE: a bottom row (MapSelectTarget and friends, near the end of
- * this file) lets a click on any of the 15 digit/action buttons above be
- * rebound to a different keyboard key or gamepad button, through
- * core/src/bindings.c's remappable layer -- see intvsession.h's own
- * "remappable bindings" section for the contract. While armed,
- * PadKeyButton's own -mouseDown:/-mouseUp: (which would normally inject a
- * pad key) instead picks the map target, and IntvKeyWindow's keyInterceptor
- * hook (IntvKeyForward.h) intercepts the next keystroke instead of letting
- * it reach the machine. A gamepad button press is polled for on a short
+ * this file) lets a click on any of the 15 digit/action buttons above, OR
+ * any of the 16 disc segments, be rebound to a different keyboard key or
+ * gamepad button, through core/src/bindings.c's remappable layer -- see
+ * intvsession.h's own "remappable bindings" section for the contract. While
+ * armed, PadKeyButton's own -mouseDown:/-mouseUp: (or DiscView's own mouse
+ * handlers), which would normally inject a pad key or disc direction,
+ * instead pick the map target, and IntvKeyWindow's keyInterceptor hook
+ * (IntvKeyForward.h) intercepts the next keystroke instead of letting it
+ * reach the machine. A gamepad button press is polled for on a short
  * NSTimer (gGamepadPollTimer below) since core/src/gamepad_sdl.c's capture
  * result lands on its own background thread, not this one.
  *
@@ -81,8 +82,7 @@ typedef NS_ENUM(NSInteger, IntvMapState) {
 };
 
 static IntvMapState gMapState = IntvMapIdle;
-static intvsession_pad_side gMapSide;
-static intvsession_key gMapKey;
+static intvsession_key_mapping gMapTarget;
 static intvsession *gMapSession;
 static NSButton *gMapBtn;
 static NSTextField *gStatusLabel;
@@ -91,7 +91,7 @@ static NSTimer *gGamepadPollTimer;
  * two panels this window builds. */
 static NSButton *gKeyButtons[2][INTVSESSION_KEY_COUNT];
 
-static void MapSelectTarget(intvsession_pad_side side, intvsession_key key);
+static void MapSelectTarget(intvsession_key_mapping target);
 static void MapResetUi(void);
 static void MapCompleteButton(intvsession_pad_button button);
 static void MapCompleteKey(uint32_t keysym);
@@ -114,7 +114,7 @@ static void MapCompleteKey(uint32_t keysym);
 {
     (void)event;
     if (gMapState == IntvMapPickTarget) {
-        MapSelectTarget(self.side, self.key);
+        MapSelectTarget(intvsession_target_key(self.side, self.key));
         return;
     }
     if (gMapState == IntvMapWaitInput)
@@ -137,21 +137,40 @@ static void MapCompleteKey(uint32_t keysym);
 @interface DiscView : NSView
 @property(nonatomic, assign) intvsession *session;
 @property(nonatomic, assign) intvsession_pad_side side;
+/* Map mode's target highlight for this disc -- see gDiscs and MapHighlight
+ * below. Declared here (rather than left implementation-only) so a call
+ * through a DiscView*-typed pointer outside -mouseDown:/-drawRect: doesn't
+ * warn. */
+- (void)setMapTarget:(int)dir;
 @end
 
 @implementation DiscView {
     int _direction; /* -1 = centered, else 0-15 (0=E, 4=N, 8=W, 12=S, odd
                      * codes the half-steps between), matching
                      * intv_host.h's disc_codes */
+    int _mapTarget; /* -1 = this disc isn't (or is no longer) the Map-mode
+                     * target, else 0-15: the sector Map mode has armed on
+                     * THIS disc -- distinct from _direction, which is the
+                     * live position actually being sent to the machine. */
     BOOL _held;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame
 {
     self = [super initWithFrame:frame];
-    if (self)
+    if (self) {
         _direction = -1;
+        _mapTarget = -1;
+    }
     return self;
+}
+
+- (void)setMapTarget:(int)dir
+{
+    if (dir == _mapTarget)
+        return;
+    _mapTarget = dir;
+    self.needsDisplay = YES;
 }
 
 /* y increases DOWNWARD in this view, like every other frontend's disc --
@@ -179,16 +198,32 @@ static NSPoint discPoint(double cx, double cy, double radius, double deg)
     self.needsDisplay = YES;
 }
 
+/* Map mode's disc half: the same PickTarget/WaitInput guard PadKeyButton's
+ * own -mouseDown:/-mouseUp: have (see this file's own header). A click in
+ * the dead hub (intvsession_disc_from_point returning -1) picks nothing and
+ * leaves Map mode armed, the same as clicking the gap between two keypad
+ * buttons would; _held is never set on that path, so -mouseDragged:'s own
+ * guard below is only a defensive backstop. */
 - (void)mouseDown:(NSEvent *)event
 {
     NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
     double r = self.bounds.size.width / 2.0;
+    if (gMapState == IntvMapPickTarget) {
+        int dir = intvsession_disc_from_point(p.x - r, p.y - r, r);
+        if (dir >= 0)
+            MapSelectTarget(intvsession_target_disc(self.side, dir));
+        return;
+    }
+    if (gMapState == IntvMapWaitInput)
+        return;
     _held = YES;
     [self setDirection:intvsession_disc_from_point(p.x - r, p.y - r, r)];
 }
 
 - (void)mouseDragged:(NSEvent *)event
 {
+    if (gMapState != IntvMapIdle)
+        return;
     if (!_held)
         return;
     NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
@@ -199,8 +234,34 @@ static NSPoint discPoint(double cx, double cy, double radius, double deg)
 - (void)mouseUp:(NSEvent *)event
 {
     (void)event;
+    if (gMapState != IntvMapIdle)
+        return;
     _held = NO;
     [self setDirection:-1];
+}
+
+/* Fills the 22.5-degree wedge centred on `dir` (0-15) in `color` -- shared
+ * by the live direction and the Map-mode target, drawn in different colours
+ * by -drawRect: below. Drawn as a filled polygon sampled along the arc
+ * rather than with -appendBezierPathWithArcWithCenter:...: every toolkit in
+ * this project has its own answer to which way an arc sweeps -- and in a
+ * flipped view AppKit's answer inverts again. A polygon has no such
+ * convention. At r ~= 71px a 3.75-degree chord bulges 0.04px inside the
+ * true arc. */
+static void discFillWedge(double cx, double cy, double r, int dir,
+                          NSColor *color)
+{
+    double centreDeg = dir * INTVSESSION_DISC_SECTOR_DEG;
+    NSBezierPath *wedge = [NSBezierPath bezierPath];
+    [wedge moveToPoint:NSMakePoint(cx, cy)];
+    for (int i = 0; i <= DISC_WEDGE_STEPS; i++) {
+        double a = centreDeg - INTVSESSION_DISC_SECTOR_DEG / 2.0 +
+                   INTVSESSION_DISC_SECTOR_DEG * i / DISC_WEDGE_STEPS;
+        [wedge lineToPoint:discPoint(cx, cy, r, a)];
+    }
+    [wedge closePath];
+    [color setFill];
+    [wedge fill];
 }
 
 - (void)drawRect:(NSRect)dirty
@@ -222,33 +283,26 @@ static NSPoint discPoint(double cx, double cy, double radius, double deg)
         setFill];
     [disc fill];
 
+    /* The Map-mode target sector, if this disc has one armed -- drawn
+     * before the live wedge below so the live wedge (which Map mode's own
+     * press guard prevents from ever landing on the same sector at the
+     * same time, but the ordering is cheap insurance either way) stays on
+     * top. */
+    if (_mapTarget >= 0)
+        discFillWedge(cx, cy, r, _mapTarget,
+                     [NSColor colorWithCalibratedRed:0.95 green:0.65
+                                                 blue:0.15 alpha:1.0]);
+
     /* The held sector: exactly the 22.5 degrees centred on the direction
      * intvsession_disc_from_point returned, so the lit wedge is always the
      * one bounded by the two spokes the pointer is between. It used to
      * span 67.5 degrees -- three sectors' worth, spilling well past the
      * one actually pressed (the same ~33.75 mistake commit f6eb131 fixed
-     * on GNOME/KDE/Windows and missed here).
-     *
-     * Drawn as a filled polygon sampled along the arc rather than with
-     * -appendBezierPathWithArcWithCenter:...: every toolkit in this
-     * project has its own answer to which way an arc sweeps -- and in a
-     * flipped view AppKit's answer inverts again. A polygon has no such
-     * convention. At r ~= 71px a 3.75-degree chord bulges 0.04px inside
-     * the true arc. */
-    if (_direction >= 0) {
-        double centreDeg = _direction * INTVSESSION_DISC_SECTOR_DEG;
-        NSBezierPath *wedge = [NSBezierPath bezierPath];
-        [wedge moveToPoint:NSMakePoint(cx, cy)];
-        for (int i = 0; i <= DISC_WEDGE_STEPS; i++) {
-            double a = centreDeg - INTVSESSION_DISC_SECTOR_DEG / 2.0 +
-                       INTVSESSION_DISC_SECTOR_DEG * i / DISC_WEDGE_STEPS;
-            [wedge lineToPoint:discPoint(cx, cy, r, a)];
-        }
-        [wedge closePath];
-        [[NSColor colorWithCalibratedRed:0.30 green:0.55 blue:0.90 alpha:1.0]
-            setFill];
-        [wedge fill];
-    }
+     * on GNOME/KDE/Windows and missed here). */
+    if (_direction >= 0)
+        discFillWedge(cx, cy, r, _direction,
+                     [NSColor colorWithCalibratedRed:0.30 green:0.55
+                                                 blue:0.90 alpha:1.0]);
 
     /* One spoke per sector boundary -- 16 of them, at the half-way angles
      * BETWEEN the 16 positions, so each position gets a visible sector of
@@ -275,6 +329,13 @@ static NSPoint discPoint(double cx, double cy, double radius, double deg)
     [center fill];
 }
 @end
+
+/* [side] -- same two sides as gKeyButtons, the disc widget each panel
+ * builds; only LEFT/RIGHT are ever populated. A direct pointer rather than
+ * hunting through the view tree, safe because these views live for the
+ * whole process (this window hides rather than closes, see
+ * +toggleForSession:). */
+static DiscView *gDiscs[2];
 
 /* ---- top-level window ---------------------------------------------------- */
 
@@ -313,13 +374,28 @@ static void MapSetStatus(NSString *text)
         gStatusLabel.stringValue = text ?: @"";
 }
 
+/* Highlights (or clears) whichever target gMapTarget currently names,
+ * MAP_KEY or MAP_DISC alike -- every SetHighlighted(gKeyButtons[...]) call
+ * site below that used to be scoped to a (side,key) pair now goes through
+ * this instead, so Map mode doesn't need two parallel code paths. */
+static void MapHighlight(BOOL on)
+{
+    if (gMapTarget.kind == INTVSESSION_MAP_KEY) {
+        SetHighlighted(gKeyButtons[gMapTarget.side][gMapTarget.key], on);
+    } else if (gMapTarget.kind == INTVSESSION_MAP_DISC) {
+        DiscView *d = gDiscs[gMapTarget.side];
+        if (d)
+            [d setMapTarget:(on ? gMapTarget.direction : -1)];
+    }
+}
+
 /* Back to IntvMapIdle from any state, undoing whatever highlight is showing
  * and disarming gamepad capture -- shared by Map-to-abort, Reset, and the
  * window being hidden mid-sequence. */
 static void MapResetUi(void)
 {
     if (gMapState == IntvMapWaitInput)
-        SetHighlighted(gKeyButtons[gMapSide][gMapKey], NO);
+        MapHighlight(NO);
     SetHighlighted(gMapBtn, NO);
     gMapState = IntvMapIdle;
     MapSetStatus(@"");
@@ -329,15 +405,14 @@ static void MapResetUi(void)
     gGamepadPollTimer = nil;
 }
 
-static void MapSelectTarget(intvsession_pad_side side, intvsession_key key)
+static void MapSelectTarget(intvsession_key_mapping target)
 {
     char desc[128];
-    intvsession_binding b = intvsession_binding_get(gMapSession, side, key);
+    intvsession_binding b = intvsession_target_binding_get(gMapSession, target);
 
-    gMapSide = side;
-    gMapKey = key;
+    gMapTarget = target;
     gMapState = IntvMapWaitInput;
-    SetHighlighted(gKeyButtons[side][key], YES);
+    MapHighlight(YES);
     intvsession_binding_describe(b, desc, sizeof(desc));
     MapSetStatus([NSString
         stringWithFormat:@"Currently mapped to %s. Press target key or "
@@ -364,15 +439,15 @@ static void MapSelectTarget(intvsession_pad_side side, intvsession_key key)
  * for the status line. */
 static void MapFinish(NSString *boundTo, const char *stolen)
 {
+    char targetName[128];
+    intvsession_target_name(gMapTarget, targetName, sizeof(targetName));
     NSString *status = [NSString
-        stringWithFormat:@"%s %s mapped to %@",
-                         intvsession_pad_side_name(gMapSide),
-                         intvsession_pad_key_name(gMapKey), boundTo];
+        stringWithFormat:@"%s mapped to %@", targetName, boundTo];
     if (stolen && stolen[0])
         status = [status
             stringByAppendingFormat:@" (taken from %s)", stolen];
 
-    SetHighlighted(gKeyButtons[gMapSide][gMapKey], NO);
+    MapHighlight(NO);
     SetHighlighted(gMapBtn, NO);
     gMapState = IntvMapIdle;
     [gGamepadPollTimer invalidate];
@@ -385,8 +460,8 @@ static void MapCompleteKey(uint32_t keysym)
     char stolen[128];
     char namebuf[64];
 
-    intvsession_binding_set_key(gMapSession, gMapSide, gMapKey, keysym,
-                                stolen, sizeof(stolen));
+    intvsession_target_set_key(gMapSession, gMapTarget, keysym, stolen,
+                               sizeof(stolen));
     intvsession_gamepad_capture_cancel(gMapSession);
     intvsession_keysym_name(keysym, namebuf, sizeof(namebuf));
     MapFinish([NSString stringWithUTF8String:namebuf], stolen);
@@ -396,8 +471,8 @@ static void MapCompleteButton(intvsession_pad_button button)
 {
     char stolen[128];
 
-    intvsession_binding_set_button(gMapSession, gMapSide, gMapKey, button,
-                                   stolen, sizeof(stolen));
+    intvsession_target_set_button(gMapSession, gMapTarget, button, stolen,
+                                  sizeof(stolen));
     MapFinish([NSString stringWithFormat:@"Gamepad %s",
                                         intvsession_pad_button_name(button)],
              stolen);
@@ -565,6 +640,9 @@ static void MapCompleteButton(intvsession_pad_button button)
     disc.side = side;
     [disc.widthAnchor constraintEqualToConstant:DISC_SIZE].active = YES;
     [disc.heightAnchor constraintEqualToConstant:DISC_SIZE].active = YES;
+    /* Only LEFT/RIGHT panels are ever built (see gDiscs' own comment). */
+    if (side == INTVSESSION_PAD_LEFT || side == INTVSESSION_PAD_RIGHT)
+        gDiscs[side] = disc;
 
     NSStackView *col = [NSStackView stackViewWithViews:@[
         label, digitGrid, actionRow, disc

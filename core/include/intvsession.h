@@ -303,7 +303,10 @@ int intvsession_render_audio(intvsession *s, int16_t *dst, int max_samples);
  * equivalent of holding "UP" and "RIGHT" together to get NE. The 8 primary
  * compass directions are each reachable by a single key (arrows, or the
  * WASD/IJKM-style diagonal keys upstream also binds), so this only costs
- * true simultaneous-key diagonals, not any direction outright. */
+ * true simultaneous-key diagonals, not any direction outright -- and a
+ * keypad window's Map mode (core/src/bindings.c) can put a single key or
+ * gamepad button directly on any of the 8 odd half-steps too, this table
+ * just carries no *default* for them. */
 typedef enum {
     INTVSESSION_KEYSYM_NONE = 0,
     INTVSESSION_KEYSYM_UP = 0x1000,
@@ -367,15 +370,19 @@ intvsession_ecs_key intvsession_ecs_key_from_keysym(uint32_t keysym);
 /* ---- remappable bindings (core/src/bindings.c) -----------------------------
  * intvsession_key_from_keysym above and the gamepad face buttons (core/src/
  * gamepad_sdl.c) are both fixed defaults transcribed from upstream jzIntv.
- * This layer sits above them: a per-(side,key) table, one keyboard slot and
- * one gamepad slot each, seeded from those same defaults and overridable at
- * runtime -- e.g. by a keypad window's "Map" mode. Shared process-wide
- * (jzIntv's own machine is a process singleton, see core/jzintv/intv_host.h)
- * and persisted in the settings store, so a mapping chosen in one frontend is
- * what every other frontend sees.
+ * This layer sits above them: a table of "targets" -- the 15 keypad/action
+ * buttons per side AND the disc's 16 clock positions per side, each with one
+ * keyboard slot and one gamepad slot -- seeded from those same defaults and
+ * overridable at runtime, e.g. by a keypad window's "Map" mode. Shared
+ * process-wide (jzIntv's own machine is a process singleton, see
+ * core/jzintv/intv_host.h) and persisted in the settings store, so a mapping
+ * chosen in one frontend is what every other frontend sees.
  *
- * The disc is deliberately NOT remappable here -- it stays on its fixed
- * keyboard/stick/D-pad bindings. */
+ * A target is exactly an intvsession_key_mapping (below): kind MAP_KEY names
+ * a (side,key), kind MAP_DISC names a (side,direction). intvsession_target_key
+ * and intvsession_target_disc build one of each; every other function in this
+ * section takes that struct rather than a bare (side,key) pair so the same
+ * calls work for both kinds. */
 
 /* Mirrors SDL3's SDL_GamepadButton numbering (gamepad_sdl.c translates
  * explicitly rather than casting) but declared here so this header, and
@@ -399,30 +406,38 @@ typedef struct {
                                     * binding */
 } intvsession_binding;
 
-intvsession_binding intvsession_binding_get(intvsession *s,
-        intvsession_pad_side side, intvsession_key key);
+/* Builds a Map target naming a keypad/action button, or one of the disc's 16
+ * clock positions (0-15, see intvsession_disc_from_point above). Pure
+ * constructors -- no session needed. */
+intvsession_key_mapping intvsession_target_key(intvsession_pad_side side,
+                                               intvsession_key key);
+intvsession_key_mapping intvsession_target_disc(intvsession_pad_side side,
+                                                int direction);
 
-/* Binds keysym/button to (side,key), first clearing it from wherever it was
- * previously bound (a keysym/button drives exactly one pad key at a time).
+intvsession_binding intvsession_target_binding_get(intvsession *s,
+        intvsession_key_mapping target);
+
+/* Binds keysym/button to `target`, first clearing it from wherever it was
+ * previously bound (a keysym/button drives exactly one target at a time).
  * If `stolen` is non-NULL, writes a description of what it was taken from
  * ("" if it was unbound) -- e.g. "Left disc East" or "Right 5" -- null
  * terminated within stolensz. Persists immediately. */
-void intvsession_binding_set_key(intvsession *s, intvsession_pad_side side,
-        intvsession_key key, uint32_t keysym, char *stolen, int stolensz);
-void intvsession_binding_set_button(intvsession *s, intvsession_pad_side side,
-        intvsession_key key, intvsession_pad_button button,
-        char *stolen, int stolensz);
+void intvsession_target_set_key(intvsession *s, intvsession_key_mapping target,
+        uint32_t keysym, char *stolen, int stolensz);
+void intvsession_target_set_button(intvsession *s, intvsession_key_mapping target,
+        intvsession_pad_button button, char *stolen, int stolensz);
 
-/* Restores every binding to its upstream default and persists that. */
+/* Restores every binding (keypad, action buttons, and disc alike) to its
+ * upstream default and persists that. */
 void intvsession_bindings_reset(intvsession *s);
 
 /* Same contract as intvsession_key_from_keysym, but honouring the bindings
- * table: returns the pad key currently bound to keysym (MAP_KEY), or the
- * fixed disc mapping (MAP_DISC, never remapped), or MAP_NONE -- including
- * when keysym's *default* pad-key target has been remapped away to a
- * different input, unlike the pure function above which would still report
- * it. Frontends should call this one; intvsession_key_from_keysym remains
- * the pure default-table lookup bindings.c itself seeds from. */
+ * table: returns keysym's current target, MAP_KEY or MAP_DISC, wherever it
+ * has been remapped to (including when keysym's *default* target has been
+ * remapped away to a different input, unlike the pure function above which
+ * would still report it), or MAP_NONE if keysym drives nothing at all.
+ * Frontends should call this one; intvsession_key_from_keysym remains the
+ * pure default-table lookup bindings.c itself seeds from. */
 intvsession_key_mapping intvsession_key_from_keysym_bound(intvsession *s,
                                                           uint32_t keysym);
 
@@ -433,11 +448,32 @@ int         intvsession_keysym_name(uint32_t keysym, char *dst, int dstsz);
 const char *intvsession_pad_button_name(intvsession_pad_button button);
 const char *intvsession_pad_key_name(intvsession_key key);        /* "5", "Clear", "Top" */
 const char *intvsession_pad_side_name(intvsession_pad_side side); /* "Left" */
+/* "East", "ENE", "Northeast", ... one of the 16 compass/half-step names for
+ * a disc clock position (0-15); "?" out of range. */
+const char *intvsession_disc_dir_name(int direction);
+
+/* Names a target itself, e.g. "Left 5", "Left disc East", "Right disc ENE";
+ * "" for a MAP_NONE target. Returns the string length. */
+int intvsession_target_name(intvsession_key_mapping target, char *dst,
+                            int dstsz);
 
 /* Describes a full binding pair, e.g. "Numpad 5 / Gamepad A", "Numpad 5",
  * "Gamepad A", or "nothing" if both slots are empty. Returns the string
  * length. */
 int intvsession_binding_describe(intvsession_binding b, char *dst, int dstsz);
+
+/* ---- back-compat wrappers, (side,key) only ---------------------------------
+ * Thin shims over the target-based API above, scoped to MAP_KEY targets --
+ * kept for callers that only ever dealt with keypad/action buttons, never the
+ * disc. New code should prefer the intvsession_target_* functions, which work
+ * for both. */
+intvsession_binding intvsession_binding_get(intvsession *s,
+        intvsession_pad_side side, intvsession_key key);
+void intvsession_binding_set_key(intvsession *s, intvsession_pad_side side,
+        intvsession_key key, uint32_t keysym, char *stolen, int stolensz);
+void intvsession_binding_set_button(intvsession *s, intvsession_pad_side side,
+        intvsession_key key, intvsession_pad_button button,
+        char *stolen, int stolensz);
 
 /* ---- gamepad capture (for a Map mode's "press a gamepad button" step) -----
  * SDL's gamepad events arrive on gamepad_sdl.c's own background thread, which

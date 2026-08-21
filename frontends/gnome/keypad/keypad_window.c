@@ -25,12 +25,13 @@
  * whichever window the window manager currently has focused.
  *
  * MAP MODE: a bottom row (map_select_target and friends, near the end of
- * this file) lets a click on any of the 15 digit/action buttons above be
- * rebound to a different keyboard key or gamepad button, through
- * core/src/bindings.c's remappable layer -- see intvsession.h's own
- * "remappable bindings" section for the contract. While armed, the same
- * GtkGestureClick press/release pair that would normally inject a pad key
- * instead picks the map target (key_pressed/key_released both check
+ * this file) lets a click on any of the 15 digit/action buttons above, OR
+ * any of the 16 disc segments, be rebound to a different keyboard key or
+ * gamepad button, through core/src/bindings.c's remappable layer -- see
+ * intvsession.h's own "remappable bindings" section for the contract. While
+ * armed, the same GtkGestureClick press/release pair that would normally
+ * inject a pad key or disc direction instead picks the map target
+ * (key_pressed/key_released and disc_pressed/disc_released all check
  * g_map_state first), and forward_key's own keyboard capture (also gated on
  * g_map_state) intercepts the next keystroke instead of forwarding it to
  * the machine. A gamepad button press is polled for on a short GLib timeout
@@ -59,6 +60,10 @@ typedef struct {
     intvsession *session;
     intvsession_pad_side side;
     int direction;   /* -1 = centered, else 0-15 (0 = East, clockwise) */
+    int map_target;  /* -1 = not the map target, else 0-15: the sector Map
+                      * mode has armed on THIS disc (see disc_set_map_target
+                      * below) -- distinct from `direction`, which is the
+                      * live position actually being sent to the machine. */
     gboolean held;
 } DiscState;
 
@@ -70,7 +75,12 @@ static intvsession *g_session;
  * highlight the button for whichever (side,key) is currently the map
  * target, indexed directly by intvsession_pad_side/intvsession_key -- only
  * INTVSESSION_PAD_LEFT/_RIGHT are ever populated here, the two panels this
- * window builds. */
+ * window builds. g_discs[side] is the disc widget's own DiscState* for the
+ * same two sides, populated by make_disc below -- a direct pointer rather
+ * than another g_object_get_data lookup, safe because the widget (and so
+ * the state g_object_set_data_full ties its lifetime to) lives for the
+ * whole process: this window is a singleton that hides rather than
+ * destroys itself. */
 typedef enum {
     INTV_MAP_IDLE = 0,        /* normal play */
     INTV_MAP_PICK_TARGET,     /* Map armed, waiting for a keypad button click */
@@ -78,12 +88,35 @@ typedef enum {
 } IntvMapState;
 
 static IntvMapState g_map_state = INTV_MAP_IDLE;
-static intvsession_pad_side g_map_side;
-static intvsession_key g_map_key;
+static intvsession_key_mapping g_map_target;
 static GtkWidget *g_map_btn;
 static GtkWidget *g_status_label;
 static GtkWidget *g_key_buttons[2][INTVSESSION_KEY_COUNT];
+static DiscState *g_discs[2];
 static guint g_gamepad_poll_id;
+
+/* Highlights (or clears) whichever target g_map_target currently names,
+ * MAP_KEY or MAP_DISC alike -- every set_highlighted(g_key_buttons[...])
+ * call site below that used to be scoped to a (side,key) pair now goes
+ * through this instead, so Map mode doesn't need two parallel code paths. */
+static void map_highlight(gboolean on)
+{
+    if (g_map_target.kind == INTVSESSION_MAP_KEY) {
+        GtkWidget *w = g_key_buttons[g_map_target.side][g_map_target.key];
+        if (w) {
+            if (on)
+                gtk_widget_add_css_class(w, "suggested-action");
+            else
+                gtk_widget_remove_css_class(w, "suggested-action");
+        }
+    } else if (g_map_target.kind == INTVSESSION_MAP_DISC) {
+        DiscState *d = g_discs[g_map_target.side];
+        if (d) {
+            d->map_target = on ? g_map_target.direction : -1;
+            gtk_widget_queue_draw(d->area);
+        }
+    }
+}
 
 /* "suggested-action" is libadwaita's own accent style class (used elsewhere
  * for e.g. dialog default buttons) -- reused here rather than defining a
@@ -115,21 +148,18 @@ static gboolean gamepad_poll_tick(gpointer user_data)
         return G_SOURCE_CONTINUE;
 
     {
-        char stolen[128], status[256];
-        intvsession_binding_set_button(g_session, g_map_side, g_map_key,
-                                       button, stolen, sizeof(stolen));
+        char stolen[128], target[128], status[256];
+        intvsession_target_set_button(g_session, g_map_target, button, stolen,
+                                      sizeof(stolen));
+        intvsession_target_name(g_map_target, target, sizeof(target));
         if (stolen[0])
             g_snprintf(status, sizeof(status),
-                      "%s %s mapped to Gamepad %s (taken from %s)",
-                      intvsession_pad_side_name(g_map_side),
-                      intvsession_pad_key_name(g_map_key),
+                      "%s mapped to Gamepad %s (taken from %s)", target,
                       intvsession_pad_button_name(button), stolen);
         else
-            g_snprintf(status, sizeof(status), "%s %s mapped to Gamepad %s",
-                      intvsession_pad_side_name(g_map_side),
-                      intvsession_pad_key_name(g_map_key),
-                      intvsession_pad_button_name(button));
-        set_highlighted(g_key_buttons[g_map_side][g_map_key], FALSE);
+            g_snprintf(status, sizeof(status), "%s mapped to Gamepad %s",
+                      target, intvsession_pad_button_name(button));
+        map_highlight(FALSE);
         set_highlighted(g_map_btn, FALSE);
         g_map_state = INTV_MAP_IDLE;
         map_set_status(status);
@@ -152,7 +182,7 @@ static void ensure_gamepad_poll(void)
 static void map_reset_ui(void)
 {
     if (g_map_state == INTV_MAP_WAIT_INPUT)
-        set_highlighted(g_key_buttons[g_map_side][g_map_key], FALSE);
+        map_highlight(FALSE);
     set_highlighted(g_map_btn, FALSE);
     g_map_state = INTV_MAP_IDLE;
     map_set_status("");
@@ -164,15 +194,14 @@ static void map_reset_ui(void)
     }
 }
 
-static void map_select_target(intvsession_pad_side side, intvsession_key key)
+static void map_select_target(intvsession_key_mapping target)
 {
     char desc[128], status[256];
-    intvsession_binding b = intvsession_binding_get(g_session, side, key);
+    intvsession_binding b = intvsession_target_binding_get(g_session, target);
 
-    g_map_side = side;
-    g_map_key = key;
+    g_map_target = target;
     g_map_state = INTV_MAP_WAIT_INPUT;
-    set_highlighted(g_key_buttons[side][key], TRUE);
+    map_highlight(TRUE);
     intvsession_binding_describe(b, desc, sizeof(desc));
     g_snprintf(status, sizeof(status),
               "Currently mapped to %s. Press target key or gamepad "
@@ -188,21 +217,19 @@ static void map_select_target(intvsession_pad_side side, intvsession_key key)
  * above (bindings.c) header describes. */
 static void map_complete_key(uint32_t keysym)
 {
-    char stolen[128], namebuf[64], status[256];
+    char stolen[128], namebuf[64], target[128], status[256];
 
-    intvsession_binding_set_key(g_session, g_map_side, g_map_key, keysym,
-                                stolen, sizeof(stolen));
+    intvsession_target_set_key(g_session, g_map_target, keysym, stolen,
+                               sizeof(stolen));
     intvsession_keysym_name(keysym, namebuf, sizeof(namebuf));
+    intvsession_target_name(g_map_target, target, sizeof(target));
     if (stolen[0])
-        g_snprintf(status, sizeof(status), "%s %s mapped to %s (taken from %s)",
-                  intvsession_pad_side_name(g_map_side),
-                  intvsession_pad_key_name(g_map_key), namebuf, stolen);
+        g_snprintf(status, sizeof(status), "%s mapped to %s (taken from %s)",
+                  target, namebuf, stolen);
     else
-        g_snprintf(status, sizeof(status), "%s %s mapped to %s",
-                  intvsession_pad_side_name(g_map_side),
-                  intvsession_pad_key_name(g_map_key), namebuf);
+        g_snprintf(status, sizeof(status), "%s mapped to %s", target, namebuf);
 
-    set_highlighted(g_key_buttons[g_map_side][g_map_key], FALSE);
+    map_highlight(FALSE);
     set_highlighted(g_map_btn, FALSE);
     g_map_state = INTV_MAP_IDLE;
     intvsession_gamepad_capture_cancel(g_session);
@@ -266,6 +293,12 @@ static void disc_set_direction(DiscState *d, int dir)
     gtk_widget_queue_draw(d->area);
 }
 
+/* Map mode's disc half: the same PICK_TARGET/WAIT_INPUT guard the keypad
+ * buttons' key_pressed/key_released have (see this file's own header). A
+ * click in the dead hub (intvsession_disc_from_point returning -1) picks
+ * nothing and leaves Map mode armed, the same as clicking the gap between
+ * two keypad buttons would. Never sets `held`, so disc_motion's own guard
+ * below is only a defensive backstop, not load-bearing. */
 static void disc_pressed(GtkGestureClick *g, int n_press, double x, double y,
                          gpointer user_data)
 {
@@ -273,6 +306,14 @@ static void disc_pressed(GtkGestureClick *g, int n_press, double x, double y,
     double r = DISC_SIZE / 2.0;
     (void)g;
     (void)n_press;
+    if (g_map_state == INTV_MAP_PICK_TARGET) {
+        int dir = intvsession_disc_from_point(x - r, y - r, r);
+        if (dir >= 0)
+            map_select_target(intvsession_target_disc(d->side, dir));
+        return;
+    }
+    if (g_map_state == INTV_MAP_WAIT_INPUT)
+        return;
     d->held = TRUE;
     disc_set_direction(d, intvsession_disc_from_point(x - r, y - r, r));
 }
@@ -285,6 +326,8 @@ static void disc_released(GtkGestureClick *g, int n_press, double x, double y,
     (void)n_press;
     (void)x;
     (void)y;
+    if (g_map_state != INTV_MAP_IDLE)
+        return;
     d->held = FALSE;
     disc_set_direction(d, -1);
 }
@@ -295,9 +338,39 @@ static void disc_motion(GtkEventControllerMotion *c, double x, double y,
     DiscState *d = user_data;
     double r = DISC_SIZE / 2.0;
     (void)c;
+    if (g_map_state != INTV_MAP_IDLE)
+        return;
     if (!d->held)
         return;
     disc_set_direction(d, intvsession_disc_from_point(x - r, y - r, r));
+}
+
+/* Fills the 22.5-degree wedge centred on `dir` (0-15) -- shared by the live
+ * direction and the Map-mode target, which are drawn in different colours
+ * at different points in disc_draw below. Drawn as a filled polygon sampled
+ * along the arc rather than with cairo_arc: every toolkit in this project
+ * has its own answer to which way an arc sweeps in a y-down surface
+ * (cairo's grows clockwise here, Qt's counter-clockwise, GDI's is a
+ * documentation argument), and each of those answers has been wrong in one
+ * of these four files at some point. A polygon has no such convention. At
+ * r ~= 71px a 3.75-degree chord bulges 0.04px inside the true arc --
+ * invisible. Caller has already set the source colour. */
+static void disc_fill_wedge(cairo_t *cr, double cx, double cy, double r,
+                            int dir)
+{
+    const double centre_deg = dir * INTVSESSION_DISC_SECTOR_DEG;
+    double x, y;
+    int i;
+
+    cairo_move_to(cr, cx, cy);
+    for (i = 0; i <= DISC_WEDGE_STEPS; i++) {
+        double a = centre_deg - INTVSESSION_DISC_SECTOR_DEG / 2.0 +
+                   INTVSESSION_DISC_SECTOR_DEG * i / DISC_WEDGE_STEPS;
+        disc_point(cx, cy, r, a, &x, &y);
+        cairo_line_to(cr, x, y);
+    }
+    cairo_close_path(cr);
+    cairo_fill(cr);
 }
 
 static void disc_draw(GtkDrawingArea *area, cairo_t *cr, int w, int h,
@@ -314,30 +387,22 @@ static void disc_draw(GtkDrawingArea *area, cairo_t *cr, int w, int h,
     cairo_arc(cr, cx, cy, r, 0, 2 * M_PI);
     cairo_fill(cr);
 
+    /* The Map-mode target sector, if this disc has one armed -- drawn
+     * before the live wedge so the live wedge (which Map mode's own press
+     * guard prevents from ever landing on the same sector at the same
+     * time, but the ordering is cheap insurance either way) stays on top. */
+    if (d->map_target >= 0) {
+        cairo_set_source_rgb(cr, 0.95, 0.65, 0.15);
+        disc_fill_wedge(cr, cx, cy, r, d->map_target);
+    }
+
     /* The held sector: exactly the 22.5 degrees centred on the direction
      * intvsession_disc_from_point returned, so the lit wedge is always the
      * one bounded by the two spokes the pointer is between -- never wider,
-     * never mirrored.
-     *
-     * Drawn as a filled polygon sampled along the arc rather than with
-     * cairo_arc: every toolkit in this project has its own answer to which
-     * way an arc sweeps in a y-down surface (cairo's grows clockwise here,
-     * Qt's counter-clockwise, GDI's is a documentation argument), and each
-     * of those answers has been wrong in one of these four files at some
-     * point. A polygon has no such convention. At r ~= 71px a 3.75-degree
-     * chord bulges 0.04px inside the true arc -- invisible. */
+     * never mirrored. */
     if (d->direction >= 0) {
-        const double centre_deg = d->direction * INTVSESSION_DISC_SECTOR_DEG;
         cairo_set_source_rgb(cr, 0.30, 0.55, 0.90);
-        cairo_move_to(cr, cx, cy);
-        for (i = 0; i <= DISC_WEDGE_STEPS; i++) {
-            double a = centre_deg - INTVSESSION_DISC_SECTOR_DEG / 2.0 +
-                       INTVSESSION_DISC_SECTOR_DEG * i / DISC_WEDGE_STEPS;
-            disc_point(cx, cy, r, a, &x, &y);
-            cairo_line_to(cr, x, y);
-        }
-        cairo_close_path(cr);
-        cairo_fill(cr);
+        disc_fill_wedge(cr, cx, cy, r, d->direction);
     }
 
     /* One spoke per sector boundary -- 16 of them, at the half-way angles
@@ -371,11 +436,15 @@ static GtkWidget *make_disc(intvsession *session, intvsession_pad_side side)
     d->session = session;
     d->side = side;
     d->direction = -1;
+    d->map_target = -1;
     d->area = gtk_drawing_area_new();
     gtk_widget_set_size_request(d->area, DISC_SIZE, DISC_SIZE);
     gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(d->area), disc_draw, d,
                                    NULL);
     g_object_set_data_full(G_OBJECT(d->area), "disc-state", d, g_free);
+    /* Only LEFT/RIGHT panels are ever built (see g_discs' own comment). */
+    if (side == INTVSESSION_PAD_LEFT || side == INTVSESSION_PAD_RIGHT)
+        g_discs[side] = d;
 
     click = gtk_gesture_click_new();
     g_signal_connect(click, "pressed", G_CALLBACK(disc_pressed), d);
@@ -413,7 +482,7 @@ static void key_pressed(GtkGestureClick *g, int n_press, double x, double y,
     (void)x;
     (void)y;
     if (g_map_state == INTV_MAP_PICK_TARGET) {
-        map_select_target(kb->side, kb->key);
+        map_select_target(intvsession_target_key(kb->side, kb->key));
         return;
     }
     if (g_map_state == INTV_MAP_WAIT_INPUT)

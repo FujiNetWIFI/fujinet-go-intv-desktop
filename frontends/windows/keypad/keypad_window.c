@@ -34,20 +34,21 @@
  * GetAncestor(..., GA_ROOT) rather than which child currently has focus.
  *
  * MAP MODE: a bottom row (map_select_target and friends, near the end of
- * this file) lets a click on any of the 15 digit/action buttons above be
- * rebound to a different keyboard key or gamepad button, through
- * core/src/bindings.c's remappable layer -- see intvsession.h's own
- * "remappable bindings" section for the contract. While armed,
- * map_intercept_key_msg (checked ahead of intv_forward_key_msg in
+ * this file) lets a click on any of the 15 digit/action buttons above, OR
+ * any of the 16 disc segments, be rebound to a different keyboard key or
+ * gamepad button, through core/src/bindings.c's remappable layer -- see
+ * intvsession.h's own "remappable bindings" section for the contract. While
+ * armed, map_intercept_key_msg (checked ahead of intv_forward_key_msg in
  * intv_keypad_pretranslate below) swallows the next keystroke for the
- * mapping instead of letting it reach the machine, and key_btn_proc's own
- * WM_LBUTTONDOWN handling picks the map target instead of injecting a pad
- * key. Highlight is BM_SETSTATE (the native "pressed" look, driven
- * programmatically, rather than an owner-draw custom style) on the Map
- * button and whichever keypad button is the current target. A gamepad
- * button press is polled for on a short WM_TIMER (IDT_GAMEPAD_POLL below)
- * since core/src/gamepad_sdl.c's capture result lands on its own
- * background thread, not this window's.
+ * mapping instead of letting it reach the machine, and key_btn_proc's/
+ * disc_proc's own WM_LBUTTONDOWN handling picks the map target instead of
+ * injecting a pad key or disc direction. Highlight is BM_SETSTATE (the
+ * native "pressed" look, driven programmatically, rather than an owner-draw
+ * custom style) on the Map button and whichever keypad button is the
+ * current target, or an amber wedge on the disc when the target is a disc
+ * segment. A gamepad button press is polled for on a short WM_TIMER
+ * (IDT_GAMEPAD_POLL below) since core/src/gamepad_sdl.c's capture result
+ * lands on its own background thread, not this window's.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -85,8 +86,15 @@ typedef struct {
 typedef struct {
     intvsession *session;
     intvsession_pad_side side;
-    int direction; /* -1 = centered, else 0-15 (0 = East, clockwise) */
+    int direction;   /* -1 = centered, else 0-15 (0 = East, clockwise) */
+    int map_target;  /* -1 = not the map target, else 0-15: the sector Map
+                      * mode has armed on THIS disc -- distinct from
+                      * `direction`, which is the live position actually
+                      * being sent to the machine. */
     int held;
+    HWND hwnd;        /* this disc's own window, for map_highlight's
+                       * InvalidateRect -- the state doesn't otherwise carry
+                       * it (disc_proc looks itself up via GWLP_USERDATA). */
 } disc_state;
 
 static HWND g_win;
@@ -105,14 +113,18 @@ typedef enum {
 #define IDT_GAMEPAD_POLL 1
 
 static map_state_t g_map_state = MAP_IDLE;
-static intvsession_pad_side g_map_side;
-static intvsession_key g_map_key;
+static intvsession_key_mapping g_map_target;
 static intvsession *g_map_session;
 static HWND g_map_btn;
 static HWND g_status_label;
 /* [side][key] -- only INTVSESSION_PAD_LEFT/_RIGHT are ever populated, the
  * two panels this window builds. */
 static HWND g_key_buttons[2][INTVSESSION_KEY_COUNT];
+/* [side] -- same two sides, this window's own disc_state* for each panel's
+ * disc, a direct pointer rather than another GWLP_USERDATA lookup, safe
+ * because the disc windows live for the whole process (this window hides
+ * rather than destroys itself). */
+static disc_state *g_discs[2];
 
 /* BM_SETSTATE forces a BUTTON control's native "pressed" rendering without
  * changing any check state or simulating a click -- exactly the
@@ -130,13 +142,32 @@ static void map_set_status(const char *text)
         SetWindowTextA(g_status_label, text ? text : "");
 }
 
+/* Highlights (or clears) whichever target g_map_target currently names,
+ * MAP_KEY or MAP_DISC alike -- every set_highlighted(g_key_buttons[...])
+ * call site below that used to be scoped to a (side,key) pair now goes
+ * through this instead, so Map mode doesn't need two parallel code paths. */
+static void map_highlight(int on)
+{
+    if (g_map_target.kind == INTVSESSION_MAP_KEY) {
+        set_highlighted(g_key_buttons[g_map_target.side][g_map_target.key],
+                        on);
+    } else if (g_map_target.kind == INTVSESSION_MAP_DISC) {
+        disc_state *d = g_discs[g_map_target.side];
+        if (d) {
+            d->map_target = on ? g_map_target.direction : -1;
+            if (d->hwnd)
+                InvalidateRect(d->hwnd, NULL, FALSE);
+        }
+    }
+}
+
 /* Back to MAP_IDLE from any state, undoing whatever highlight is showing
  * and disarming gamepad capture -- shared by Map-to-abort, Reset, and the
  * window being hidden/closed mid-sequence. */
 static void map_reset_ui(void)
 {
     if (g_map_state == MAP_WAIT_INPUT)
-        set_highlighted(g_key_buttons[g_map_side][g_map_key], 0);
+        map_highlight(0);
     set_highlighted(g_map_btn, 0);
     g_map_state = MAP_IDLE;
     map_set_status("");
@@ -146,15 +177,15 @@ static void map_reset_ui(void)
         KillTimer(g_win, IDT_GAMEPAD_POLL);
 }
 
-static void map_select_target(intvsession_pad_side side, intvsession_key key)
+static void map_select_target(intvsession_key_mapping target)
 {
     char desc[128], status[256];
-    intvsession_binding b = intvsession_binding_get(g_map_session, side, key);
+    intvsession_binding b = intvsession_target_binding_get(g_map_session,
+                                                            target);
 
-    g_map_side = side;
-    g_map_key = key;
+    g_map_target = target;
     g_map_state = MAP_WAIT_INPUT;
-    set_highlighted(g_key_buttons[side][key], 1);
+    map_highlight(1);
     intvsession_binding_describe(b, desc, sizeof(desc));
     snprintf(status, sizeof(status),
             "Currently mapped to %s. Press target key or gamepad button, "
@@ -171,18 +202,16 @@ static void map_select_target(intvsession_pad_side side, intvsession_key key)
  * for the status line. */
 static void map_finish(const char *bound_to, const char *stolen)
 {
-    char status[256];
+    char target[128], status[256];
 
+    intvsession_target_name(g_map_target, target, sizeof(target));
     if (stolen && stolen[0])
-        snprintf(status, sizeof(status), "%s %s mapped to %s (taken from %s)",
-                intvsession_pad_side_name(g_map_side),
-                intvsession_pad_key_name(g_map_key), bound_to, stolen);
+        snprintf(status, sizeof(status), "%s mapped to %s (taken from %s)",
+                target, bound_to, stolen);
     else
-        snprintf(status, sizeof(status), "%s %s mapped to %s",
-                intvsession_pad_side_name(g_map_side),
-                intvsession_pad_key_name(g_map_key), bound_to);
+        snprintf(status, sizeof(status), "%s mapped to %s", target, bound_to);
 
-    set_highlighted(g_key_buttons[g_map_side][g_map_key], 0);
+    map_highlight(0);
     set_highlighted(g_map_btn, 0);
     g_map_state = MAP_IDLE;
     if (g_win)
@@ -194,8 +223,8 @@ static void map_complete_key(uint32_t keysym)
 {
     char stolen[128], namebuf[64];
 
-    intvsession_binding_set_key(g_map_session, g_map_side, g_map_key, keysym,
-                                stolen, sizeof(stolen));
+    intvsession_target_set_key(g_map_session, g_map_target, keysym, stolen,
+                               sizeof(stolen));
     intvsession_gamepad_capture_cancel(g_map_session);
     intvsession_keysym_name(keysym, namebuf, sizeof(namebuf));
     map_finish(namebuf, stolen);
@@ -205,8 +234,8 @@ static void map_complete_button(intvsession_pad_button button)
 {
     char stolen[128], boundto[64];
 
-    intvsession_binding_set_button(g_map_session, g_map_side, g_map_key,
-                                   button, stolen, sizeof(stolen));
+    intvsession_target_set_button(g_map_session, g_map_target, button, stolen,
+                                  sizeof(stolen));
     snprintf(boundto, sizeof(boundto), "Gamepad %s",
              intvsession_pad_button_name(button));
     map_finish(boundto, stolen);
@@ -259,13 +288,41 @@ static void disc_set_direction(HWND hwnd, disc_state *s, int dir)
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
+/* Fills the 22.5-degree wedge centred on `dir` (0-15) into hdc, whatever
+ * brush is currently selected -- shared by the live direction and the
+ * Map-mode target, which disc_paint below selects a different brush for
+ * before each call. Drawn as a filled Polygon sampled along the arc rather
+ * than with Pie(): every toolkit in this project has its own answer to
+ * which way an arc sweeps in a y-down surface, and GDI's is the murkiest of
+ * the four -- its arc direction is documented as counter-clockwise, but
+ * relative to a logical coordinate system whose y axis points the other
+ * way from the screen's, so which of the two radials is the start is a
+ * coin toss that decides between a 22.5-degree wedge and a 337.5-degree
+ * one. A polygon has no such convention. At r ~= 71px a 3.75-degree chord
+ * bulges 0.04px inside the true arc. */
+static void disc_fill_wedge(HDC hdc, int cx, int cy, int r, int dir)
+{
+    double centre_deg = dir * INTVSESSION_DISC_SECTOR_DEG;
+    POINT wedge[DISC_WEDGE_STEPS + 2];
+    int i;
+
+    wedge[0].x = cx;
+    wedge[0].y = cy;
+    for (i = 0; i <= DISC_WEDGE_STEPS; i++) {
+        double a = centre_deg - INTVSESSION_DISC_SECTOR_DEG / 2.0 +
+                   INTVSESSION_DISC_SECTOR_DEG * i / DISC_WEDGE_STEPS;
+        wedge[i + 1] = disc_point(cx, cy, r, a);
+    }
+    Polygon(hdc, wedge, DISC_WEDGE_STEPS + 2);
+}
+
 static void disc_paint(HWND hwnd, disc_state *s)
 {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
     RECT c;
     int cx, cy, r, hub;
-    HBRUSH bg, hi, center;
+    HBRUSH bg, hi, target, center;
     HPEN pen, oldPen;
     HBRUSH oldBrush;
     int i;
@@ -278,6 +335,7 @@ static void disc_paint(HWND hwnd, disc_state *s)
 
     bg = CreateSolidBrush(RGB(38, 38, 43));
     hi = CreateSolidBrush(RGB(77, 140, 230));
+    target = CreateSolidBrush(RGB(242, 166, 38));
     center = CreateSolidBrush(RGB(64, 64, 71));
     pen = CreatePen(PS_SOLID, 1, RGB(115, 115, 128));
 
@@ -290,31 +348,22 @@ static void disc_paint(HWND hwnd, disc_state *s)
     oldPen = (HPEN)SelectObject(hdc, GetStockObject(NULL_PEN));
     Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
 
+    /* The Map-mode target sector, if this disc has one armed -- drawn
+     * before the live wedge below so the live wedge (which Map mode's own
+     * press guard prevents from ever landing on the same sector at the
+     * same time, but the ordering is cheap insurance either way) stays on
+     * top. */
+    if (s->map_target >= 0) {
+        SelectObject(hdc, target);
+        disc_fill_wedge(hdc, cx, cy, r, s->map_target);
+    }
+
     /* The held sector: exactly the 22.5 degrees centred on the direction
      * intvsession_disc_from_point returned, so the lit wedge is always the
-     * one bounded by the two spokes the pointer is between.
-     *
-     * Drawn as a filled Polygon sampled along the arc rather than with
-     * Pie(): every toolkit in this project has its own answer to which way
-     * an arc sweeps in a y-down surface, and GDI's is the murkiest of the
-     * four -- its arc direction is documented as counter-clockwise, but
-     * relative to a logical coordinate system whose y axis points the
-     * other way from the screen's, so which of the two radials is the
-     * start is a coin toss that decides between a 22.5-degree wedge and a
-     * 337.5-degree one. A polygon has no such convention. At r ~= 71px a
-     * 3.75-degree chord bulges 0.04px inside the true arc. */
+     * one bounded by the two spokes the pointer is between. */
     if (s->direction >= 0) {
-        double centre_deg = s->direction * INTVSESSION_DISC_SECTOR_DEG;
-        POINT wedge[DISC_WEDGE_STEPS + 2];
-        wedge[0].x = cx;
-        wedge[0].y = cy;
-        for (i = 0; i <= DISC_WEDGE_STEPS; i++) {
-            double a = centre_deg - INTVSESSION_DISC_SECTOR_DEG / 2.0 +
-                       INTVSESSION_DISC_SECTOR_DEG * i / DISC_WEDGE_STEPS;
-            wedge[i + 1] = disc_point(cx, cy, r, a);
-        }
         SelectObject(hdc, hi);
-        Polygon(hdc, wedge, DISC_WEDGE_STEPS + 2);
+        disc_fill_wedge(hdc, cx, cy, r, s->direction);
     }
 
     /* One spoke per sector boundary -- 16 of them, at the half-way angles
@@ -340,6 +389,7 @@ static void disc_paint(HWND hwnd, disc_state *s)
     SelectObject(hdc, oldPen);
     DeleteObject(bg);
     DeleteObject(hi);
+    DeleteObject(target);
     DeleteObject(center);
     DeleteObject(pen);
     EndPaint(hwnd, &ps);
@@ -357,7 +407,23 @@ static LRESULT CALLBACK disc_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 1;
     case WM_LBUTTONDOWN:
         if (s) {
+            /* Map mode's disc half: the same PICK_TARGET/WAIT_INPUT guard
+             * key_btn_proc's own WM_LBUTTONDOWN has (see this file's own
+             * header). A click in the dead hub (intvsession_disc_from_point
+             * returning -1) picks nothing and leaves Map mode armed, the
+             * same as clicking the gap between two keypad buttons would;
+             * SetCapture/s->held are never reached on that path. */
             double r = DISC_SIZE / 2.0;
+            if (g_map_state == MAP_PICK_TARGET) {
+                int dir = intvsession_disc_from_point(
+                    (double)(short)LOWORD(lp) - r,
+                    (double)(short)HIWORD(lp) - r, r);
+                if (dir >= 0)
+                    map_select_target(intvsession_target_disc(s->side, dir));
+                return 0;
+            }
+            if (g_map_state == MAP_WAIT_INPUT)
+                return 0;
             s->held = 1;
             SetCapture(hwnd);
             disc_set_direction(hwnd, s,
@@ -367,7 +433,7 @@ static LRESULT CALLBACK disc_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     case WM_MOUSEMOVE:
-        if (s && s->held) {
+        if (s && s->held && g_map_state == MAP_IDLE) {
             double r = DISC_SIZE / 2.0;
             disc_set_direction(hwnd, s,
                                intvsession_disc_from_point(
@@ -376,7 +442,7 @@ static LRESULT CALLBACK disc_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     case WM_LBUTTONUP:
-        if (s) {
+        if (s && g_map_state == MAP_IDLE) {
             s->held = 0;
             ReleaseCapture();
             disc_set_direction(hwnd, s, -1);
@@ -407,7 +473,7 @@ static LRESULT CALLBACK key_btn_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     if (kb) {
         if (msg == WM_LBUTTONDOWN) {
             if (g_map_state == MAP_PICK_TARGET) {
-                map_select_target(kb->side, kb->key);
+                map_select_target(intvsession_target_key(kb->side, kb->key));
                 return 0;
             }
             if (g_map_state == MAP_WAIT_INPUT)
@@ -497,7 +563,12 @@ static void build_controller(HWND parent, HINSTANCE inst, intvsession *session,
     s->session = session;
     s->side = side;
     s->direction = -1;
+    s->map_target = -1;
+    s->hwnd = disc;
     SetWindowLongPtrA(disc, GWLP_USERDATA, (LONG_PTR)s);
+    /* Only LEFT/RIGHT panels are ever built (see g_discs' own comment). */
+    if (side == INTVSESSION_PAD_LEFT || side == INTVSESSION_PAD_RIGHT)
+        g_discs[side] = s;
 }
 
 /* The Map/Reset row beneath both controller panels, which end around

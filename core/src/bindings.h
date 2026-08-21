@@ -31,16 +31,27 @@ void bindings_init(struct intvsession *s);
  * (intvsession_key_from_keysym_bound), a physical pad drives at most one
  * side at a time (intvsession_gamepad_assign), so the same button index is
  * free to mean different things on different sides; nothing to steal across
- * them. MAP_NONE if `button` drives nothing on `side`. */
-intvsession_key_mapping bindings_key_from_button(intvsession_pad_side side,
-                                                  intvsession_pad_button button);
+ * them. MAP_NONE if `button` drives nothing on `side`, MAP_KEY/MAP_DISC
+ * otherwise -- a button can be bound to a keypad key or a disc segment. */
+intvsession_key_mapping bindings_target_from_button(intvsession_pad_side side,
+                                                     intvsession_pad_button button);
 
-/* True iff `button` is NOT currently bound to any keypad key on `side` --
- * gamepad_sdl.c's poll_sticks gates each D-pad direction it reads for the
- * disc on this, so a D-pad button the user remapped to a keypad digit stops
- * also nudging the disc every poll. */
+/* True iff `button` is NOT currently bound to any keypad key or disc segment
+ * on `side` -- gamepad_sdl.c's poll_sticks gates each D-pad direction it
+ * reads for the disc on this, so a D-pad button the user remapped to a
+ * keypad digit (or explicitly to a different disc segment) stops also
+ * nudging the disc from the raw D-pad state every poll. */
 int bindings_button_is_free(intvsession_pad_side side,
                             intvsession_pad_button button);
+
+/* The gamepad button explicitly bound to each of `side`'s 16 disc positions,
+ * indexed by clock position (0 = East, ... see intvsession.h), NONE where
+ * unbound. Returns how many of the 16 are bound, so poll_sticks can skip
+ * straight to the D-pad/stick fallback in the common (all-default) case.
+ * gamepad_sdl.c's own polling thread is the only reader; there is no public
+ * equivalent because only it needs per-position resolution priority. */
+int bindings_disc_buttons(intvsession_pad_side side,
+                          intvsession_pad_button out[INTVSESSION_DISC_POSITIONS]);
 
 #ifdef __cplusplus
 }

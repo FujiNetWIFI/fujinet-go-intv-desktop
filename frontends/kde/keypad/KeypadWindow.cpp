@@ -32,16 +32,19 @@
  *
  * MAP MODE: a bottom row (buildMapRow, onMapClicked and friends, near the
  * end of this file) lets a click on any of the 15 digit/action buttons
- * above, OR any of the 16 disc segments, be rebound to a different keyboard
- * key or gamepad button, through core/src/bindings.c's remappable layer --
- * see intvsession.h's own "remappable bindings" section for the contract.
- * While armed, the same pressed()/released() pair (or DiscWidget's own
- * mouse handlers) that would normally inject a pad key or disc direction
- * instead picks the map target, and forwardKey's own keyboard capture
- * intercepts the next keystroke instead of forwarding it to the machine. A
- * gamepad button press is polled for on a short QTimer (g_gamepadPollTimer
- * below) since core/src/gamepad_sdl.c's capture result lands on its own
- * background thread, not this one.
+ * above, any of the 16 disc segments, OR either of the System row's two
+ * buttons (Reset Game / Reset to CONFIG, buildSystemRow -- machine-global
+ * system actions, not per-side), be rebound to a different keyboard key or
+ * gamepad button, through core/src/bindings.c's remappable layer -- see
+ * intvsession.h's own "remappable bindings" section for the contract. While
+ * armed, the same pressed()/released() pair (or DiscWidget's own mouse
+ * handlers, or the System row's plain clicked(), see onSysactClicked) that
+ * would normally inject a pad key/disc direction/system action instead
+ * picks the map target, and forwardKey's own keyboard capture intercepts
+ * the next keystroke instead of forwarding it to the machine. A gamepad
+ * button press is polled for on a short QTimer (g_gamepadPollTimer below)
+ * since core/src/gamepad_sdl.c's capture result lands on its own background
+ * thread, not this one.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -256,6 +259,8 @@ QLabel *g_statusLabel = nullptr;
 /* [side][key] -- only INTVSESSION_PAD_LEFT/_RIGHT are ever populated, the
  * two panels this window builds. */
 QPushButton *g_keyButtons[2][INTVSESSION_KEY_COUNT] = {};
+/* Indexed by intvsession_sysaction -- see buildSystemRow. */
+QPushButton *g_sysactButtons[INTVSESSION_SYSACT_COUNT] = {};
 /* [side] -- same two sides, the disc widget each panel builds. QPointer
  * rather than a raw pointer only for its auto-null-on-destroy safety net;
  * in practice these never get destroyed, since this window hides rather
@@ -285,9 +290,10 @@ void mapSetStatus(const QString &text)
 }
 
 /* Highlights (or clears) whichever target g_mapTarget currently names,
- * MAP_KEY or MAP_DISC alike -- every setHighlighted(g_keyButtons[...]) call
- * site below that used to be scoped to a (side,key) pair now goes through
- * this instead, so Map mode doesn't need two parallel code paths. */
+ * MAP_KEY/MAP_DISC/MAP_SYSACT alike -- every setHighlighted(g_keyButtons
+ * [...]) call site below that used to be scoped to a (side,key) pair now
+ * goes through this instead, so Map mode doesn't need parallel code paths
+ * per kind. */
 void mapHighlight(bool on)
 {
     if (g_mapTarget.kind == INTVSESSION_MAP_KEY) {
@@ -296,6 +302,8 @@ void mapHighlight(bool on)
         if (g_discs[g_mapTarget.side])
             g_discs[g_mapTarget.side]->setMapTarget(on ? g_mapTarget.direction
                                                        : -1);
+    } else if (g_mapTarget.kind == INTVSESSION_MAP_SYSACT) {
+        setHighlighted(g_sysactButtons[g_mapTarget.sysact], on);
     }
 }
 
@@ -409,6 +417,42 @@ QPushButton *makeKey(const QString &label, intvsession *session,
     return btn;
 }
 
+/* Reset Game / Reset to CONFIG -- machine-global system actions, distinct
+ * from the Map row's own "Reset Bindings" below, and themselves Map-mode
+ * targets like every keypad digit/action button and disc segment. Plain
+ * clicked(), unlike makeKey's pressed()/released() pair: a sysaction isn't
+ * held the way a keypad key is. */
+void onSysactClicked(intvsession *session, intvsession_sysaction a)
+{
+    if (g_mapState == MapState::PickTarget) {
+        mapSelectTarget(intvsession_target_sysaction(a));
+        return;
+    }
+    if (g_mapState == MapState::WaitInput)
+        return; /* waiting for a key/pad press, not another click */
+    if (intvsession_sysaction_fire(session, a) != 0)
+        mapSetStatus(QString::fromUtf8(intvsession_last_error(session)));
+}
+
+QWidget *buildSystemRow(intvsession *session)
+{
+    auto *row = new QHBoxLayout;
+    row->addStretch();
+    for (int a = 0; a < INTVSESSION_SYSACT_COUNT; a++) {
+        auto sysact = static_cast<intvsession_sysaction>(a);
+        auto *btn = new QPushButton(
+            QString::fromUtf8(intvsession_sysaction_name(sysact)));
+        QObject::connect(btn, &QPushButton::clicked, btn,
+                         [session, sysact] { onSysactClicked(session, sysact); });
+        g_sysactButtons[a] = btn;
+        row->addWidget(btn);
+    }
+    row->addStretch();
+    auto *wrap = new QWidget;
+    wrap->setLayout(row);
+    return wrap;
+}
+
 void onMapClicked()
 {
     if (g_mapState != MapState::Idle) {
@@ -511,6 +555,7 @@ KeypadWindow::KeypadWindow(QWidget *parent, intvsession *session)
 
     auto *outer = new QVBoxLayout(this);
     outer->addLayout(panels);
+    outer->addWidget(buildSystemRow(session));
     outer->addWidget(buildMapRow(session));
 }
 

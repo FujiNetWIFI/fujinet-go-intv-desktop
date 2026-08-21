@@ -40,12 +40,15 @@
  * session-wide keyboard hook is needed after all.
  *
  * MAP MODE: a bottom row (MapSelectTarget and friends, near the end of
- * this file) lets a click on any of the 15 digit/action buttons above, OR
- * any of the 16 disc segments, be rebound to a different keyboard key or
- * gamepad button, through core/src/bindings.c's remappable layer -- see
+ * this file) lets a click on any of the 15 digit/action buttons above, any
+ * of the 16 disc segments, OR either of the System row's two buttons
+ * (Reset Game / Reset to CONFIG, -buildSystemRow -- machine-global system
+ * actions, not per-side), be rebound to a different keyboard key or gamepad
+ * button, through core/src/bindings.c's remappable layer -- see
  * intvsession.h's own "remappable bindings" section for the contract. While
  * armed, PadKeyButton's own -mouseDown:/-mouseUp: (or DiscView's own mouse
- * handlers), which would normally inject a pad key or disc direction,
+ * handlers, or the System row's plain target/action, see -onSysactClicked:),
+ * which would normally inject a pad key/disc direction/system action,
  * instead pick the map target, and IntvKeyWindow's keyInterceptor hook
  * (IntvKeyForward.h) intercepts the next keystroke instead of letting it
  * reach the machine. A gamepad button press is polled for on a short
@@ -90,6 +93,8 @@ static NSTimer *gGamepadPollTimer;
 /* [side][key] -- only INTVSESSION_PAD_LEFT/_RIGHT are ever populated, the
  * two panels this window builds. */
 static NSButton *gKeyButtons[2][INTVSESSION_KEY_COUNT];
+/* Indexed by intvsession_sysaction -- see -buildSystemRow. */
+static NSButton *gSysactButtons[INTVSESSION_SYSACT_COUNT];
 
 static void MapSelectTarget(intvsession_key_mapping target);
 static void MapResetUi(void);
@@ -375,9 +380,10 @@ static void MapSetStatus(NSString *text)
 }
 
 /* Highlights (or clears) whichever target gMapTarget currently names,
- * MAP_KEY or MAP_DISC alike -- every SetHighlighted(gKeyButtons[...]) call
- * site below that used to be scoped to a (side,key) pair now goes through
- * this instead, so Map mode doesn't need two parallel code paths. */
+ * MAP_KEY/MAP_DISC/MAP_SYSACT alike -- every SetHighlighted(gKeyButtons
+ * [...]) call site below that used to be scoped to a (side,key) pair now
+ * goes through this instead, so Map mode doesn't need parallel code paths
+ * per kind. */
 static void MapHighlight(BOOL on)
 {
     if (gMapTarget.kind == INTVSESSION_MAP_KEY) {
@@ -386,6 +392,8 @@ static void MapHighlight(BOOL on)
         DiscView *d = gDiscs[gMapTarget.side];
         if (d)
             [d setMapTarget:(on ? gMapTarget.direction : -1)];
+    } else if (gMapTarget.kind == INTVSESSION_MAP_SYSACT) {
+        SetHighlighted(gSysactButtons[gMapTarget.sysact], on);
     }
 }
 
@@ -585,6 +593,47 @@ static void MapCompleteButton(intvsession_pad_button button)
     }
 }
 
+/* Reset Game / Reset to CONFIG -- machine-global system actions, distinct
+ * from the Map row's own "Reset Bindings" above, and themselves Map-mode
+ * targets like every keypad digit/action button and disc segment. Plain
+ * target/action (button.tag carries which intvsession_sysaction), unlike
+ * PadKeyButton's -mouseDown:/-mouseUp: pair: a sysaction isn't held the way
+ * a keypad key is. */
+- (void)onSysactClicked:(id)sender
+{
+    intvsession_sysaction a = (intvsession_sysaction)((NSButton *)sender).tag;
+
+    if (gMapState == IntvMapPickTarget) {
+        MapSelectTarget(intvsession_target_sysaction(a));
+        return;
+    }
+    if (gMapState == IntvMapWaitInput)
+        return; /* waiting for a key/pad press, not another click */
+    if (intvsession_sysaction_fire(_session, a) != 0)
+        MapSetStatus(
+            [NSString stringWithUTF8String:intvsession_last_error(_session)]);
+}
+
+- (NSView *)buildSystemRow
+{
+    NSMutableArray<NSView *> *buttons = [NSMutableArray array];
+    for (int a = 0; a < INTVSESSION_SYSACT_COUNT; a++) {
+        NSButton *btn = [NSButton
+            buttonWithTitle:[NSString stringWithUTF8String:
+                                          intvsession_sysaction_name(
+                                              (intvsession_sysaction)a)]
+                     target:self
+                     action:@selector(onSysactClicked:)];
+        btn.tag = a;
+        gSysactButtons[a] = btn;
+        [buttons addObject:btn];
+    }
+    NSStackView *row = [NSStackView stackViewWithViews:buttons];
+    row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    row.spacing = 8;
+    return row;
+}
+
 /* Every row here is centered within the panel (via NSStackView's default
  * centered alignment on the cross axis when embedded in a vertical column
  * with alignment CenterX), matching the GNOME port's own
@@ -666,15 +715,21 @@ static void MapCompleteButton(intvsession_pad_button button)
     panels.alignment = NSLayoutAttributeTop;
     panels.spacing = 16;
 
-    NSStackView *root =
-        [NSStackView stackViewWithViews:@[ panels, [self buildMapRow] ]];
+    NSStackView *root = [NSStackView stackViewWithViews:@[
+        panels, [self buildSystemRow], [self buildMapRow]
+    ]];
     root.orientation = NSUserInterfaceLayoutOrientationVertical;
     root.alignment = NSLayoutAttributeCenterX;
     root.spacing = 4;
     root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
 
+    /* 530, not 480: the System row (buildSystemRow) needs room above the
+     * Map row -- the window isn't resizable, so a fixed content size has to
+     * grow along with what root actually holds now. gStatusLabel is pinned
+     * to 440pt wide (see buildMapRow), and the System row's two buttons
+     * comfortably fit under that. */
     _window = [[IntvKeyWindow alloc]
-        initWithContentRect:NSMakeRect(0, 0, 480, 480)
+        initWithContentRect:NSMakeRect(0, 0, 480, 530)
                   styleMask:NSWindowStyleMaskTitled |
                             NSWindowStyleMaskClosable |
                             NSWindowStyleMaskMiniaturizable
@@ -686,7 +741,7 @@ static void MapCompleteButton(intvsession_pad_button button)
     _window.session = _session;
     _window.releasedWhenClosed = NO;
     _window.contentView = root;
-    [_window setContentSize:NSMakeSize(480, 480)];
+    [_window setContentSize:NSMakeSize(480, 530)];
     [_window center];
 
     /* Map mode's keyboard half: a press while waiting for input completes

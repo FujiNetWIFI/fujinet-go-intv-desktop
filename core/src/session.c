@@ -10,6 +10,8 @@
 
 #include <stdio.h>
 
+#include <pthread.h>
+
 #include "bindings.h"
 #include "gamepad_sdl.h"
 #include "intv_audio.h"
@@ -97,6 +99,74 @@ int intvsession_load_cart(intvsession *s, const char *path)
 int intvsession_reset_to_config(intvsession *s)
 {
     return intvsession_load_cart(s, NULL);
+}
+
+int intvsession_reset_game(intvsession *s)
+{
+    (void)s;
+    /* gamepad_sdl.c's own last_disc[] cache has to be told first: it lives
+     * in the SDL-linked half of this port (jzintv_core itself stays
+     * SDL-free, see no_sdl_link_test), so this is the one place that can
+     * call both intv_gamepad_forget_disc and intv_host_reset -- see the
+     * former's own comment on why a stick/D-pad held across the reset
+     * would otherwise leave the disc reading stuck centered. */
+    intv_gamepad_forget_disc();
+    intv_host_reset();
+    return 0;
+}
+
+int intvsession_sysaction_fire(intvsession *s, intvsession_sysaction a)
+{
+    switch (a) {
+    case INTVSESSION_SYSACT_RESET_GAME:   return intvsession_reset_game(s);
+    case INTVSESSION_SYSACT_RESET_CONFIG: return intvsession_reset_to_config(s);
+    default:                             return -1;
+    }
+}
+
+/* ---- system-action latch -------------------------------------------------
+ * See intvsession_sysaction_post's own comment in intvsession.h: the one
+ * caller that can't fire directly is gamepad_sdl.c's SDL thread, for
+ * RESET_CONFIG. A bitmask, not a single pending intvsession_sysaction --
+ * INTVSESSION_SYSACT_RESET_GAME is 0, indistinguishable from "nothing
+ * pending" if this were a bare enum, and two distinct actions posted before
+ * a drain must both survive, not collapse into one. Process-global like
+ * bindings.c's own table and gamepad_sdl.c's pad table, for the same
+ * reason: jzIntv's machine is a process singleton. */
+static pthread_mutex_t s_sysact_mtx = PTHREAD_MUTEX_INITIALIZER;
+static unsigned s_sysact_pending;
+
+void intvsession_sysaction_post(intvsession *s, intvsession_sysaction a)
+{
+    (void)s;
+    if (a < 0 || a >= INTVSESSION_SYSACT_COUNT)
+        return;
+    pthread_mutex_lock(&s_sysact_mtx);
+    s_sysact_pending |= (1u << (unsigned)a);
+    pthread_mutex_unlock(&s_sysact_mtx);
+}
+
+int intvsession_sysaction_take(intvsession *s, intvsession_sysaction *out)
+{
+    int a;
+    (void)s;
+    pthread_mutex_lock(&s_sysact_mtx);
+    if (!s_sysact_pending) {
+        pthread_mutex_unlock(&s_sysact_mtx);
+        return 0;
+    }
+    /* Lowest set bit -- which of the two, if both are pending, is
+     * arbitrary; both are delivered, one per _take call, not coalesced. */
+    for (a = 0; a < INTVSESSION_SYSACT_COUNT; a++) {
+        if (s_sysact_pending & (1u << (unsigned)a)) {
+            s_sysact_pending &= ~(1u << (unsigned)a);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_sysact_mtx);
+    if (out)
+        *out = (intvsession_sysaction)a;
+    return 1;
 }
 
 static const char *const hw_mode_names[] = { "Auto", "Off", "On", NULL };

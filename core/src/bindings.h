@@ -31,8 +31,13 @@ void bindings_init(struct intvsession *s);
  * (intvsession_key_from_keysym_bound), a physical pad drives at most one
  * side at a time (intvsession_gamepad_assign), so the same button index is
  * free to mean different things on different sides; nothing to steal across
- * them. MAP_NONE if `button` drives nothing on `side`, MAP_KEY/MAP_DISC
- * otherwise -- a button can be bound to a keypad key or a disc segment. */
+ * them. MAP_NONE if `button` drives nothing on `side`, MAP_KEY/MAP_DISC/
+ * MAP_SYSACT otherwise -- a button can be bound to a keypad key, a disc
+ * segment, or a system action. The one exception to "scoped to one side
+ * only": a system action is machine-global (always stored on LEFT, see
+ * intvsession_target_sysaction), so this also falls back to LEFT's two
+ * sysaction slots when `side` isn't LEFT and the per-side scan misses --
+ * see the function's own comment. */
 intvsession_key_mapping bindings_target_from_button(intvsession_pad_side side,
                                                      intvsession_pad_button button);
 

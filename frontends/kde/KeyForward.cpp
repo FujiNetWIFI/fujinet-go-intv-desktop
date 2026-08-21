@@ -211,6 +211,31 @@ void intvForwardKey(intvsession *session, const QKeyEvent *event, int down)
     if (keysym == 0)
         return;
 
+    /* _bound, not the pure table: a keypad window "Map" remap has to reach
+     * every keyboard-driven window, not just the one the remap happened
+     * in -- see intvsession.h's own comment on why. Resolved once, up
+     * front, so a system-action target can be checked ahead of ECS
+     * keyboard mode below. */
+    intvsession_key_mapping m = intvsession_key_from_keysym_bound(session, keysym);
+
+    /* System actions outrank ECS keyboard mode: Escape/Backspace default to
+     * Reset to CONFIG/Reset Game, but both are also real ECS keys
+     * (intvsession_ecs_key_from_keysym) -- ESC has to always be able to get
+     * back to CONFIG regardless of which mode has the keyboard. Cost:
+     * ESC/Backspace stop reaching the emulated ECS matrix from the HOST
+     * keyboard while bound this way; the standalone ECS keyboard window is
+     * unaffected (it calls intvsession_ecs_key_set directly, ignoring
+     * keyboard_mode -- see EcsKeyboardWindow.cpp's own header). Every
+     * caller of this function already drops auto-repeat before reaching
+     * here (DisplayWidget/KeypadWindow's own key handlers), so no extra
+     * repeat guard is needed for the fire-once behaviour a sysaction
+     * wants. */
+    if (m.kind == INTVSESSION_MAP_SYSACT) {
+        if (down)
+            intvsession_sysaction_fire(session, m.sysact);
+        return;
+    }
+
     /* "ECS Keyboard" input mode (Settings, or toggled live from there)
      * steals the host keyboard for the ECS's own keyboard instead of the
      * hand controllers -- see intvsession_ecs_key_from_keysym's own comment
@@ -222,10 +247,6 @@ void intvForwardKey(intvsession *session, const QKeyEvent *event, int down)
         return;
     }
 
-    /* _bound, not the pure table: a keypad window "Map" remap has to reach
-     * every keyboard-driven window, not just the one the remap happened
-     * in -- see intvsession.h's own comment on why. */
-    intvsession_key_mapping m = intvsession_key_from_keysym_bound(session, keysym);
     if (m.kind == INTVSESSION_MAP_KEY)
         intvsession_pad_key(session, m.side, m.key, down);
     else if (m.kind == INTVSESSION_MAP_DISC)

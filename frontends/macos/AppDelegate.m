@@ -41,6 +41,7 @@
     NSTimer *_logTimer;
     NSWindow *_settingsWindow;
     BOOL _sessionDirty;
+    NSTimer *_sysactTimer;
 }
 
 /* Settings keys shared with the GNOME/KDE/Windows frontends (all four read/
@@ -110,6 +111,38 @@ static NSArray<NSString *> *restartSettingKeys(void)
         alert.informativeText =
             [NSString stringWithUTF8String:intvsession_last_error(_session)];
         [alert runModal];
+    }
+}
+
+- (void)resetGame:(id)sender
+{
+    (void)sender;
+    if (intvsession_reset_game(_session) != 0) {
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"FujiNet Go Intv";
+        alert.informativeText =
+            [NSString stringWithUTF8String:intvsession_last_error(_session)];
+        [alert runModal];
+    }
+}
+
+/* Drains intvsession_sysaction_take -- the one caller that can't fire a
+ * sysaction directly is gamepad_sdl.c's SDL thread (queuing RESET_CONFIG so
+ * it never joins itself); this, the UI thread, fires each on the tick
+ * below. Lives on the app delegate rather than the keypad window: that
+ * window hides rather than closes but is hidden far more often than shown,
+ * and a gamepad-bound sysaction has to keep working regardless. */
+- (void)drainSysactions
+{
+    intvsession_sysaction a;
+    while (intvsession_sysaction_take(_session, &a)) {
+        if (intvsession_sysaction_fire(_session, a) != 0) {
+            NSAlert *alert = [[NSAlert alloc] init];
+            alert.messageText = @"FujiNet Go Intv";
+            alert.informativeText = [NSString
+                stringWithUTF8String:intvsession_last_error(_session)];
+            [alert runModal];
+        }
     }
 }
 
@@ -414,6 +447,18 @@ static NSArray<NSString *> *restartSettingKeys(void)
 
     NSMenuItem *fujiItem = [[NSMenuItem alloc] init];
     NSMenu *fuji = [[NSMenu alloc] initWithTitle:@"FujiNet"];
+    /* No keyEquivalent here, deliberately: Backspace is a *remappable*
+     * default (core/src/bindings.c), not a fixed accelerator like Cmd+R
+     * below. AppKit's -performKeyEquivalent: chain runs before a window's
+     * own -keyDown:, so binding one here would fire Reset Game on plain
+     * Backspace forever, even after a keypad window Map-mode remap moved
+     * that action to a different key. The mouse-clickable menu entry is
+     * enough; the real trigger is IntvForwardKeyEvent's MAP_SYSACT dispatch
+     * (IntvKeyForward.m), which honours whatever the user has actually
+     * bound. */
+    [fuji addItem:[self item:@"Reset Game (Backspace)"
+                      action:@selector(resetGame:)
+                         key:@""]];
     [fuji addItem:[self item:@"Reset to CONFIG"
                       action:@selector(resetToConfig:)
                          key:@"r"]];
@@ -520,6 +565,16 @@ static NSArray<NSString *> *restartSettingKeys(void)
     [_window makeFirstResponder:_display];
     [_display start];
 
+    /* ~100ms: fast enough that a gamepad press feels immediate, cheap
+     * enough to run for the app's whole lifetime. See -drainSysactions's
+     * own comment. */
+    _sysactTimer = [NSTimer scheduledTimerWithTimeInterval:0.1
+                                                     repeats:YES
+                                                       block:^(NSTimer *timer) {
+                                                         (void)timer;
+                                                         [self drainSysactions];
+                                                       }];
+
     /* Developer affordance shared with the other frontends. */
     if (getenv("INTV_OPEN_DEBUGGER"))
         [DebuggerWindow showForSession:_session];
@@ -531,6 +586,7 @@ static NSArray<NSString *> *restartSettingKeys(void)
 {
     (void)note;
     [_logTimer invalidate];
+    [_sysactTimer invalidate];
     [_display stop];
     intvsession_stop(_session);
 }

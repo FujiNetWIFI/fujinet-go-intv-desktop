@@ -6,6 +6,7 @@
 #pragma once
 
 #include <QMainWindow>
+#include <QTimer>
 
 #include "intvsession.h"
 
@@ -30,7 +31,16 @@ private:
     void showEcsKeyboard();
     void showSettings();
     void resetToConfig();
+    void resetGame();
+    /* Drains intvsession_sysaction_take -- the one caller that can't fire a
+     * sysaction directly is gamepad_sdl.c's SDL thread (queuing RESET_CONFIG
+     * so it never joins itself); this, the UI thread, fires each on
+     * m_sysactTimer's tick. Lives here rather than on KeypadWindow: that
+     * window hides rather than closes but is hidden far more often than
+     * shown, and a gamepad-bound sysaction has to keep working regardless. */
+    void drainSysactions();
 
     intvsession *m_session;
     DisplayWidget *m_display;
+    QTimer *m_sysactTimer;
 };

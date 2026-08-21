@@ -432,6 +432,201 @@ int main(void)
         intvsession_bindings_reset(s); /* leave a clean table behind */
     }
 
+    /* ---- system actions (Reset Game / Reset to CONFIG) -------------------
+     * From here on the table is back at defaults (the reset two blocks up
+     * left it clean) -- exactly the state these need to be exercised from. */
+    {
+        intvsession_binding backspace = intvsession_target_binding_get(
+            s, intvsession_target_sysaction(INTVSESSION_SYSACT_RESET_GAME));
+        intvsession_binding escape = intvsession_target_binding_get(
+            s, intvsession_target_sysaction(INTVSESSION_SYSACT_RESET_CONFIG));
+        check("Reset Game defaults to Backspace, no gamepad default",
+              backspace.keysym == INTVSESSION_KEYSYM_BACKSPACE &&
+                  backspace.button == INTVSESSION_PAD_BTN_NONE);
+        check("Reset to CONFIG defaults to Escape, no gamepad default",
+              escape.keysym == INTVSESSION_KEYSYM_ESCAPE &&
+                  escape.button == INTVSESSION_PAD_BTN_NONE);
+
+        {
+            intvsession_key_mapping m = intvsession_key_from_keysym_bound(
+                s, INTVSESSION_KEYSYM_BACKSPACE);
+            check("Backspace resolves to MAP_SYSACT Reset Game",
+                  m.kind == INTVSESSION_MAP_SYSACT &&
+                      m.sysact == INTVSESSION_SYSACT_RESET_GAME);
+        }
+        {
+            intvsession_key_mapping m = intvsession_key_from_keysym_bound(
+                s, INTVSESSION_KEYSYM_ESCAPE);
+            check("Escape resolves to MAP_SYSACT Reset to CONFIG",
+                  m.kind == INTVSESSION_MAP_SYSACT &&
+                      m.sysact == INTVSESSION_SYSACT_RESET_CONFIG);
+        }
+    }
+    {
+        char name[64];
+        int n = intvsession_target_name(
+            intvsession_target_sysaction(INTVSESSION_SYSACT_RESET_GAME), name,
+            sizeof(name));
+        check("target_name(Reset Game) has no side prefix",
+              n == (int)strlen(name) && strcmp(name, "Reset Game") == 0);
+        n = intvsession_target_name(
+            intvsession_target_sysaction(INTVSESSION_SYSACT_RESET_CONFIG),
+            name, sizeof(name));
+        check("target_name(Reset to CONFIG) has no side prefix",
+              strcmp(name, "Reset to CONFIG") == 0);
+        check("sysaction_name(RESET_GAME) matches",
+              strcmp(intvsession_sysaction_name(INTVSESSION_SYSACT_RESET_GAME),
+                    "Reset Game") == 0);
+        check("sysaction_name out of range is \"?\"",
+              strcmp(intvsession_sysaction_name(
+                        (intvsession_sysaction)INTVSESSION_SYSACT_COUNT),
+                    "?") == 0);
+    }
+    {
+        /* Steal Backspace off Reset Game onto Left/5 -- Reset Game should
+         * read back as stolen, and Backspace should stop resolving to any
+         * sysaction. */
+        char stolen[128] = "unset";
+        intvsession_binding_set_key(s, INTVSESSION_PAD_LEFT, INTVSESSION_KEY_5,
+                                    INTVSESSION_KEYSYM_BACKSPACE, stolen,
+                                    sizeof(stolen));
+        check("stealing Backspace names Reset Game",
+              strcmp(stolen, "Reset Game") == 0);
+        check("Backspace no longer resolves to a sysaction",
+              intvsession_key_from_keysym_bound(s, INTVSESSION_KEYSYM_BACKSPACE)
+                      .kind != INTVSESSION_MAP_SYSACT);
+        check("Reset Game's slot is now empty",
+              intvsession_target_binding_get(
+                  s, intvsession_target_sysaction(INTVSESSION_SYSACT_RESET_GAME))
+                      .keysym == 0);
+    }
+    {
+        /* Now bind Reset Game onto 'F' -- unbound by any default (see
+         * intv_keymap.c: not one of the IJKM/DRWEASZXC disc letters), so
+         * this steals nothing. */
+        char stolen[128] = "unset";
+        intvsession_target_set_key(
+            s, intvsession_target_sysaction(INTVSESSION_SYSACT_RESET_GAME),
+            'F', stolen, sizeof(stolen));
+        check("binding Reset Game onto an unclaimed key steals nothing",
+              stolen[0] == '\0');
+        check("Reset Game now drives on 'F'",
+              intvsession_key_from_keysym_bound(s, 'F').kind ==
+                  INTVSESSION_MAP_SYSACT &&
+              intvsession_key_from_keysym_bound(s, 'F').sysact ==
+                  INTVSESSION_SYSACT_RESET_GAME);
+    }
+    {
+        /* Gamepad steal for a sysaction crosses every side -- unlike a
+         * keypad/disc target, whose steal is scoped to one side (see the
+         * "gamepad steal is scoped per side" block above). SOUTH already
+         * drives every side's own Top action button by default
+         * (compute_defaults_locked seeds it on all four) -- binding it to
+         * Reset Game must clear it from EVERY side's own action-button
+         * slot, or e.g. Right would still fire its own Top action on the
+         * same physical press, alongside the sysaction. */
+        char stolen[128] = "unset";
+        intvsession_target_set_button(
+            s, intvsession_target_sysaction(INTVSESSION_SYSACT_RESET_GAME),
+            INTVSESSION_PAD_BTN_SOUTH, stolen, sizeof(stolen));
+
+        /* bindings_button_is_free is correctly 0 (NOT free) on every side
+         * now, not just LEFT: bindings_target_from_button's cross-side
+         * fallback (see its own comment) makes SOUTH resolve to the
+         * sysaction from ANY side's pad, which is the whole point --
+         * pressing SOUTH fires Reset Game regardless of which side that
+         * physical pad happens to be assigned to. */
+        check("SOUTH reads not-free on every side once bound to a "
+              "sysaction (it resolves there via the cross-side fallback)",
+              bindings_button_is_free(INTVSESSION_PAD_LEFT,
+                                      INTVSESSION_PAD_BTN_SOUTH) == 0 &&
+              bindings_button_is_free(INTVSESSION_PAD_RIGHT,
+                                      INTVSESSION_PAD_BTN_SOUTH) == 0 &&
+              bindings_button_is_free(INTVSESSION_PAD_ECS_LEFT,
+                                      INTVSESSION_PAD_BTN_SOUTH) == 0 &&
+              bindings_button_is_free(INTVSESSION_PAD_ECS_RIGHT,
+                                      INTVSESSION_PAD_BTN_SOUTH) == 0);
+        /* And every side's reverse lookup resolves to the sysaction, not
+         * its old per-side Top action -- the old claim is genuinely gone
+         * (cleared), not just shadowed by the fallback. */
+        {
+            static const intvsession_pad_side sides[] = {
+                INTVSESSION_PAD_LEFT, INTVSESSION_PAD_RIGHT,
+                INTVSESSION_PAD_ECS_LEFT, INTVSESSION_PAD_ECS_RIGHT,
+            };
+            int i, ok = 1;
+            for (i = 0; i < 4; i++) {
+                intvsession_key_mapping m =
+                    bindings_target_from_button(sides[i],
+                                                INTVSESSION_PAD_BTN_SOUTH);
+                if (m.kind != INTVSESSION_MAP_SYSACT ||
+                    m.sysact != INTVSESSION_SYSACT_RESET_GAME)
+                    ok = 0;
+            }
+            check("every side's reverse lookup finds the sysaction, not "
+                  "its old Top action binding",
+                  ok);
+        }
+    }
+    intvsession_bindings_reset(s); /* leave a clean table behind */
+
+    /* ---- slot-numbering regression guard ---------------------------------
+     * System actions are appended AFTER the disc's 16 slots (SYSACT_SLOT),
+     * so a legacy persisted string naming a disc slot by number must still
+     * land on the same disc direction -- "appended, not inserted", see
+     * bindings.c's own file header. Slot 15 is DISC_SLOT(0), Left disc
+     * East. */
+    {
+        intvsession_set_str(s, "bindings", "0.15.k:70"); /* 70 = 'F' */
+        intvsession_settings_flush(s);
+        intvsession_free(s);
+        s = open_session(config_dir, data_dir);
+        check("re-open after a legacy disc-slot string", s != NULL);
+        if (s) {
+            check("slot 15 still lands on Left disc East, not a sysaction",
+                  intvsession_key_from_keysym_bound(s, 'F').kind ==
+                      INTVSESSION_MAP_DISC &&
+                  intvsession_key_from_keysym_bound(s, 'F').direction == 0);
+            intvsession_bindings_reset(s);
+        }
+    }
+
+    /* ---- system-action latch (post/take) ---------------------------------
+     * Pure cross-thread queue, no session state involved -- see
+     * intvsession_sysaction_post's own comment on why gamepad_sdl.c's SDL
+     * thread needs it instead of firing RESET_CONFIG inline. */
+    {
+        intvsession_sysaction a;
+        check("take on an empty latch returns 0",
+              intvsession_sysaction_take(s, &a) == 0);
+
+        intvsession_sysaction_post(s, INTVSESSION_SYSACT_RESET_CONFIG);
+        check("take returns the posted action",
+              intvsession_sysaction_take(s, &a) == 1 &&
+                  a == INTVSESSION_SYSACT_RESET_CONFIG);
+        check("a second take on a single post returns 0",
+              intvsession_sysaction_take(s, &a) == 0);
+
+        /* RESET_GAME is 0 -- the bitmask, not a bare enum, is what keeps
+         * this from being indistinguishable from "nothing pending" (see
+         * session.c's own comment on s_sysact_pending). */
+        intvsession_sysaction_post(s, INTVSESSION_SYSACT_RESET_GAME);
+        intvsession_sysaction_post(s, INTVSESSION_SYSACT_RESET_CONFIG);
+        {
+            int got_game = 0, got_config = 0, n;
+            for (n = 0; n < 2; n++) {
+                check("take succeeds while the latch has pending actions",
+                      intvsession_sysaction_take(s, &a) == 1);
+                if (a == INTVSESSION_SYSACT_RESET_GAME) got_game = 1;
+                if (a == INTVSESSION_SYSACT_RESET_CONFIG) got_config = 1;
+            }
+            check("both distinct posted actions were each taken once",
+                  got_game && got_config);
+        }
+        check("take on a drained latch returns 0 again",
+              intvsession_sysaction_take(s, &a) == 0);
+    }
+
     /* ---- name tables ---------------------------------------------------- */
     check("pad_key_name(5) is \"5\"",
           strcmp(intvsession_pad_key_name(INTVSESSION_KEY_5), "5") == 0);
@@ -524,7 +719,7 @@ int main(void)
 
         name[0] = 'x';
         n = intvsession_target_name(
-            (intvsession_key_mapping){ INTVSESSION_MAP_NONE, 0, 0, 0 }, name,
+            (intvsession_key_mapping){ .kind = INTVSESSION_MAP_NONE }, name,
             sizeof(name));
         check("target_name(MAP_NONE) returns 0 and an empty string",
               n == 0 && name[0] == '\0');

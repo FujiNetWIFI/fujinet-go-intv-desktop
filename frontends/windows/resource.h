@@ -14,6 +14,7 @@
 #define IDM_SETTINGS       208
 #define IDM_ECS_KEYBOARD   209
 #define IDM_RESET_CONFIG   210
+#define IDM_RESET_GAME     211
 
 /* Settings window child control ids. */
 #define IDC_SET_ECS          301

@@ -307,6 +307,11 @@ target_link_libraries(boot_smoke jzintv_core)
 # roms_embedded.h (src/) so the test can check intv_embedded_rom_count itself.
 target_include_directories(boot_smoke PRIVATE src)
 
+add_executable(reset_test tests/reset_test.c)
+target_link_libraries(reset_test jzintv_core)
+# roms_embedded.h (src/) so the test can check intv_embedded_rom_count itself.
+target_include_directories(reset_test PRIVATE src)
+
 add_executable(pad_test tests/pad_test.c)
 target_link_libraries(pad_test jzintv_core)
 target_include_directories(pad_test PRIVATE src)
@@ -372,6 +377,7 @@ target_link_libraries(periph_test jzintv_core)
 
 add_test(NAME no_sdl_link COMMAND no_sdl_link_test)
 add_test(NAME boot_smoke COMMAND boot_smoke)
+add_test(NAME reset_test COMMAND reset_test)
 add_test(NAME pad_test COMMAND pad_test)
 add_test(NAME ecs_key COMMAND ecs_key_test)
 add_test(NAME hwopts COMMAND hwopts_test)
@@ -393,5 +399,6 @@ set_tests_properties(debug stic PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 set_tests_properties(pad_test ecs_key hwopts boot_smoke audio PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 # Needs WITH_INTV_ROMS=ON to have anything to provision; reported as 77
 # (skipped) rather than a failure otherwise, and it boots a real machine, so
-# it is the one test here that takes real wall-clock time.
-set_tests_properties(boot_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+# these are the two tests here that take real wall-clock time.
+set_tests_properties(boot_smoke reset_test PROPERTIES SKIP_RETURN_CODE 77
+                     TIMEOUT 30)

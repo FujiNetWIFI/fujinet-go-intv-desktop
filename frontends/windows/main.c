@@ -45,6 +45,7 @@ static int g_fullscreen;
 static WINDOWPLACEMENT g_prev_placement = {sizeof(g_prev_placement)};
 
 #define TIMER_REPAINT 1
+#define TIMER_SYSACT  3 /* 2 is LOG_TIMER_ID, on the separate log window */
 
 /* ---- display ---------------------------------------------------------------
  * INTVSESSION_FB_WIDTH x _HEIGHT is fixed (160x200, the STIC's own raw
@@ -277,6 +278,34 @@ void intv_forward_key(WPARAM vk, LPARAM lp, int down)
     if (!keysym)
         return;
 
+    /* _bound, not the pure table: a keypad window "Map" remap has to reach
+     * every keyboard-driven window, not just the one the remap happened
+     * in -- see intvsession.h's own comment on why. Resolved once, up
+     * front, so a system-action target can be checked ahead of ECS
+     * keyboard mode below. */
+    m = intvsession_key_from_keysym_bound(g_session, keysym);
+
+    /* System actions outrank ECS keyboard mode: Escape/Backspace default to
+     * Reset to CONFIG/Reset Game, but both are also real ECS keys
+     * (intvsession_ecs_key_from_keysym) -- ESC has to always be able to get
+     * back to CONFIG regardless of which mode has the keyboard. Cost:
+     * ESC/Backspace stop reaching the emulated ECS matrix from the HOST
+     * keyboard while bound this way; the standalone ECS keyboard window is
+     * unaffected (intv_forward_ecs_key below calls intvsession_ecs_key_set
+     * directly, ignoring keyboard_mode). */
+    if (m.kind == INTVSESSION_MAP_SYSACT) {
+        /* Win32 auto-repeats WM_KEYDOWN/WM_SYSKEYDOWN for as long as a key
+         * is held -- lp bit 30 ("previous key state") is 1 on every repeat
+         * and 0 only on the genuine first press, so gate on that to fire
+         * once, not ~30 times/sec for as long as the key is held. Bit 30 is
+         * always 1 on WM_KEYUP/WM_SYSKEYUP (a release is never a repeat),
+         * so this only needs checking on the down edge; the release itself
+         * is a no-op for a sysaction either way. */
+        if (down && !(lp & (1L << 30)))
+            intvsession_sysaction_fire(g_session, m.sysact);
+        return;
+    }
+
     /* "ECS Keyboard" input mode (Settings, or toggled live from there)
      * steals the keyboard for the ECS's own keyboard instead of the hand
      * controllers -- see intvsession_ecs_key_from_keysym's own comment on
@@ -288,10 +317,6 @@ void intv_forward_key(WPARAM vk, LPARAM lp, int down)
         return;
     }
 
-    /* _bound, not the pure table: a keypad window "Map" remap has to reach
-     * every keyboard-driven window, not just the one the remap happened
-     * in -- see intvsession.h's own comment on why. */
-    m = intvsession_key_from_keysym_bound(g_session, keysym);
     if (m.kind == INTVSESSION_MAP_KEY)
         intvsession_pad_key(g_session, m.side, m.key, down);
     else if (m.kind == INTVSESSION_MAP_DISC)
@@ -415,6 +440,30 @@ static void reset_to_config(void)
     if (intvsession_reset_to_config(g_session) != 0)
         MessageBoxA(g_hwnd, intvsession_last_error(g_session),
                     "FujiNet Go Intv", MB_ICONWARNING);
+}
+
+static void reset_game(void)
+{
+    if (intvsession_reset_game(g_session) != 0)
+        MessageBoxA(g_hwnd, intvsession_last_error(g_session),
+                    "FujiNet Go Intv", MB_ICONWARNING);
+}
+
+/* Drains intvsession_sysaction_take -- the one caller that can't fire a
+ * sysaction directly is gamepad_sdl.c's SDL thread (queuing RESET_CONFIG so
+ * it never joins itself); this, the UI thread, fires each on TIMER_SYSACT's
+ * tick (see WinMain's own SetTimer). Lives on the main window rather than
+ * the keypad window: that window hides rather than destroys itself (see
+ * intv_keypad_pretranslate's own header) but is hidden far more often than
+ * shown, and a gamepad-bound sysaction has to keep working regardless. */
+static void drain_sysactions(void)
+{
+    intvsession_sysaction a;
+    while (intvsession_sysaction_take(g_session, &a)) {
+        if (intvsession_sysaction_fire(g_session, a) != 0)
+            MessageBoxA(g_hwnd, intvsession_last_error(g_session),
+                        "FujiNet Go Intv", MB_ICONWARNING);
+    }
 }
 
 /* ---- settings --------------------------------------------------------------
@@ -645,6 +694,7 @@ static HMENU build_menu(void)
     HMENU settings = CreatePopupMenu();
     HMENU help = CreatePopupMenu();
 
+    AppendMenuA(fujinet, MF_STRING, IDM_RESET_GAME, "Reset Game\tBackspace");
     AppendMenuA(fujinet, MF_STRING, IDM_RESET_CONFIG, "Reset to CONFIG\tCtrl+R");
     AppendMenuA(fujinet, MF_STRING, IDM_FUJINET_CONFIG, "Configuration...");
     AppendMenuA(fujinet, MF_STRING, IDM_FUJINET_LOG, "Console Log...");
@@ -685,6 +735,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             return 0;
         }
+        if (wp == TIMER_SYSACT) {
+            drain_sysactions();
+            return 0;
+        }
         break;
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
@@ -704,6 +758,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         switch (LOWORD(wp)) {
         case IDM_KEYPAD:         open_keypad(); break;
         case IDM_ECS_KEYBOARD:   open_ecskbd(); break;
+        case IDM_RESET_GAME:     reset_game(); break;
         case IDM_RESET_CONFIG:   reset_to_config(); break;
         case IDM_FUJINET_CONFIG: show_fujinet_config(); break;
         case IDM_FUJINET_LOG:
@@ -778,6 +833,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     ShowWindow(g_hwnd, show);
 
     SetTimer(g_hwnd, TIMER_REPAINT, 16, NULL);
+    SetTimer(g_hwnd, TIMER_SYSACT, 100, NULL);
 
     /* Developer affordances, matching the GNOME frontend's own
      * INTV_OPEN_DEBUGGER/INTV_OPEN_KEYPAD env vars. */
@@ -798,6 +854,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     }
 
     KillTimer(g_hwnd, TIMER_REPAINT);
+    KillTimer(g_hwnd, TIMER_SYSACT);
     intvsession_free(g_session);
     return (int)msg.wParam;
 }

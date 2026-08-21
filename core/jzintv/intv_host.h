@@ -92,6 +92,20 @@ int intv_host_start(const intv_host_opts *opts);
  * call even if not running. */
 void intv_host_stop(void);
 
+/* Soft-resets the running machine in place: releases every held pad/ECS
+ * input and clears the audio ring (pad_reset_inputs + intv_audio_reset, both
+ * synchronous -- done before this function returns) then arms jzIntv's own
+ * one-shot RESET (intv.do_reset = 2, the same value its 'r' GUI-mode command
+ * and RESET pad key use) for the emulator thread to consume on its next
+ * iteration -- see jzintv.c's main loop: it forces the CP1610's PC to 0x1000
+ * and, one iteration later, calls periph_reset() exactly once. Unlike
+ * intv_host_stop, does not join the emulator thread and does not touch which
+ * cartridge is mapped -- periph_reset has no reset handler for icart/legacy,
+ * so whatever cart (including one pushed live over FujiNet) stays mapped and
+ * restarts as itself. Cross-thread write, same pattern as intv_host_stop's
+ * own intv.do_exit = 1. Safe to call even if not running (no-op). */
+void intv_host_reset(void);
+
 int intv_host_is_running(void);
 
 /* Registers a callback fired once, at the very top of the emulator thread

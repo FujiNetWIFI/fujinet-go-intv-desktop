@@ -25,18 +25,22 @@
  * whichever window the window manager currently has focused.
  *
  * MAP MODE: a bottom row (map_select_target and friends, near the end of
- * this file) lets a click on any of the 15 digit/action buttons above, OR
- * any of the 16 disc segments, be rebound to a different keyboard key or
- * gamepad button, through core/src/bindings.c's remappable layer -- see
+ * this file) lets a click on any of the 15 digit/action buttons above, any
+ * of the 16 disc segments, OR either of the System row's two buttons
+ * (Reset Game / Reset to CONFIG, build_system_row -- machine-global system
+ * actions, not per-side), be rebound to a different keyboard key or gamepad
+ * button, through core/src/bindings.c's remappable layer -- see
  * intvsession.h's own "remappable bindings" section for the contract. While
- * armed, the same GtkGestureClick press/release pair that would normally
- * inject a pad key or disc direction instead picks the map target
- * (key_pressed/key_released and disc_pressed/disc_released all check
- * g_map_state first), and forward_key's own keyboard capture (also gated on
- * g_map_state) intercepts the next keystroke instead of forwarding it to
- * the machine. A gamepad button press is polled for on a short GLib timeout
- * (g_gamepad_poll below) since core/src/gamepad_sdl.c's capture result
- * lands on its own background thread, not this one.
+ * armed, the same GtkGestureClick press/release pair (or the System row's
+ * plain "clicked", see build_system_row) that would normally inject a pad
+ * key/disc direction/system action instead picks the map target
+ * (key_pressed/key_released, disc_pressed/disc_released, and
+ * on_sysact_clicked all check g_map_state first), and forward_key's own
+ * keyboard capture (also gated on g_map_state) intercepts the next
+ * keystroke instead of forwarding it to the machine. A gamepad button press
+ * is polled for on a short GLib timeout (g_gamepad_poll below) since
+ * core/src/gamepad_sdl.c's capture result lands on its own background
+ * thread, not this one.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -92,13 +96,15 @@ static intvsession_key_mapping g_map_target;
 static GtkWidget *g_map_btn;
 static GtkWidget *g_status_label;
 static GtkWidget *g_key_buttons[2][INTVSESSION_KEY_COUNT];
+static GtkWidget *g_sysact_buttons[INTVSESSION_SYSACT_COUNT];
 static DiscState *g_discs[2];
 static guint g_gamepad_poll_id;
 
 /* Highlights (or clears) whichever target g_map_target currently names,
- * MAP_KEY or MAP_DISC alike -- every set_highlighted(g_key_buttons[...])
- * call site below that used to be scoped to a (side,key) pair now goes
- * through this instead, so Map mode doesn't need two parallel code paths. */
+ * MAP_KEY/MAP_DISC/MAP_SYSACT alike -- every set_highlighted(g_key_buttons
+ * [...]) call site below that used to be scoped to a (side,key) pair now
+ * goes through this instead, so Map mode doesn't need parallel code paths
+ * per kind. */
 static void map_highlight(gboolean on)
 {
     if (g_map_target.kind == INTVSESSION_MAP_KEY) {
@@ -114,6 +120,14 @@ static void map_highlight(gboolean on)
         if (d) {
             d->map_target = on ? g_map_target.direction : -1;
             gtk_widget_queue_draw(d->area);
+        }
+    } else if (g_map_target.kind == INTVSESSION_MAP_SYSACT) {
+        GtkWidget *w = g_sysact_buttons[g_map_target.sysact];
+        if (w) {
+            if (on)
+                gtk_widget_add_css_class(w, "suggested-action");
+            else
+                gtk_widget_remove_css_class(w, "suggested-action");
         }
     }
 }
@@ -579,7 +593,52 @@ static GtkWidget *build_controller(intvsession *session,
     return box;
 }
 
+/* ---- system row (Reset Game / Reset to CONFIG) --------------------------
+ * Two buttons, distinct from the Map row's own "Reset Bindings" -- these
+ * fire a machine-global system action (core/src/bindings.c's MAP_SYSACT
+ * target kind), and are themselves Map-mode targets like every keypad
+ * digit/action button and disc segment. "clicked", not a press/release
+ * gesture: unlike a keypad key, a sysaction isn't held. */
+static void on_sysact_clicked(GtkButton *btn, gpointer user_data)
+{
+    intvsession_sysaction a = (intvsession_sysaction)GPOINTER_TO_INT(user_data);
+    (void)btn;
+
+    if (g_map_state == INTV_MAP_PICK_TARGET) {
+        map_select_target(intvsession_target_sysaction(a));
+        return;
+    }
+    if (g_map_state == INTV_MAP_WAIT_INPUT)
+        return; /* waiting for a key/pad press, not another click */
+    if (g_session && intvsession_sysaction_fire(g_session, a) != 0)
+        map_set_status(intvsession_last_error(g_session));
+}
+
+static GtkWidget *build_system_row(void)
+{
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    int a;
+
+    for (a = 0; a < INTVSESSION_SYSACT_COUNT; a++) {
+        GtkWidget *btn = gtk_button_new_with_label(
+            intvsession_sysaction_name((intvsession_sysaction)a));
+        g_signal_connect(btn, "clicked", G_CALLBACK(on_sysact_clicked),
+                         GINT_TO_POINTER(a));
+        g_sysact_buttons[a] = btn;
+        gtk_box_append(GTK_BOX(row), btn);
+    }
+    gtk_widget_set_halign(row, GTK_ALIGN_CENTER);
+    return row;
+}
+
 /* ---- keyboard passthrough (see file header) ----------------------------- */
+
+/* GTK4's key-pressed signal carries no repeat flag -- tracked by hand so
+ * holding a sysaction key (e.g. Backspace) fires once, not ~60 times/sec
+ * for as long as it's held. Mirrors window.c's own IntvWindow::sysact_down;
+ * a file-static here rather than a struct field, matching every other piece
+ * of this singleton window's state. */
+static gboolean g_sysact_down[INTVSESSION_SYSACT_COUNT];
 
 static gboolean forward_key(GtkEventControllerKey *c, guint keyval,
                             guint keycode, GdkModifierType state, int down)
@@ -606,6 +665,25 @@ static gboolean forward_key(GtkEventControllerKey *c, guint keyval,
     if (g_map_state == INTV_MAP_PICK_TARGET)
         return TRUE; /* still swallow -- waiting for a button click, not this */
 
+    /* _bound, not the pure table: a remap made here (or in any other
+     * window) has to take effect here too. Resolved once, up front, so a
+     * system-action target can be checked ahead of ECS keyboard mode
+     * below -- see window.c's own forward_key for the full rationale on why
+     * (mirrored here). */
+    m = intvsession_key_from_keysym_bound(g_session, keysym);
+
+    if (m.kind == INTVSESSION_MAP_SYSACT) {
+        if (down) {
+            if (!g_sysact_down[m.sysact]) {
+                g_sysact_down[m.sysact] = TRUE;
+                intvsession_sysaction_fire(g_session, m.sysact);
+            }
+        } else {
+            g_sysact_down[m.sysact] = FALSE;
+        }
+        return TRUE;
+    }
+
     /* Honour "ECS Keyboard" input mode here exactly as window.c's own
      * forward_key does. Without this branch, typing while THIS window holds
      * focus drove the hand controllers even with ECS keyboard mode on --
@@ -618,9 +696,6 @@ static gboolean forward_key(GtkEventControllerKey *c, guint keyval,
         return TRUE;
     }
 
-    /* _bound, not the pure table: a remap made here (or in any other
-     * window) has to take effect here too. */
-    m = intvsession_key_from_keysym_bound(g_session, keysym);
     if (m.kind == INTVSESSION_MAP_KEY)
         intvsession_pad_key(g_session, m.side, m.key, down);
     else if (m.kind == INTVSESSION_MAP_DISC)
@@ -646,11 +721,18 @@ static void on_key_released(GtkEventControllerKey *c, guint keyval,
 
 static gboolean on_close_request(GtkWindow *win, gpointer user_data)
 {
+    int a;
     (void)user_data;
     /* A Map sequence left armed behind a hidden window would still be
      * capturing gamepad input on the next show -- abort it, same as
      * clicking Map again to cancel. */
     map_reset_ui();
+    /* Same reasoning as window.c's own on_focus_leave: a sysaction key held
+     * when this window loses focus/closes shouldn't leave its slot stuck
+     * "down" and unable to fire again until some other window sees the
+     * matching release. */
+    for (a = 0; a < INTVSESSION_SYSACT_COUNT; a++)
+        g_sysact_down[a] = FALSE;
     gtk_widget_set_visible(GTK_WIDGET(win), FALSE);
     return TRUE; /* don't destroy -- this is a singleton, hide and reuse */
 }
@@ -718,6 +800,7 @@ static void ensure_window(GtkWindow *parent, intvsession *session)
     gtk_widget_set_margin_top(outer, 12);
     gtk_widget_set_margin_bottom(outer, 16);
     gtk_box_append(GTK_BOX(outer), panels);
+    gtk_box_append(GTK_BOX(outer), build_system_row());
     gtk_box_append(GTK_BOX(outer), build_map_row());
 
     header = adw_header_bar_new();

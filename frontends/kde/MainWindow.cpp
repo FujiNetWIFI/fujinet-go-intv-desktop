@@ -42,6 +42,23 @@ MainWindow::MainWindow(intvsession *session, QWidget *parent)
 
     buildMenus();
     m_display->setFocus();
+
+    /* ~100ms: fast enough that a gamepad press feels immediate, cheap
+     * enough to run for the app's whole lifetime. */
+    m_sysactTimer = new QTimer(this);
+    connect(m_sysactTimer, &QTimer::timeout, this,
+           &MainWindow::drainSysactions);
+    m_sysactTimer->start(100);
+}
+
+void MainWindow::drainSysactions()
+{
+    intvsession_sysaction a;
+    while (intvsession_sysaction_take(m_session, &a)) {
+        if (intvsession_sysaction_fire(m_session, a) != 0)
+            statusBar()->showMessage(
+                QString::fromUtf8(intvsession_last_error(m_session)), 5000);
+    }
 }
 
 void MainWindow::showDebugger()
@@ -79,6 +96,16 @@ void MainWindow::resetToConfig()
     m_display->setFocus();
 }
 
+void MainWindow::resetGame()
+{
+    if (intvsession_reset_game(m_session) != 0)
+        statusBar()->showMessage(
+            QString::fromUtf8(intvsession_last_error(m_session)), 5000);
+    else
+        statusBar()->showMessage(QStringLiteral("Reset Game"), 5000);
+    m_display->setFocus();
+}
+
 void MainWindow::showSettings()
 {
     SettingsDialog dlg(m_session, this);
@@ -103,6 +130,19 @@ void MainWindow::buildMenus()
                     this, &MainWindow::showDebugger);
 
     QMenu *fujinet = menuBar()->addMenu(QStringLiteral("&FujiNet"));
+    /* No QKeySequence here, deliberately: Backspace is a *remappable*
+     * default (core/src/bindings.c), not a fixed accelerator like Ctrl+R
+     * below. Binding one here would fire Reset Game on plain Backspace
+     * forever, even after a keypad window Map-mode remap moved that action
+     * to a different key -- DisplayWidget claims the ShortcutOverride for
+     * everything except F9/F11/F12 specifically so menu accelerators can't
+     * shadow what the machine should receive (see its own header), but a
+     * KeypadWindow with focus doesn't, so this would have raced the
+     * bindings table there. The mouse-clickable menu entry is enough; the
+     * real trigger is intvForwardKey's MAP_SYSACT dispatch (KeyForward.cpp),
+     * which honours whatever the user has actually bound. */
+    fujinet->addAction(QStringLiteral("Reset &Game (Backspace)"), this,
+                       &MainWindow::resetGame);
     fujinet->addAction(QStringLiteral("&Reset to CONFIG"),
                        QKeySequence(Qt::CTRL | Qt::Key_R), this,
                        &MainWindow::resetToConfig);

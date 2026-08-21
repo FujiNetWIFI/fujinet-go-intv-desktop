@@ -19,19 +19,21 @@
 static intvsession_key_mapping key(intvsession_pad_side side,
                                    intvsession_key k)
 {
-    intvsession_key_mapping m = {INTVSESSION_MAP_KEY, side, k, 0};
+    intvsession_key_mapping m = { .kind = INTVSESSION_MAP_KEY, .side = side,
+                                  .key = k };
     return m;
 }
 
 static intvsession_key_mapping disc(intvsession_pad_side side, int dir)
 {
-    intvsession_key_mapping m = {INTVSESSION_MAP_DISC, side, 0, dir};
+    intvsession_key_mapping m = { .kind = INTVSESSION_MAP_DISC, .side = side,
+                                  .direction = dir };
     return m;
 }
 
 static intvsession_key_mapping none(void)
 {
-    intvsession_key_mapping m = {INTVSESSION_MAP_NONE, 0, 0, 0};
+    intvsession_key_mapping m = { .kind = INTVSESSION_MAP_NONE };
     return m;
 }
 

@@ -34,21 +34,24 @@
  * GetAncestor(..., GA_ROOT) rather than which child currently has focus.
  *
  * MAP MODE: a bottom row (map_select_target and friends, near the end of
- * this file) lets a click on any of the 15 digit/action buttons above, OR
- * any of the 16 disc segments, be rebound to a different keyboard key or
- * gamepad button, through core/src/bindings.c's remappable layer -- see
+ * this file) lets a click on any of the 15 digit/action buttons above, any
+ * of the 16 disc segments, OR either of the System row's two buttons
+ * (Reset Game / Reset to CONFIG, build_system_row -- machine-global system
+ * actions, not per-side), be rebound to a different keyboard key or gamepad
+ * button, through core/src/bindings.c's remappable layer -- see
  * intvsession.h's own "remappable bindings" section for the contract. While
  * armed, map_intercept_key_msg (checked ahead of intv_forward_key_msg in
  * intv_keypad_pretranslate below) swallows the next keystroke for the
  * mapping instead of letting it reach the machine, and key_btn_proc's/
- * disc_proc's own WM_LBUTTONDOWN handling picks the map target instead of
- * injecting a pad key or disc direction. Highlight is BM_SETSTATE (the
- * native "pressed" look, driven programmatically, rather than an owner-draw
- * custom style) on the Map button and whichever keypad button is the
- * current target, or an amber wedge on the disc when the target is a disc
- * segment. A gamepad button press is polled for on a short WM_TIMER
- * (IDT_GAMEPAD_POLL below) since core/src/gamepad_sdl.c's capture result
- * lands on its own background thread, not this window's.
+ * disc_proc's own WM_LBUTTONDOWN handling (or the System row's own
+ * WM_COMMAND/BN_CLICKED, see keypad_wnd_proc) picks the map target instead
+ * of injecting a pad key/disc direction/system action. Highlight is
+ * BM_SETSTATE (the native "pressed" look, driven programmatically, rather
+ * than an owner-draw custom style) on the Map button and whichever keypad
+ * button is the current target, or an amber wedge on the disc when the
+ * target is a disc segment. A gamepad button press is polled for on a
+ * short WM_TIMER (IDT_GAMEPAD_POLL below) since core/src/gamepad_sdl.c's
+ * capture result lands on its own background thread, not this window's.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -108,8 +111,11 @@ typedef enum {
     MAP_WAIT_INPUT,     /* target picked, waiting for a key/pad press */
 } map_state_t;
 
-#define IDC_KEYPAD_MAP   2001
-#define IDC_KEYPAD_RESET 2002
+#define IDC_KEYPAD_MAP    2001
+#define IDC_KEYPAD_RESET  2002
+/* One id per intvsession_sysaction, IDC_KEYPAD_SYSACT_BASE + a -- see
+ * build_system_row and keypad_wnd_proc's own WM_COMMAND handling. */
+#define IDC_KEYPAD_SYSACT_BASE 2003
 #define IDT_GAMEPAD_POLL 1
 
 static map_state_t g_map_state = MAP_IDLE;
@@ -120,6 +126,8 @@ static HWND g_status_label;
 /* [side][key] -- only INTVSESSION_PAD_LEFT/_RIGHT are ever populated, the
  * two panels this window builds. */
 static HWND g_key_buttons[2][INTVSESSION_KEY_COUNT];
+/* Indexed by intvsession_sysaction -- see build_system_row. */
+static HWND g_sysact_buttons[INTVSESSION_SYSACT_COUNT];
 /* [side] -- same two sides, this window's own disc_state* for each panel's
  * disc, a direct pointer rather than another GWLP_USERDATA lookup, safe
  * because the disc windows live for the whole process (this window hides
@@ -143,9 +151,10 @@ static void map_set_status(const char *text)
 }
 
 /* Highlights (or clears) whichever target g_map_target currently names,
- * MAP_KEY or MAP_DISC alike -- every set_highlighted(g_key_buttons[...])
- * call site below that used to be scoped to a (side,key) pair now goes
- * through this instead, so Map mode doesn't need two parallel code paths. */
+ * MAP_KEY/MAP_DISC/MAP_SYSACT alike -- every set_highlighted(g_key_buttons
+ * [...]) call site below that used to be scoped to a (side,key) pair now
+ * goes through this instead, so Map mode doesn't need parallel code paths
+ * per kind. */
 static void map_highlight(int on)
 {
     if (g_map_target.kind == INTVSESSION_MAP_KEY) {
@@ -158,6 +167,8 @@ static void map_highlight(int on)
             if (d->hwnd)
                 InvalidateRect(d->hwnd, NULL, FALSE);
         }
+    } else if (g_map_target.kind == INTVSESSION_MAP_SYSACT) {
+        set_highlighted(g_sysact_buttons[g_map_target.sysact], on);
     }
 }
 
@@ -571,23 +582,48 @@ static void build_controller(HWND parent, HINSTANCE inst, intvsession *session,
         g_discs[side] = s;
 }
 
-/* The Map/Reset row beneath both controller panels, which end around
- * y=366 (see build_controller's own arithmetic: oy=8, plus 26 title + 4*36
- * digit rows + 8 + 28 action row + 44 + DISC_SIZE(150) disc). See this
- * file's own header for the state machine map_select_target/map_complete_*
- * and keypad_wnd_proc's WM_COMMAND handling implement together. */
+/* The System row beneath both controller panels, which end at y=372 (see
+ * build_controller's own arithmetic: oy=8, plus 26 title + 4*36 digit rows
+ * + 8 + 28 action row + 44 + DISC_SIZE(150) disc = 8+26+144+8+28+44+150).
+ * Reset Game / Reset to CONFIG -- machine-global system actions, distinct
+ * from the Map row's own "Reset Bindings" below, and themselves Map-mode
+ * targets like every keypad digit/action button and disc segment. Plain
+ * BS_PUSHBUTTON controls routed through keypad_wnd_proc's own WM_COMMAND
+ * (IDC_KEYPAD_SYSACT_BASE + a) -- NOT make_key, which subclasses with
+ * key_btn_proc for a held press/release pair a sysaction doesn't want, and
+ * would also clobber the file-static g_btn_proc it shares with every keypad
+ * digit button. */
+static void build_system_row(HWND parent, HINSTANCE inst)
+{
+    int a;
+    int x = 170 - (INTVSESSION_SYSACT_COUNT - 1) * 20; /* roughly centered */
+
+    for (a = 0; a < INTVSESSION_SYSACT_COUNT; a++) {
+        HWND btn = CreateWindowExA(
+            0, "BUTTON", intvsession_sysaction_name((intvsession_sysaction)a),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x, 380, 120, 28, parent,
+            (HMENU)(INT_PTR)(IDC_KEYPAD_SYSACT_BASE + a), inst, NULL);
+        g_sysact_buttons[a] = btn;
+        x += 128;
+    }
+}
+
+/* The Map/Reset row beneath the System row (y=416, see build_system_row's
+ * own arithmetic: 380 + 28 button height + 8 gap). See this file's own
+ * header for the state machine map_select_target/map_complete_* and
+ * keypad_wnd_proc's WM_COMMAND handling implement together. */
 static void build_map_row(HWND parent, HINSTANCE inst)
 {
     g_map_btn = CreateWindowExA(0, "BUTTON", "Map",
                                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 170,
-                                380, 80, 28, parent,
+                                416, 80, 28, parent,
                                 (HMENU)(INT_PTR)IDC_KEYPAD_MAP, inst, NULL);
     CreateWindowExA(0, "BUTTON", "Reset Bindings",
-                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 258, 380, 140, 28,
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 258, 416, 140, 28,
                     parent, (HMENU)(INT_PTR)IDC_KEYPAD_RESET, inst, NULL);
     g_status_label =
         CreateWindowExA(0, "STATIC", "",
-                        WS_CHILD | WS_VISIBLE | SS_CENTER, 8, 416, 464, 48,
+                        WS_CHILD | WS_VISIBLE | SS_CENTER, 8, 452, 464, 48,
                         parent, NULL, inst, NULL);
 }
 
@@ -613,6 +649,22 @@ static LRESULT CALLBACK keypad_wnd_proc(HWND hwnd, UINT msg, WPARAM wp,
                 if (g_map_session) {
                     intvsession_bindings_reset(g_map_session);
                     map_set_status("Bindings reset to default");
+                }
+            } else if (id >= IDC_KEYPAD_SYSACT_BASE &&
+                      id < IDC_KEYPAD_SYSACT_BASE + INTVSESSION_SYSACT_COUNT) {
+                /* Reset Game / Reset to CONFIG -- see build_system_row's own
+                 * header. Three Map states, same as every keypad digit/
+                 * disc segment (key_btn_proc/disc_proc): PICK_TARGET picks
+                 * this as the map target, WAIT_INPUT swallows the click
+                 * (waiting for a key/pad press, not another click), IDLE
+                 * fires it. */
+                intvsession_sysaction a =
+                    (intvsession_sysaction)(id - IDC_KEYPAD_SYSACT_BASE);
+                if (g_map_state == MAP_PICK_TARGET) {
+                    map_select_target(intvsession_target_sysaction(a));
+                } else if (g_map_state == MAP_IDLE && g_map_session) {
+                    if (intvsession_sysaction_fire(g_map_session, a) != 0)
+                        map_set_status(intvsession_last_error(g_map_session));
                 }
             }
         }
@@ -684,13 +736,14 @@ void intv_keypad_window_toggle(HWND parent, intvsession *session)
     g_map_session = session;
 
     g_win = CreateWindowExA(0, "IntvKeypadWindow", "Keypad", WS_OVERLAPPEDWINDOW,
-                            CW_USEDEFAULT, CW_USEDEFAULT, 480, 560, parent,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 480, 600, parent,
                             NULL, inst, NULL);
 
     build_controller(g_win, inst, session, INTVSESSION_PAD_LEFT, 8, 8,
                      "Left Controller");
     build_controller(g_win, inst, session, INTVSESSION_PAD_RIGHT, 240, 8,
                      "Right Controller");
+    build_system_row(g_win, inst);
     build_map_row(g_win, inst);
 
     ShowWindow(g_win, SW_SHOW);

@@ -34,6 +34,26 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.7.0" date="2026-08-21">
+      <description>
+        <p>
+          There was no way to restart the game you were playing short of
+          reloading it from FujiNet CONFIG, and no keyboard shortcut back to
+          CONFIG itself -- only a menu item and Ctrl+R, unreachable from a
+          gamepad and unable to be remapped to a different key.
+        </p>
+        <p>
+          Backspace now soft-resets the running game in place, the way a
+          real Intellivision's own RESET switch does: the cartridge stays
+          mapped and FujiNet stays connected, so a game pushed over the
+          network restarts as itself instead of dropping back to CONFIG.
+          Escape returns to CONFIG, reachable by keypress now as well as the
+          menu. Both are new buttons in the keypad window's own row and, like
+          every keypad button and disc segment, can be rebound to any key or
+          gamepad button through Map mode.
+        </p>
+      </description>
+    </release>
     <release version="0.6.0" date="2026-08-21">
       <description>
         <p>

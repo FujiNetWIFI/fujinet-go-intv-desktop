@@ -23,6 +23,18 @@ extern "C" {
 int intv_gamepad_start(void);
 void intv_gamepad_stop(void);
 
+/* Clears every pad slot's per-side "last direction sent" cache (poll_sticks'
+ * own last_disc[]) back to a value neither intv_disc_from_stick nor
+ * intv_disc_from_dpad can ever return, so the very next poll re-asserts the
+ * disc's state -- including centered -- even if the stick/D-pad hasn't
+ * physically moved. Call after anything that resets the emulated disc out
+ * from under poll_sticks' own bookkeeping (session.c's intvsession_reset_
+ * game does, via intv_host_reset -- see that function): otherwise a stick or
+ * D-pad still held at the moment of reset reads as "unchanged" on every
+ * subsequent poll and the disc stays stuck centered in the machine until
+ * the player physically releases and re-presses it. */
+void intv_gamepad_forget_disc(void);
+
 /* Pure functions -- see gamepad_sdl.c for the full contract of each;
  * unit-tested in core/tests/gamepad_test.c without any hardware attached. */
 int intv_disc_from_stick(float x, float y, float deadzone);

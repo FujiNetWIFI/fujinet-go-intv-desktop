@@ -7,16 +7,19 @@
  * settings-store persistence and the human-readable name tables a Map mode
  * needs for its status line.
  *
- * A "target" is either one of the 15 keypad/action buttons or one of the
- * disc's 16 clock positions, per side -- see intvsession_key_mapping and
- * intvsession_target_key/_target_disc in intvsession.h. Internally both
- * kinds live in the same per-side array, keypad/action buttons at slots
- * 0..INTVSESSION_KEY_COUNT-1 and disc positions at DISC_SLOT(0..15) right
- * after them (slot_for_target/target_for_slot below convert). Appended, not
- * inserted: the persisted "bindings" string names a slot by number, so an
- * older build's parser (whose range check tops out at the old
- * INTVSESSION_KEY_COUNT) simply ignores the disc slots it doesn't know about
- * instead of misreading them as some other keypad key.
+ * A "target" is one of the 15 keypad/action buttons or one of the disc's 16
+ * clock positions, per side, or one of the machine-global system actions
+ * (Reset Game, Reset to CONFIG) -- see intvsession_key_mapping and
+ * intvsession_target_key/_target_disc/_target_sysaction in intvsession.h.
+ * Internally all three kinds live in the same per-side array: keypad/action
+ * buttons at slots 0..INTVSESSION_KEY_COUNT-1, disc positions at
+ * DISC_SLOT(0..15) right after them, and system actions at
+ * SYSACT_SLOT(0..INTVSESSION_SYSACT_COUNT-1) after that, LEFT side only
+ * (slot_for_target/target_for_slot below convert). Appended, not inserted:
+ * the persisted "bindings" string names a slot by number, so an older
+ * build's parser (whose range check tops out at the old NUM_SLOTS) simply
+ * ignores whatever trailing slots it doesn't know about instead of
+ * misreading them as some other keypad key.
  *
  * Two tables, not one: s_defaults is computed once per bindings_init call and
  * never mutated again, s_table is the live, user-editable copy. Diffing the
@@ -41,9 +44,14 @@
 
 /* See this file's own header: slots 0..INTVSESSION_KEY_COUNT-1 are the
  * keypad/action buttons (index == intvsession_key), slots DISC_SLOT(0)
- * .. DISC_SLOT(15) are the disc's 16 clock positions. */
+ * .. DISC_SLOT(15) are the disc's 16 clock positions, and slots
+ * SYSACT_SLOT(0) .. SYSACT_SLOT(INTVSESSION_SYSACT_COUNT-1) -- LEFT side
+ * only, see intvsession_target_sysaction's own comment -- are the
+ * machine-global system actions (Reset Game, Reset to CONFIG). */
 #define DISC_SLOT(dir) (INTVSESSION_KEY_COUNT + (dir))
-#define NUM_SLOTS (INTVSESSION_KEY_COUNT + INTVSESSION_DISC_POSITIONS)
+#define SYSACT_SLOT(a) (INTVSESSION_KEY_COUNT + INTVSESSION_DISC_POSITIONS + (a))
+#define NUM_SLOTS (INTVSESSION_KEY_COUNT + INTVSESSION_DISC_POSITIONS + \
+                  INTVSESSION_SYSACT_COUNT)
 
 static intvsession_binding s_defaults[NUM_SIDES][NUM_SLOTS];
 static intvsession_binding s_table[NUM_SIDES][NUM_SLOTS];
@@ -95,22 +103,29 @@ static int slot_for_target(intvsession_key_mapping t)
             return -1;
         return DISC_SLOT(t.direction);
     }
+    if (t.kind == INTVSESSION_MAP_SYSACT) {
+        if (t.sysact < 0 || t.sysact >= INTVSESSION_SYSACT_COUNT)
+            return -1;
+        return SYSACT_SLOT(t.sysact);
+    }
     return -1;
 }
 
 static intvsession_key_mapping target_for_slot(int side, int slot)
 {
-    intvsession_key_mapping m;
+    intvsession_key_mapping m = { 0 };
 
     m.side = (intvsession_pad_side)side;
     if (slot < INTVSESSION_KEY_COUNT) {
         m.kind = INTVSESSION_MAP_KEY;
         m.key = (intvsession_key)slot;
-        m.direction = 0;
-    } else {
+    } else if (slot < INTVSESSION_KEY_COUNT + INTVSESSION_DISC_POSITIONS) {
         m.kind = INTVSESSION_MAP_DISC;
-        m.key = 0;
         m.direction = slot - INTVSESSION_KEY_COUNT;
+    } else {
+        m.kind = INTVSESSION_MAP_SYSACT;
+        m.sysact = (intvsession_sysaction)
+                (slot - INTVSESSION_KEY_COUNT - INTVSESSION_DISC_POSITIONS);
     }
     return m;
 }
@@ -118,14 +133,29 @@ static intvsession_key_mapping target_for_slot(int side, int slot)
 intvsession_key_mapping intvsession_target_key(intvsession_pad_side side,
                                                 intvsession_key key)
 {
-    intvsession_key_mapping m = { INTVSESSION_MAP_KEY, side, key, 0 };
+    intvsession_key_mapping m = { .kind = INTVSESSION_MAP_KEY, .side = side,
+                                  .key = key };
     return m;
 }
 
 intvsession_key_mapping intvsession_target_disc(intvsession_pad_side side,
                                                  int direction)
 {
-    intvsession_key_mapping m = { INTVSESSION_MAP_DISC, side, 0, direction };
+    intvsession_key_mapping m = { .kind = INTVSESSION_MAP_DISC, .side = side,
+                                  .direction = direction };
+    return m;
+}
+
+/* .side is always LEFT -- a sysaction is machine-global, not per-side, but
+ * still needs some side to key its slot in s_table/s_defaults (see
+ * SYSACT_SLOT below). Left was picked arbitrarily; every lookup that can
+ * reach a sysaction target (bindings_target_from_button's fallback,
+ * intvsession_target_set_button's steal scan) knows to treat it specially,
+ * so nothing outside this file needs to know slots exist there at all. */
+intvsession_key_mapping intvsession_target_sysaction(intvsession_sysaction a)
+{
+    intvsession_key_mapping m = { .kind = INTVSESSION_MAP_SYSACT,
+                                  .side = INTVSESSION_PAD_LEFT, .sysact = a };
     return m;
 }
 
@@ -213,6 +243,18 @@ static void compute_defaults_locked(void)
         s_defaults[side][INTVSESSION_ACTION_LOWER_LEFT].button =
             INTVSESSION_PAD_BTN_WEST;
     }
+
+    /* System action defaults: Backspace/Escape, LEFT side's sysact slots
+     * only (see intvsession_target_sysaction's own comment on why a
+     * sysaction lives on one arbitrary side). Both keysyms are already
+     * walked by the special_keysyms sweep above, but intvsession_key_from_
+     * keysym has no case for either (falls to its default: none()), so
+     * neither claimed a slot there -- these are genuinely free. No gamepad
+     * default for either; a player opts in via Map mode. */
+    s_defaults[INTVSESSION_PAD_LEFT][SYSACT_SLOT(INTVSESSION_SYSACT_RESET_GAME)]
+        .keysym = INTVSESSION_KEYSYM_BACKSPACE;
+    s_defaults[INTVSESSION_PAD_LEFT][SYSACT_SLOT(INTVSESSION_SYSACT_RESET_CONFIG)]
+        .keysym = INTVSESSION_KEYSYM_ESCAPE;
 }
 
 static void reset_to_defaults_locked(void)
@@ -240,19 +282,25 @@ static void pack_locked(char *buf, size_t bufsz)
         for (slot = 0; slot < NUM_SLOTS; slot++) {
             const intvsession_binding *cur = &s_table[side][slot];
             const intvsession_binding *def = &s_defaults[side][slot];
+            /* Clamped separately from `used`: forming buf+used once used
+             * has run past bufsz -- which NUM_SLOTS growing over time makes
+             * less and less theoretical -- would be a pointer more than one
+             * past the end, UB even though snprintf's size-0 call never
+             * dereferences it. */
+            size_t off = used < bufsz ? used : bufsz;
             int n;
 
             if (cur->keysym != def->keysym) {
-                n = snprintf(buf + used, used < bufsz ? bufsz - used : 0,
-                            "%s%d.%d.k:%u", used ? ";" : "", side, slot,
+                n = snprintf(buf + off, bufsz - off, "%s%d.%d.k:%u",
+                            used ? ";" : "", side, slot,
                             (unsigned)cur->keysym);
                 if (n > 0)
                     used += (size_t)n;
             }
+            off = used < bufsz ? used : bufsz;
             if (cur->button != def->button) {
-                n = snprintf(buf + used, used < bufsz ? bufsz - used : 0,
-                            "%s%d.%d.p:%d", used ? ";" : "", side, slot,
-                            (int)cur->button);
+                n = snprintf(buf + off, bufsz - off, "%s%d.%d.p:%d",
+                            used ? ";" : "", side, slot, (int)cur->button);
                 if (n > 0)
                     used += (size_t)n;
             }
@@ -308,7 +356,7 @@ void bindings_init(struct intvsession *s)
 
 static intvsession_key_mapping none_mapping(void)
 {
-    intvsession_key_mapping m = { INTVSESSION_MAP_NONE, 0, 0, 0 };
+    intvsession_key_mapping m = { .kind = INTVSESSION_MAP_NONE };
     return m;
 }
 
@@ -393,7 +441,11 @@ intvsession_binding intvsession_binding_get(intvsession *s,
 
 /* Gamepad-button lookup, scoped to one side only -- see bindings.h. Now
  * returns MAP_DISC too, since a button can drive a disc segment as well as a
- * keypad key. */
+ * keypad key. Falls back to LEFT's system-action slots when `side` isn't
+ * LEFT and the per-side scan misses: a sysaction target is always stored on
+ * LEFT (see intvsession_target_sysaction's own comment) regardless of which
+ * side's physical pad the player used to bind it, so a pad bound to RIGHT
+ * (or ECS_LEFT/ECS_RIGHT) can still fire one. */
 intvsession_key_mapping bindings_target_from_button(intvsession_pad_side side,
                                                      intvsession_pad_button button)
 {
@@ -407,6 +459,18 @@ intvsession_key_mapping bindings_target_from_button(intvsession_pad_side side,
             intvsession_key_mapping m = target_for_slot(side, slot);
             pthread_mutex_unlock(&s_mtx);
             return m;
+        }
+    }
+    if (side != INTVSESSION_PAD_LEFT) {
+        int a;
+        for (a = 0; a < INTVSESSION_SYSACT_COUNT; a++) {
+            slot = SYSACT_SLOT(a);
+            if (s_table[INTVSESSION_PAD_LEFT][slot].button == button) {
+                intvsession_key_mapping m =
+                    target_for_slot(INTVSESSION_PAD_LEFT, slot);
+                pthread_mutex_unlock(&s_mtx);
+                return m;
+            }
         }
     }
     pthread_mutex_unlock(&s_mtx);
@@ -480,6 +544,15 @@ const char *intvsession_disc_dir_name(int direction)
     if (direction < 0 || direction >= INTVSESSION_DISC_POSITIONS)
         return "?";
     return disc_dir_names[direction];
+}
+
+const char *intvsession_sysaction_name(intvsession_sysaction a)
+{
+    switch (a) {
+    case INTVSESSION_SYSACT_RESET_GAME:   return "Reset Game";
+    case INTVSESSION_SYSACT_RESET_CONFIG: return "Reset to CONFIG";
+    default:                             return "?";
+    }
 }
 
 /* Xbox-style face-button letters -- SDL3's own SOUTH/EAST/WEST/NORTH names
@@ -573,6 +646,12 @@ int intvsession_target_name(intvsession_key_mapping target, char *dst,
         snprintf(buf, sizeof(buf), "%s disc %s",
                 intvsession_pad_side_name(target.side),
                 intvsession_disc_dir_name(target.direction));
+    else if (target.kind == INTVSESSION_MAP_SYSACT)
+        /* No side prefix -- a sysaction isn't per-side (see
+         * intvsession_target_sysaction's own comment), so ".side" here is
+         * an implementation detail this name deliberately doesn't leak. */
+        snprintf(buf, sizeof(buf), "%s",
+                intvsession_sysaction_name(target.sysact));
     else
         buf[0] = '\0';
 
@@ -660,7 +739,7 @@ void intvsession_target_set_key(intvsession *s, intvsession_key_mapping target,
 void intvsession_target_set_button(intvsession *s, intvsession_key_mapping target,
         intvsession_pad_button button, char *stolen, int stolensz)
 {
-    int slot, cur_slot = -1;
+    int slot, cur_slot = -1, cur_side = target.side;
     int k;
 
     if (stolen && stolensz > 0)
@@ -673,20 +752,53 @@ void intvsession_target_set_button(intvsession *s, intvsession_key_mapping targe
 
     pthread_mutex_lock(&s_mtx);
     if (button != INTVSESSION_PAD_BTN_NONE) {
-        for (k = 0; k < NUM_SLOTS; k++) {
-            if (s_table[target.side][k].button == button) {
-                cur_slot = k;
-                break;
+        if (target.kind == INTVSESSION_MAP_SYSACT) {
+            /* A sysaction target is machine-global (always stored on LEFT,
+             * see intvsession_target_sysaction's own comment), but the
+             * button being bound to it can currently belong to ANY side --
+             * a physical gamepad's face buttons get the same per-side
+             * defaults on all four (compute_defaults_locked). Scanning and
+             * clearing only target.side (always LEFT) would miss a claim on
+             * RIGHT/ECS_LEFT/ECS_RIGHT, leaving that side able to fire the
+             * same button's old action right alongside the new sysaction --
+             * so every side holding this button is cleared, not just the
+             * first, keeping this consistent with bindings_target_from_
+             * button's own cross-side fallback. `stolen` still names only
+             * the first one found; a button hitting more than one side at
+             * once shouldn't happen given every other setter's own
+             * per-side-unique invariant, but clearing all of them is
+             * correct even if it somehow did. */
+            int side;
+            for (side = 0; side < NUM_SIDES; side++) {
+                for (k = 0; k < NUM_SLOTS; k++) {
+                    if (s_table[side][k].button == button) {
+                        if (cur_slot < 0) {
+                            cur_side = side;
+                            cur_slot = k;
+                        }
+                        s_table[side][k].button = INTVSESSION_PAD_BTN_NONE;
+                    }
+                }
+            }
+        } else {
+            for (k = 0; k < NUM_SLOTS; k++) {
+                if (s_table[target.side][k].button == button) {
+                    cur_slot = k;
+                    s_table[target.side][k].button = INTVSESSION_PAD_BTN_NONE;
+                    break;
+                }
             }
         }
     }
-    if (cur_slot == slot)
-        cur_slot = -1;
+    if (cur_slot == slot && cur_side == (int)target.side)
+        cur_slot = -1; /* re-bound to the slot it already occupies -- not a
+                        * steal, see intvsession_target_set_key's own
+                        * comment on the same rule. The slot itself was
+                        * already cleared above; the unconditional write
+                        * below puts `button` straight back. */
     if (cur_slot >= 0 && stolen && stolensz > 0)
-        intvsession_target_name(target_for_slot(target.side, cur_slot),
+        intvsession_target_name(target_for_slot(cur_side, cur_slot),
                                 stolen, stolensz);
-    if (cur_slot >= 0)
-        s_table[target.side][cur_slot].button = INTVSESSION_PAD_BTN_NONE;
     s_table[target.side][slot].button = button;
     persist_locked_then(s); /* unlocks s_mtx */
 }

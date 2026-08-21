@@ -27,6 +27,14 @@ struct _IntvWindow {
     intvsession *session;
     IntvDisplay *display;
     AdwToastOverlay *toasts;
+    /* GTK4's key-pressed signal carries no repeat flag (unlike KDE/macOS,
+     * which drop repeats before this code ever sees them) -- tracked by
+     * hand so holding a sysaction key (e.g. Backspace) fires Reset Game
+     * once on press, not ~60 times/sec for as long as it's held. Cleared on
+     * focus loss (on_focus_leave) alongside the ECS matrix, so a key held
+     * when focus moves elsewhere doesn't leave its slot stuck "down". */
+    gboolean sysact_down[INTVSESSION_SYSACT_COUNT];
+    guint sysact_timer_id;
 };
 
 G_DEFINE_FINAL_TYPE(IntvWindow, intv_window, ADW_TYPE_APPLICATION_WINDOW)
@@ -58,6 +66,36 @@ static gboolean forward_key(IntvWindow *self, GtkEventControllerKey *ctrl,
 {
     uint32_t keysym = intv_keysym_from_key_event(ctrl, keyval, keycode, state);
 
+    /* _bound, not the pure table: a keypad window "Map" remap has to take
+     * effect here too, since typing while the main window holds focus is
+     * the common case, not the exception. Resolved once, up front, so a
+     * system-action target can be checked ahead of ECS keyboard mode
+     * below. */
+    intvsession_key_mapping m = intvsession_key_from_keysym_bound(self->session,
+                                                                  keysym);
+
+    /* System actions outrank ECS keyboard mode: Escape/Backspace default to
+     * Reset to CONFIG/Reset Game, but both are also real ECS keys
+     * (intv_keymap.c's ecs_key_from_keysym) -- ESC has to always be able to
+     * get back to CONFIG regardless of which mode has the keyboard. Cost:
+     * ESC/Backspace stop reaching the emulated ECS matrix from the HOST
+     * keyboard while bound this way; the F10 on-screen ECS keyboard window
+     * is unaffected (ecskbd_window.c calls intvsession_ecs_key_set
+     * directly, ignoring keyboard_mode). GTK4 delivers no repeat flag on
+     * key-pressed, so self->sysact_down gates this to the leading edge --
+     * see that field's own comment. */
+    if (m.kind == INTVSESSION_MAP_SYSACT) {
+        if (down) {
+            if (!self->sysact_down[m.sysact]) {
+                self->sysact_down[m.sysact] = TRUE;
+                intvsession_sysaction_fire(self->session, m.sysact);
+            }
+        } else {
+            self->sysact_down[m.sysact] = FALSE;
+        }
+        return TRUE;
+    }
+
     /* "ECS Keyboard" input mode (Preferences -> Input, or toggled live from
      * there) steals the host keyboard for the ECS's own keyboard instead of
      * the hand controllers -- the two can't both claim it at once. See
@@ -69,11 +107,6 @@ static gboolean forward_key(IntvWindow *self, GtkEventControllerKey *ctrl,
         return TRUE;
     }
 
-    /* _bound, not the pure table: a keypad window "Map" remap has to take
-     * effect here too, since typing while the main window holds focus is
-     * the common case, not the exception. */
-    intvsession_key_mapping m = intvsession_key_from_keysym_bound(self->session,
-                                                                  keysym);
     if (m.kind == INTVSESSION_MAP_KEY)
         intvsession_pad_key(self->session, m.side, m.key, down);
     else if (m.kind == INTVSESSION_MAP_DISC)
@@ -139,8 +172,11 @@ static void on_focus_leave(GtkEventControllerFocus *controller,
                            gpointer user_data)
 {
     IntvWindow *self = INTV_WINDOW(user_data);
+    int i;
     (void)controller;
     intvsession_ecs_keys_clear(self->session);
+    for (i = 0; i < INTVSESSION_SYSACT_COUNT; i++)
+        self->sysact_down[i] = FALSE;
 }
 
 /* ---- actions ------------------------------------------------------------ */
@@ -173,6 +209,18 @@ static void action_reset_config(GSimpleAction *action, GVariant *param,
         intv_window_toast(self, intvsession_last_error(self->session));
     else
         intv_window_toast(self, "Reset to CONFIG");
+}
+
+static void action_reset_game(GSimpleAction *action, GVariant *param,
+                              gpointer user_data)
+{
+    IntvWindow *self = INTV_WINDOW(user_data);
+    (void)action;
+    (void)param;
+    if (intvsession_reset_game(self->session) != 0)
+        intv_window_toast(self, intvsession_last_error(self->session));
+    else
+        intv_window_toast(self, "Reset Game");
 }
 
 static void action_fujinet_config(GSimpleAction *action, GVariant *param,
@@ -259,6 +307,7 @@ static void action_about(GSimpleAction *action, GVariant *param,
 static const GActionEntry win_actions[] = {
     {.name = "keypad", .activate = action_keypad},
     {.name = "ecs-keyboard", .activate = action_ecs_keyboard},
+    {.name = "reset-game", .activate = action_reset_game},
     {.name = "reset-config", .activate = action_reset_config},
     {.name = "fujinet-config", .activate = action_fujinet_config},
     {.name = "fujinet-log", .activate = action_fujinet_log},
@@ -267,9 +316,19 @@ static const GActionEntry win_actions[] = {
     {.name = "about", .activate = action_about},
 };
 
+static void intv_window_dispose(GObject *object)
+{
+    IntvWindow *self = INTV_WINDOW(object);
+    if (self->sysact_timer_id) {
+        g_source_remove(self->sysact_timer_id);
+        self->sysact_timer_id = 0;
+    }
+    G_OBJECT_CLASS(intv_window_parent_class)->dispose(object);
+}
+
 static void intv_window_class_init(IntvWindowClass *klass)
 {
-    (void)klass;
+    G_OBJECT_CLASS(klass)->dispose = intv_window_dispose;
 }
 
 static void intv_window_init(IntvWindow *self)
@@ -289,6 +348,7 @@ static GMenu *build_menu(void)
     g_menu_append(view, "Debugger (F12)", "win.debugger");
     g_menu_append_section(menu, "View", G_MENU_MODEL(view));
 
+    g_menu_append(fujinet, "Reset Game (Backspace)", "win.reset-game");
     g_menu_append(fujinet, "Reset to CONFIG (Ctrl+R)", "win.reset-config");
     g_menu_append(fujinet, "FujiNet Configuration…", "win.fujinet-config");
     g_menu_append(fujinet, "FujiNet Console Log…", "win.fujinet-log");
@@ -302,6 +362,27 @@ static GMenu *build_menu(void)
     g_object_unref(fujinet);
     g_object_unref(tail);
     return menu;
+}
+
+/* Drains intvsession_sysaction_take -- the only caller that can't fire a
+ * sysaction directly (gamepad_sdl.c's SDL thread, queuing RESET_CONFIG so it
+ * never joins itself) -- and fires each on this, the UI thread. Lives on the
+ * main window rather than the keypad window: the latter hides rather than
+ * destroys itself (see keypad_window.c) but is hidden far more often than
+ * shown, and a gamepad-bound sysaction has to keep working regardless of
+ * whether that window happens to be open. ~100ms: fast enough that a
+ * gamepad press feels immediate, cheap enough to run for the app's whole
+ * lifetime. */
+static gboolean sysact_drain_tick(gpointer user_data)
+{
+    IntvWindow *self = INTV_WINDOW(user_data);
+    intvsession_sysaction a;
+
+    while (intvsession_sysaction_take(self->session, &a)) {
+        if (intvsession_sysaction_fire(self->session, a) != 0)
+            intv_window_toast(self, intvsession_last_error(self->session));
+    }
+    return G_SOURCE_CONTINUE;
 }
 
 GtkWidget *intv_window_new(AdwApplication *app, intvsession *session)
@@ -359,6 +440,8 @@ GtkWidget *intv_window_new(AdwApplication *app, intvsession *session)
         g_signal_connect(focus, "leave", G_CALLBACK(on_focus_leave), self);
         gtk_widget_add_controller(GTK_WIDGET(self), focus);
     }
+
+    self->sysact_timer_id = g_timeout_add(100, sysact_drain_tick, self);
 
     gtk_widget_grab_focus(GTK_WIDGET(self->display));
 

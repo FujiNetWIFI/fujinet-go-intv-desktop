@@ -191,8 +191,25 @@ static void handle_button(intv_pad_side side, Uint8 button, int pressed)
      * disc (see this file's own header and poll_sticks' own comment on why
      * a second writer here would race it). */
     m = bindings_target_from_button((intvsession_pad_side)side, b);
-    if (m.kind == INTVSESSION_MAP_KEY)
+    if (m.kind == INTVSESSION_MAP_KEY) {
         intv_host_pad_key(side, (intv_pad_key)m.key, pressed);
+    } else if (m.kind == INTVSESSION_MAP_SYSACT) {
+        /* Fire on press only -- a release is meaningless for either
+         * sysaction. RESET_GAME is just a flag write (intv_host_reset), safe
+         * to call inline from this thread. RESET_CONFIG is NOT: intvsession_
+         * reset_to_config -> intvsession_stop -> intv_gamepad_stop() would
+         * pthread_join(s_thread, ...) from inside s_thread itself (EDEADLK,
+         * followed by SDL_QuitSubSystem tearing down the subsystem this
+         * very callback is running under). Queue it instead and let a
+         * frontend's own UI-thread timer drain and fire it from there --
+         * see intvsession_sysaction_post's own comment. */
+        if (pressed) {
+            if (m.sysact == INTVSESSION_SYSACT_RESET_GAME)
+                intvsession_sysaction_fire(NULL, m.sysact);
+            else
+                intvsession_sysaction_post(NULL, m.sysact);
+        }
+    }
 }
 
 intvsession_pad_button pad_button_from_sdl(uint8_t button)
@@ -496,6 +513,21 @@ void intv_gamepad_stop(void)
     pthread_join(s_thread, NULL);
     SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
     s_running = 0;
+}
+
+void intv_gamepad_forget_disc(void)
+{
+    pthread_mutex_lock(&s_lock);
+    for (int i = 0; i < s_pad_count; i++)
+        for (int side = 0; side < NUM_SIDES; side++)
+            /* -2, not -1: -1 is "centered", a value poll_sticks legitimately
+             * sends and would then treat as unchanged if the stick is
+             * already resting there. -2 is outside intv_disc_from_stick/
+             * _dpad's -1..15 range, so the very next poll's dir != last_disc
+             * check is guaranteed true regardless of what dir turns out to
+             * be, even -1 itself. */
+            s_pads[i].last_disc[side] = -2;
+    pthread_mutex_unlock(&s_lock);
 }
 
 int intvsession_gamepad_count(intvsession *s)

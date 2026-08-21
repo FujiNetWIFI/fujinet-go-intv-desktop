@@ -16,6 +16,8 @@
  * pointers), so -- like jzintv.c itself -- every one of those headers has to
  * be visible before cfg.h is, in the same order jzintv.c uses them.
  */
+#include "intv_audio.h"
+
 #include "config.h"
 #include "lzoe/lzoe.h"
 #include "file/file.h"
@@ -391,6 +393,42 @@ void intv_host_stop(void)
     intv.do_exit = 1;
     pthread_join(s_thread, NULL);
     free_argv();
+}
+
+void intv_host_reset(void)
+{
+    pthread_mutex_lock(&s_lock);
+    const int running = s_running;
+    pthread_mutex_unlock(&s_lock);
+
+    if (!running)
+        return;
+
+    /* Release every held input first: this port injects straight into
+     * intv.pad0/pad1 (see intv_host_pad_key/_pad_disc/_ecs_key below) and
+     * never goes through jzIntv's own event layer, so jzIntv's own
+     * pad_reset_inputs() call in its main loop (gated on chg_evt_map, which
+     * this port never sets) never runs -- a key held at the moment of reset
+     * would otherwise stay latched down in the machine across it.
+     * pad_reset_inputs also clears pad_t.k[] (ECS keyboard) and fake_shift/
+     * stale, so this subsumes intv_host_ecs_keys_clear(). Both synchronous:
+     * done here, on the caller's thread, before do_reset is even armed. */
+    pad_reset_inputs(&intv.pad0);
+    pad_reset_inputs(&intv.pad1);
+
+    /* So up to ~100ms of pre-reset audio doesn't play out across the
+     * reset -- see intv_audio.h's own comment on the ring this drains. */
+    intv_audio_reset();
+
+    /* Arms jzIntv's one-shot RESET for its main loop to consume on its next
+     * iteration (see jzintv.c: do_reset == 2 clears itself, forces the
+     * CP1610's PC to 0x1000, and periph_reset() runs exactly once, one
+     * iteration later) -- same cross-thread write pattern as do_exit above.
+     * Not declared volatile/atomic upstream (neither is do_exit), but the
+     * loop body between reading it and clearing it does enough (periph_tick/
+     * gfx_refresh/plat_delay) that the compiler cannot hoist the reload;
+     * __atomic_store_n costs nothing here and documents the intent. */
+    __atomic_store_n(&intv.do_reset, 2u, __ATOMIC_RELAXED);
 }
 
 int intv_host_is_running(void)

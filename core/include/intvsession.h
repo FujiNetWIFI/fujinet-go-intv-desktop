@@ -135,6 +135,19 @@ const char *intvsession_cart_path(intvsession *s);
  * Returns 0 on success, -1 with intvsession_last_error() set. */
 int intvsession_reset_to_config(intvsession *s);
 
+/* Soft-resets the currently running cartridge in place -- the console-level
+ * RESET a real Intellivision's front switch performs, not a process
+ * restart: the cart stays mapped (see intv_host.h's intv_host_reset), so a
+ * cartridge pushed over FujiNet (which never touches the persisted "cart"
+ * key -- see intv_host_start's own comment) restarts as itself rather than
+ * dropping back to CONFIG. Every held key/disc/ECS input is released first,
+ * so a button held at the moment of reset doesn't stay stuck down in the
+ * machine. Unlike intvsession_reset_to_config, this does not touch the
+ * "cart" setting, does not stop/restart the FujiNet runtime, and does not
+ * block -- it only arms jzIntv's own one-shot reset for its next tick.
+ * Always succeeds (0) if a session is running; a no-op otherwise. */
+int intvsession_reset_game(intvsession *s);
+
 /* Menu/combo label tables, NULL past the end so a caller walks idx = 0..
  * until NULL rather than hardcoding a count. */
 const char *intvsession_hw_mode_name(int idx);   /* "Auto" / "Off" / "On" */
@@ -334,6 +347,19 @@ typedef enum {
     INTVSESSION_KEYSYM_BACKSPACE,
 } intvsession_keysym;
 
+/* A machine-global action -- distinct from intvsession_key, which is always
+ * per-side hardware the CP1610 reads through pad_t. A sysaction target's
+ * .side is forced to INTVSESSION_PAD_LEFT by intvsession_target_sysaction
+ * (bindings.c stores it in a slot band of its own, past the disc's 16
+ * positions) but carries no meaning -- there is only one machine, not one
+ * per side. See intvsession_sysaction_fire/_post/_take below for how a
+ * bound input actually triggers one. */
+typedef enum {
+    INTVSESSION_SYSACT_RESET_GAME = 0,   /* intvsession_reset_game */
+    INTVSESSION_SYSACT_RESET_CONFIG,     /* intvsession_reset_to_config */
+    INTVSESSION_SYSACT_COUNT
+} intvsession_sysaction;
+
 typedef enum {
     INTVSESSION_MAP_NONE = 0, /* keysym has no pad mapping */
     INTVSESSION_MAP_KEY,      /* side/key valid -- call intvsession_pad_key */
@@ -343,6 +369,15 @@ typedef enum {
                               * what a frontend sends on release, ANDed with
                               * its own "is anything else on this disc still
                               * held" bookkeeping if it wants combos). */
+    INTVSESSION_MAP_SYSACT,   /* sysact valid -- call
+                              * intvsession_sysaction_fire (keyboard/on-screen
+                              * button) or intvsession_sysaction_post (SDL
+                              * gamepad thread, see that function's own
+                              * comment on why it can't fire inline). A
+                              * frontend that doesn't know this kind yet is
+                              * still safe: every existing if/else-if
+                              * dispatch chain simply falls through and does
+                              * nothing, matching an unmapped keysym. */
 } intvsession_map_kind;
 
 typedef struct {
@@ -350,6 +385,10 @@ typedef struct {
     intvsession_pad_side side;
     intvsession_key      key;       /* valid iff kind == INTVSESSION_MAP_KEY */
     int                  direction; /* valid iff kind == INTVSESSION_MAP_DISC */
+    intvsession_sysaction sysact;   /* valid iff kind == INTVSESSION_MAP_SYSACT
+                                     * -- appended last so every existing
+                                     * positional initializer of this struct
+                                     * stays valid. */
 } intvsession_key_mapping;
 
 /* keysym: an ASCII value for a printable key, or one of the
@@ -371,18 +410,23 @@ intvsession_ecs_key intvsession_ecs_key_from_keysym(uint32_t keysym);
  * intvsession_key_from_keysym above and the gamepad face buttons (core/src/
  * gamepad_sdl.c) are both fixed defaults transcribed from upstream jzIntv.
  * This layer sits above them: a table of "targets" -- the 15 keypad/action
- * buttons per side AND the disc's 16 clock positions per side, each with one
- * keyboard slot and one gamepad slot -- seeded from those same defaults and
- * overridable at runtime, e.g. by a keypad window's "Map" mode. Shared
- * process-wide (jzIntv's own machine is a process singleton, see
- * core/jzintv/intv_host.h) and persisted in the settings store, so a mapping
- * chosen in one frontend is what every other frontend sees.
+ * buttons per side, the disc's 16 clock positions per side, AND the two
+ * machine-global system actions (Reset Game, Reset to CONFIG) -- each with
+ * one keyboard slot and one gamepad slot, seeded from those same defaults
+ * (or, for the system actions, from Backspace/Escape -- see bindings.c's
+ * compute_defaults_locked) and overridable at runtime, e.g. by a keypad
+ * window's "Map" mode. Shared process-wide (jzIntv's own machine is a
+ * process singleton, see core/jzintv/intv_host.h) and persisted in the
+ * settings store, so a mapping chosen in one frontend is what every other
+ * frontend sees.
  *
  * A target is exactly an intvsession_key_mapping (below): kind MAP_KEY names
- * a (side,key), kind MAP_DISC names a (side,direction). intvsession_target_key
- * and intvsession_target_disc build one of each; every other function in this
- * section takes that struct rather than a bare (side,key) pair so the same
- * calls work for both kinds. */
+ * a (side,key), kind MAP_DISC names a (side,direction), kind MAP_SYSACT
+ * names a machine-global intvsession_sysaction (see that enum's own
+ * comment). intvsession_target_key, _target_disc and _target_sysaction build
+ * one of each; every other function in this section takes that struct
+ * rather than a bare (side,key) pair so the same calls work for all three
+ * kinds. */
 
 /* Mirrors SDL3's SDL_GamepadButton numbering (gamepad_sdl.c translates
  * explicitly rather than casting) but declared here so this header, and
@@ -413,6 +457,9 @@ intvsession_key_mapping intvsession_target_key(intvsession_pad_side side,
                                                intvsession_key key);
 intvsession_key_mapping intvsession_target_disc(intvsession_pad_side side,
                                                 int direction);
+/* .side is always INTVSESSION_PAD_LEFT (see intvsession_sysaction's own
+ * comment) -- callers should not read it back out of the result. */
+intvsession_key_mapping intvsession_target_sysaction(intvsession_sysaction a);
 
 intvsession_binding intvsession_target_binding_get(intvsession *s,
         intvsession_key_mapping target);
@@ -451,9 +498,13 @@ const char *intvsession_pad_side_name(intvsession_pad_side side); /* "Left" */
 /* "East", "ENE", "Northeast", ... one of the 16 compass/half-step names for
  * a disc clock position (0-15); "?" out of range. */
 const char *intvsession_disc_dir_name(int direction);
+/* "Reset Game" / "Reset to CONFIG"; "?" out of range. */
+const char *intvsession_sysaction_name(intvsession_sysaction a);
 
-/* Names a target itself, e.g. "Left 5", "Left disc East", "Right disc ENE";
- * "" for a MAP_NONE target. Returns the string length. */
+/* Names a target itself, e.g. "Left 5", "Left disc East", "Right disc ENE",
+ * or a bare sysaction name ("Reset Game") with no side prefix, since a
+ * sysaction isn't per-side; "" for a MAP_NONE target. Returns the string
+ * length. */
 int intvsession_target_name(intvsession_key_mapping target, char *dst,
                             int dstsz);
 
@@ -490,6 +541,26 @@ void intvsession_gamepad_capture_cancel(intvsession *s);
  * timer. */
 int intvsession_gamepad_capture_poll(intvsession *s,
                                      intvsession_pad_button *button);
+
+/* ---- system actions (core/src/session.c) -------------------------------
+ * Dispatches a MAP_SYSACT target's effect. Safe to call from any thread that
+ * is allowed to block briefly and is not itself the emulator or gamepad
+ * thread (RESET_CONFIG's intvsession_stop joins both) -- i.e. a UI thread,
+ * on a keypress or a keypad-window button click. Returns whatever the
+ * underlying call returns (0 success, -1 + intvsession_last_error() on
+ * failure); -1 for an out-of-range action. */
+int intvsession_sysaction_fire(intvsession *s, intvsession_sysaction a);
+
+/* Cross-thread queue for exactly the one caller that can't use
+ * intvsession_sysaction_fire directly: gamepad_sdl.c's background SDL
+ * thread, for which firing RESET_CONFIG inline would join itself (see
+ * intv_gamepad_stop). _post queues a; a frontend's own UI-thread timer
+ * drains the queue with _take (returns 1 and writes *out for one pending
+ * action, 0 once empty -- call in a loop) and calls _fire from there
+ * instead. Multiple distinct actions posted before a drain are each
+ * delivered once, not coalesced. */
+void intvsession_sysaction_post(intvsession *s, intvsession_sysaction a);
+int  intvsession_sysaction_take(intvsession *s, intvsession_sysaction *out);
 
 /* ---- FujiNet ---------------------------------------------------------
  * The runtime (libfujinet.{so,dylib}/fujinet.dll, built by

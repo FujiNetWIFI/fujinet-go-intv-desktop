@@ -34,6 +34,17 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.7.1" date="2026-08-22">
+      <description>
+        <p>
+          The Linux .deb/.rpm/.tar.gz packages built a shared libSDL3
+          instead of linking it statically, so they depended on a system
+          libSDL3.so no distribution actually ships. SDL3 is now statically
+          linked into the Linux packages, matching the Windows and macOS
+          builds.
+        </p>
+      </description>
+    </release>
     <release version="0.7.0" date="2026-08-21">
       <description>
         <p>

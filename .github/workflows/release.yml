@@ -63,8 +63,6 @@ jobs:
       matrix:
         frontend: [gnome, kde]
     runs-on: ubuntu-latest
-    env:
-      LD_LIBRARY_PATH: /tmp/sdl3-install/lib
     steps:
       - uses: actions/checkout@v4
 
@@ -84,14 +82,18 @@ jobs:
             libgbm-dev libgl1-mesa-dev libpulse-dev libasound2-dev \
             libxtst-dev dpkg-dev rpm
 
-      - name: Build and install SDL3 (release-3.4.12, pinned)
+      # Statically linked (unlike linux.yml's push-CI job, which links the
+      # packaged shared SDL3 for speed), so the shipped .deb/.rpm/.tar.gz
+      # have no libSDL3.so runtime dependency -- same reasoning as the
+      # release-grade SDL3 build the windows-package/macos-package jobs use.
+      - name: Build and install static SDL3 (release-3.4.12, pinned)
         run: |
           git clone --depth 1 --branch release-3.4.12 \
             https://github.com/libsdl-org/SDL.git /tmp/sdl3-src
           cmake -S /tmp/sdl3-src -B /tmp/sdl3-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/tmp/sdl3-install \
-            -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST_LIBRARY=OFF
+            -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST_LIBRARY=OFF
           cmake --build /tmp/sdl3-build
           cmake --install /tmp/sdl3-build
 
@@ -109,6 +111,19 @@ jobs:
       - name: Test
         working-directory: build
         run: ctest --output-on-failure
+
+      # Confirms the switch to static SDL3 actually took: a shared build
+      # left unnoticed here would ship a .deb/.rpm that depends on a
+      # libSDL3.so no target machine (and no apt/dnf repo) actually has.
+      - name: Verify the built binary has no libSDL3.so dependency
+        run: |
+          BIN="build/frontends/${{ matrix.frontend }}/fujinet-go-intv-${{ matrix.frontend }}"
+          test -f "$BIN" || { echo "::error::$BIN not built"; exit 1; }
+          if ldd "$BIN" | grep -qi libSDL3; then
+            echo "::error::$BIN dynamically links libSDL3 -- static link did not take"
+            ldd "$BIN"
+            exit 1
+          fi
 
       - name: Package (deb, rpm, tar.gz)
         working-directory: build

@@ -34,6 +34,18 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.7.3" date="2026-08-26">
+      <description>
+        <p>
+          Fixed the violent flicker in the embedded FujiNet CONFIG menu.
+          Every screen with a selection bar redrew its whole list each time
+          the bar moved, which was far more work than one video frame allows,
+          so the list was visibly seen repainting in pieces. Moving the
+          selection now touches only the two rows that change, and the
+          network list no longer re-fetches every SSID to do it.
+        </p>
+      </description>
+    </release>
     <release version="0.7.2" date="2026-08-25">
       <description>
         <p>

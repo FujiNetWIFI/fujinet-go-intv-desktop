@@ -34,6 +34,17 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.7.4" date="2026-08-28">
+      <description>
+        <p>
+          The bundled FujiNet runtime gains calendars. Programs running on
+          the emulated Intellivision can now open CALENDAR, GCAL (Google
+          Calendar) and ICAL (iCalendar over HTTP) network URLs the same way
+          they already open Google Drive and Gmail, and read the events back
+          as plain text.
+        </p>
+      </description>
+    </release>
     <release version="0.7.3" date="2026-08-26">
       <description>
         <p>

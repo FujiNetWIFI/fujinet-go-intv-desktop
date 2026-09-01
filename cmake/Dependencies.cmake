@@ -39,11 +39,12 @@ set(JZINTV_VERSION "20200712")
 set(JZINTV_URL "http://spatula-city.org/~im14u2c/intv/dl/jzintv-${JZINTV_VERSION}-src.zip")
 set(JZINTV_SHA256 "b36b3b274d0fc05cb227818d4957f96620d23d8d6b7596c24f07675ced7129f3")
 
-# fujinet-firmware add-google-calendar (cd7c0eb9, one commit on top of
-# master 9a2d7beb): the CALENDAR/GCAL/ICAL network protocols. Pinned to the
-# branch rather than to master because the work is not merged yet; move this
-# to the merge commit once it lands.
-set(FUJINET_COMMIT "cd7c0eb9a543845a3b934bc52663eeedc4656f92")
+# fujinet-firmware force-mbedtls-3 (07e1bed3, one commit on top of master
+# f6a47f28): fujinet_pc.cmake now rejects Mbed TLS 4.x, which removed the
+# headers the vendored mongoose needs. Pinned to the branch rather than to
+# master because the work is not merged yet; move this to the merge commit
+# once PR #1595 lands.
+set(FUJINET_COMMIT "07e1bed306c43d6aadaf6f1fabf92e16aa759a09")
 set(FUJINET_URL "https://github.com/FujiNetWIFI/fujinet-firmware")
 
 # intv_provide_dependency(NAME <n> PATH <p> SENTINEL <file> OVERRIDE <VAR>

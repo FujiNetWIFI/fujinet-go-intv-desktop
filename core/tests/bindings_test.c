@@ -646,9 +646,52 @@ int main(void)
         check("keysym_name('a') is \"A\" (uppercased)",
               intvsession_keysym_name('a', name, sizeof(name)) == 1 &&
                   strcmp(name, "A") == 0);
-        check("keysym_name of a nonsense value is 0, dst untouched",
+        /* The contract is now "dst is ALWAYS written" -- it used to be left
+         * untouched for an unnamed keysym, and every caller in every
+         * frontend then printed its uninitialised stack buffer. */
+        check("keysym_name of a nonsense value is 0, dst emptied",
               intvsession_keysym_name(0x9999, name, sizeof(name)) == 0 &&
-                  strcmp(name, "A") == 0);
+                  name[0] == '\0');
+        check("keysym_name(0) is 0, dst emptied",
+              intvsession_keysym_name(0, name, sizeof(name)) == 0 &&
+                  name[0] == '\0');
+
+        /* ---- fallback bands (intvsession.h) ------------------------------
+         * The reason they exist: an Intellivision-to-USB adapter in keyboard
+         * mode emits HID usages a normal keyboard has no cap for, and every
+         * one of them used to translate to keysym 0 and be unmappable. */
+        check("keysym_name names a HID usage (F16)",
+              intvsession_keysym_name(INTVSESSION_KEYSYM_HID_BASE + 0x6B, name,
+                                      sizeof(name)) > 0 &&
+                  strcmp(name, "F16") == 0);
+        check("keysym_name names a keypad-only HID usage (Keypad A)",
+              intvsession_keysym_name(INTVSESSION_KEYSYM_HID_BASE + 0xBC, name,
+                                      sizeof(name)) > 0 &&
+                  strcmp(name, "Keypad A") == 0);
+        check("keysym_name synthesizes a name for an unnamed HID usage",
+              intvsession_keysym_name(INTVSESSION_KEYSYM_HID_BASE + 0xAF, name,
+                                      sizeof(name)) > 0 &&
+                  strcmp(name, "HID 0xAF") == 0);
+        check("keysym_name synthesizes a name for the native band",
+              intvsession_keysym_name(INTVSESSION_KEYSYM_NATIVE_BASE + 0xFF,
+                                      name, sizeof(name)) > 0 &&
+                  strcmp(name, "Key 0x00FF") == 0);
+    }
+    {
+        /* Raw joystick bands: an adapter's 20th button and its hat have no
+         * names of their own, but must still describe rather than print "?".
+         * See intvsession_pad_button_name's contract on the buffer. */
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s",
+                intvsession_pad_button_name(
+                    (intvsession_pad_button)(INTVSESSION_PAD_BTN_RAW_BASE + 17)));
+        check("pad_button_name(raw 17) is \"Button 17\"",
+              strcmp(buf, "Button 17") == 0);
+        snprintf(buf, sizeof(buf), "%s",
+                intvsession_pad_button_name(
+                    (intvsession_pad_button)(INTVSESSION_PAD_HAT_BASE + 8 + 1)));
+        check("pad_button_name(hat 1 NE) is \"Hat 1 NE\"",
+              strcmp(buf, "Hat 1 NE") == 0);
     }
     {
         char desc[128];
@@ -723,6 +766,98 @@ int main(void)
             sizeof(name));
         check("target_name(MAP_NONE) returns 0 and an empty string",
               n == 0 && name[0] == '\0');
+    }
+
+    /* ---- what an Intellivision-to-USB adapter actually needs ------------
+     * The two fallback bands and the settings line length are one story, so
+     * they are tested as one: map a whole two-controller adapter -- both
+     * sides' 15 keypad/action buttons AND all 16 disc positions, each to a
+     * keysym and a button only reachable through a band -- then reopen and
+     * check that ALL of it came back.
+     *
+     * The volume matters as much as the values. This packs a "bindings="
+     * line of a couple of kilobytes, and settings.c used to read lines with
+     * a 1024-byte fgets buffer: the line was split, the continuation had no
+     * '=' so the parser dropped it, and every mapping past the first ~1015
+     * bytes vanished on the next launch. Mapping a full adapter is exactly
+     * how a user would hit that, so the test has to map a full one -- a
+     * smaller sample stays under the old limit and proves nothing. */
+    {
+        const intvsession_pad_side sides[2] = { INTVSESSION_PAD_LEFT,
+                                                INTVSESSION_PAD_RIGHT };
+        /* One target per (side, slot), flattened so the keysym and button
+         * handed to each are trivially distinct -- a binding steals its
+         * input from wherever it was, so a repeat would silently undo an
+         * earlier one and the round-trip check below would be vacuous. */
+        intvsession_key_mapping targets[2 *
+            (INTVSESSION_KEY_COUNT + INTVSESSION_DISC_POSITIONS)];
+        int n = 0, i, side_i, all_back = 1;
+
+        for (side_i = 0; side_i < 2; side_i++) {
+            for (i = 0; i < INTVSESSION_KEY_COUNT; i++)
+                targets[n++] = intvsession_target_key(sides[side_i],
+                                                      (intvsession_key)i);
+            for (i = 0; i < INTVSESSION_DISC_POSITIONS; i++)
+                targets[n++] = intvsession_target_disc(sides[side_i], i);
+        }
+        check("the adapter mapping covers every slot on both sides",
+              n == 2 * (INTVSESSION_KEY_COUNT + INTVSESSION_DISC_POSITIONS));
+
+        for (i = 0; i < n; i++) {
+            /* HID usages from 0xA5 up run through the keypad-only keys
+             * ("Keypad A", "Keypad Mem Store", ...) that no ordinary
+             * keyboard can produce at all -- the class of key that used to
+             * translate to 0 and be unmappable. */
+            intvsession_target_set_key(
+                s, targets[i],
+                INTVSESSION_KEYSYM_HID_BASE + 0xA5 + (uint32_t)i, NULL, 0);
+            intvsession_target_set_button(
+                s, targets[i],
+                (intvsession_pad_button)(INTVSESSION_PAD_BTN_RAW_BASE + i),
+                NULL, 0);
+        }
+
+        check("a fallback-band keysym resolves to its target",
+              intvsession_key_from_keysym_bound(
+                  s, INTVSESSION_KEYSYM_HID_BASE + 0xA5).kind ==
+                  INTVSESSION_MAP_KEY);
+        check("a fallback-band keysym has no DEFAULT mapping",
+              intvsession_key_from_keysym(
+                  INTVSESSION_KEYSYM_HID_BASE + 0xA5).kind ==
+                  INTVSESSION_MAP_NONE);
+        check("a raw joystick button resolves to its target",
+              bindings_target_from_button(
+                  INTVSESSION_PAD_LEFT,
+                  (intvsession_pad_button)INTVSESSION_PAD_BTN_RAW_BASE).kind ==
+                  INTVSESSION_MAP_KEY);
+        {
+            /* A bound exotic input must describe as itself. Before the name
+             * tables covered the bands, keysym_name returned 0 here and
+             * describe() reported a fully-bound slot as "nothing" -- so
+             * check the worst case, a usage with no name of its own, which
+             * has to fall back to a synthesized one rather than nothing. */
+            char desc[128];
+            intvsession_binding_describe(
+                intvsession_target_binding_get(s, targets[0]), desc,
+                sizeof(desc));
+            check("describe of an adapter binding names both halves, not "
+                  "\"nothing\"",
+                  strstr(desc, "HID 0xA5") && strstr(desc, "Button 0"));
+        }
+
+        intvsession_free(s);
+        s = open_session(config_dir, data_dir);
+        check("re-open after mapping a full adapter", s != NULL);
+        for (i = 0; s && i < n; i++) {
+            const intvsession_binding b =
+                intvsession_target_binding_get(s, targets[i]);
+            if (b.keysym != (uint32_t)(INTVSESSION_KEYSYM_HID_BASE + 0xA5 + i) ||
+                b.button != (intvsession_pad_button)
+                                (INTVSESSION_PAD_BTN_RAW_BASE + i))
+                all_back = 0;
+        }
+        check("every one of a full adapter's bindings survived a reopen",
+              all_back);
     }
 
     intvsession_free(s);

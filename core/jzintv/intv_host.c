@@ -618,6 +618,22 @@ void intv_host_ecs_keys_clear(void)
         intv.pad1.k[row] = 0;
 }
 
+void intv_host_pads_clear(void)
+{
+    /* l[]/r[] only: k[] is the ECS keyboard matrix, which
+     * intv_host_ecs_keys_clear owns. Both pads unconditionally, for the same
+     * reason intv_host_pad_key writes pad1 unconditionally -- pad1 is only
+     * bus-registered when ECS is enabled, and writing it otherwise is
+     * harmless. Element 15 is the disc (see intv_host_pad_disc), so zeroing
+     * the whole array releases the disc along with every key. */
+    for (int i = 0; i < 18; i++) {
+        intv.pad0.l[i] = 0;
+        intv.pad0.r[i] = 0;
+        intv.pad1.l[i] = 0;
+        intv.pad1.r[i] = 0;
+    }
+}
+
 void intv_host_debug_test_tone(void)
 {
     /* Register 8 (mixer) is active-LOW, per ay8910_calc_sound's own

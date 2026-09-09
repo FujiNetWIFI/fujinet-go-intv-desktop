@@ -18,6 +18,7 @@
 
 #include <windows.h>
 #include <shellapi.h>
+#include <mmsystem.h> /* timeBeginPeriod -- see WinMain's own comment */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -40,6 +41,17 @@ static HWND g_log_edit;
 static uint32_t g_frame[INTVSESSION_FB_WIDTH * INTVSESSION_FB_HEIGHT];
 static uint64_t g_serial;
 static int g_have_frame;
+
+/* Off-screen buffer the frame is composed into, blitted to the window in one
+ * BitBlt -- see paint(). Sized to the client rect and rebuilt only when that
+ * changes. */
+static HDC     g_back_dc;
+static HBITMAP g_back_bmp;
+static HBITMAP g_back_old;
+static int     g_back_w, g_back_h;
+static int     g_back_dirty;   /* the picture in it is stale (new frame, or
+                                * the buffer was just created/resized) */
+static RECT    g_pic;          /* where the picture sits in the back buffer */
 
 static int g_fullscreen;
 static WINDOWPLACEMENT g_prev_placement = {sizeof(g_prev_placement)};
@@ -74,123 +86,154 @@ static RECT dest_rect(int cw, int ch)
     return r;
 }
 
-static void paint(HWND hwnd)
+/* Describes g_frame to GDI. Constant for the life of the process --
+ * INTVSESSION_FB_WIDTH/_HEIGHT are the STIC's fixed geometry -- so it is
+ * built once rather than on the stack of every paint. */
+static const BITMAPINFO *frame_bmi(void)
 {
-    PAINTSTRUCT ps;
-    HDC hdc = BeginPaint(hwnd, &ps);
-    RECT client;
-    BITMAPINFO bmi;
-    RECT d;
-
-    GetClientRect(hwnd, &client);
-    FillRect(hdc, &client, (HBRUSH)GetStockObject(BLACK_BRUSH));
-
-    if (g_have_frame) {
-        memset(&bmi, 0, sizeof(bmi));
+    static BITMAPINFO bmi;
+    if (bmi.bmiHeader.biSize == 0) {
         bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
         bmi.bmiHeader.biWidth = INTVSESSION_FB_WIDTH;
         bmi.bmiHeader.biHeight = -INTVSESSION_FB_HEIGHT; /* top-down */
         bmi.bmiHeader.biPlanes = 1;
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = BI_RGB;
-
-        d = dest_rect(client.right, client.bottom);
-        SetStretchBltMode(hdc, COLORONCOLOR);
-        StretchDIBits(hdc, d.left, d.top, d.right - d.left, d.bottom - d.top,
-                      0, 0, INTVSESSION_FB_WIDTH, INTVSESSION_FB_HEIGHT,
-                      g_frame, &bmi, DIB_RGB_COLORS, SRCCOPY);
     }
+    return &bmi;
+}
+
+static void free_backbuffer(void)
+{
+    if (g_back_dc) {
+        SelectObject(g_back_dc, g_back_old);
+        DeleteDC(g_back_dc);
+        g_back_dc = NULL;
+        g_back_old = NULL;
+    }
+    if (g_back_bmp) {
+        DeleteObject(g_back_bmp);
+        g_back_bmp = NULL;
+    }
+    g_back_w = g_back_h = 0;
+}
+
+/* Ensures the off-screen buffer matches the client size. Returns 0 if it
+ * could not be created, in which case paint() falls back to drawing straight
+ * to the window (correct, just flicker-prone -- better than a blank window). */
+static int ensure_backbuffer(HDC ref, int w, int h)
+{
+    if (w <= 0 || h <= 0)
+        return 0;
+    if (g_back_dc && g_back_w == w && g_back_h == h)
+        return 1;
+
+    free_backbuffer();
+    g_back_dc = CreateCompatibleDC(ref);
+    if (!g_back_dc)
+        return 0;
+    g_back_bmp = CreateCompatibleBitmap(ref, w, h);
+    if (!g_back_bmp) {
+        DeleteDC(g_back_dc);
+        g_back_dc = NULL;
+        return 0;
+    }
+    g_back_old = (HBITMAP)SelectObject(g_back_dc, g_back_bmp);
+    SetStretchBltMode(g_back_dc, COLORONCOLOR); /* once, not per paint */
+    g_back_w = w;
+    g_back_h = h;
+    g_back_dirty = 1; /* nothing has been drawn into it yet */
+    return 1;
+}
+
+/* Redraws the picture and its letterbox bars into the back buffer. Only
+ * called when something actually changed -- a repaint caused by the window
+ * being uncovered or moved reuses what is already there, which is the whole
+ * point of keeping a back buffer rather than a bare double-buffer swap. */
+static void compose(int w, int h)
+{
+    RECT bar;
+
+    g_pic = dest_rect(w, h);
+
+    /* Only the bars, not the whole client area: the picture region is about
+     * to be overwritten anyway, and on a 4:3 window there are no bars at all.
+     * At most one pair is non-empty (dest_rect pillarboxes or letterboxes,
+     * never both), and FillRect ignores an empty rect. */
+    bar.left = 0; bar.top = 0; bar.right = w; bar.bottom = g_pic.top;
+    FillRect(g_back_dc, &bar, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    bar.top = g_pic.bottom; bar.bottom = h;
+    FillRect(g_back_dc, &bar, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    bar.top = 0; bar.bottom = h; bar.left = 0; bar.right = g_pic.left;
+    FillRect(g_back_dc, &bar, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    bar.left = g_pic.right; bar.right = w;
+    FillRect(g_back_dc, &bar, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
+    if (g_have_frame)
+        StretchDIBits(g_back_dc, g_pic.left, g_pic.top,
+                      g_pic.right - g_pic.left, g_pic.bottom - g_pic.top,
+                      0, 0, INTVSESSION_FB_WIDTH, INTVSESSION_FB_HEIGHT,
+                      g_frame, frame_bmi(), DIB_RGB_COLORS, SRCCOPY);
+    else
+        FillRect(g_back_dc, &g_pic, (HBRUSH)GetStockObject(BLACK_BRUSH));
+}
+
+/* WHY THE BACK BUFFER: this used to FillRect the whole client area black and
+ * then StretchDIBits the picture over it, both straight onto the window DC --
+ * i.e. straight into the surface DWM composites from. GDI batches, and DWM
+ * samples that surface on its own vsync, independently of this thread. Sample
+ * between the fill and the blit and the composited frame is entirely black:
+ * rare per frame, near-certain over a few minutes of play, and reported as
+ * "the screen occasionally goes black for a frame or two". Composing
+ * off-screen and blitting once leaves no intermediate state for DWM to catch.
+ *
+ * It is also much less work. A repaint with no new frame (uncover, move,
+ * another window dragged across) now costs one BitBlt instead of a fresh
+ * 160x200 -> client-size software stretch. */
+static void paint(HWND hwnd)
+{
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(hwnd, &ps);
+    RECT client;
+    int w, h;
+
+    GetClientRect(hwnd, &client);
+    w = client.right;
+    h = client.bottom;
+
+    if (!ensure_backbuffer(hdc, w, h)) {
+        /* No back buffer to be had. Draw directly; flicker beats blank. */
+        FillRect(hdc, &client, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        if (g_have_frame) {
+            RECT d = dest_rect(w, h);
+            SetStretchBltMode(hdc, COLORONCOLOR);
+            StretchDIBits(hdc, d.left, d.top, d.right - d.left,
+                          d.bottom - d.top, 0, 0, INTVSESSION_FB_WIDTH,
+                          INTVSESSION_FB_HEIGHT, g_frame, frame_bmi(),
+                          DIB_RGB_COLORS, SRCCOPY);
+        }
+        EndPaint(hwnd, &ps);
+        return;
+    }
+
+    if (g_back_dirty) {
+        compose(w, h);
+        g_back_dirty = 0;
+    }
+
+    /* Only the invalid region -- BeginPaint has already clipped to it, but
+     * blitting just those pixels keeps a partial repaint cheap. */
+    BitBlt(hdc, ps.rcPaint.left, ps.rcPaint.top,
+           ps.rcPaint.right - ps.rcPaint.left,
+           ps.rcPaint.bottom - ps.rcPaint.top,
+           g_back_dc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
 
     EndPaint(hwnd, &ps);
 }
 
-/* ---- keyboard ----------------------------------------------------------------
- * intvsession_key_from_keysym wants intvsession.h's OWN private numbering
- * for non-printable keys (INTVSESSION_KEYSYM_* starting at 0x1000) -- NOT
- * an X11 keysym the way the CoCo/MSX ports' own special_keysym tables
- * produce. See frontends/gnome/keysym_map.h's header comment for why that
- * distinction matters (a real bug was caught there: passing a toolkit's
- * native key value straight through silently drops every arrow/numpad/
- * modifier key while ASCII letters keep working by coincidence).
- *
- * Win32's VK_* codes carry no shift state of their own, so non-special keys
- * resolve straight to their base US-layout character, stable across
- * down/up by construction -- same reasoning the CoCo/MSX ports' own
- * base_char() documents. */
-
-static uint32_t special_keysym(WPARAM vk)
-{
-    switch (vk) {
-    case VK_UP:       return INTVSESSION_KEYSYM_UP;
-    case VK_DOWN:     return INTVSESSION_KEYSYM_DOWN;
-    case VK_LEFT:     return INTVSESSION_KEYSYM_LEFT;
-    case VK_RIGHT:    return INTVSESSION_KEYSYM_RIGHT;
-    case VK_NUMPAD0:  return INTVSESSION_KEYSYM_KP_0;
-    case VK_NUMPAD1:  return INTVSESSION_KEYSYM_KP_1;
-    case VK_NUMPAD2:  return INTVSESSION_KEYSYM_KP_2;
-    case VK_NUMPAD3:  return INTVSESSION_KEYSYM_KP_3;
-    case VK_NUMPAD4:  return INTVSESSION_KEYSYM_KP_4;
-    case VK_NUMPAD5:  return INTVSESSION_KEYSYM_KP_5;
-    case VK_NUMPAD6:  return INTVSESSION_KEYSYM_KP_6;
-    case VK_NUMPAD7:  return INTVSESSION_KEYSYM_KP_7;
-    case VK_NUMPAD8:  return INTVSESSION_KEYSYM_KP_8;
-    case VK_NUMPAD9:  return INTVSESSION_KEYSYM_KP_9;
-    case VK_DECIMAL:  return INTVSESSION_KEYSYM_KP_PERIOD;
-    case VK_LSHIFT:   return INTVSESSION_KEYSYM_LSHIFT;
-    case VK_RSHIFT:   return INTVSESSION_KEYSYM_RSHIFT;
-    case VK_LCONTROL: return INTVSESSION_KEYSYM_LCTRL;
-    case VK_RCONTROL: return INTVSESSION_KEYSYM_RCTRL;
-    case VK_LMENU:    return INTVSESSION_KEYSYM_LALT;
-    case VK_RMENU:    return INTVSESSION_KEYSYM_RALT;
-    /* VK_RETURN doubles as the numpad Enter key when the extended-key bit
-     * is set (checked by the caller via lParam), otherwise it resolves to
-     * INTVSESSION_KEYSYM_RETURN in on_key itself, not here (this table has
-     * no lParam to check). Non-printable keys the base controller map has
-     * no use for, but the ECS keyboard map (on_key's own ECS branch) does. */
-    case VK_ESCAPE: return INTVSESSION_KEYSYM_ESCAPE;
-    case VK_BACK:   return INTVSESSION_KEYSYM_BACKSPACE;
-    default:
-        return 0;
-    }
-}
-
-static uint32_t base_char(WPARAM vk)
-{
-    if (vk >= 'A' && vk <= 'Z') return (uint32_t)(vk - 'A' + 'a');
-    if (vk >= '0' && vk <= '9') return (uint32_t)vk;
-    switch (vk) {
-    case VK_SPACE:      return ' ';
-    case VK_OEM_MINUS:  return '-';
-    case VK_OEM_PLUS:   return '=';
-    case VK_OEM_COMMA:  return ',';
-    case VK_OEM_PERIOD: return '.';
-    case VK_OEM_1:      return ';'; /* ECS-keyboard-only (KEYB_SEMI) */
-    default:            return 0;
-    }
-}
-
-/* WM_(SYS)KEYDOWN/UP only report the generic VK_SHIFT/CONTROL/MENU; the
- * left/right pair is recovered from the scancode (Shift) or the
- * extended-key bit (Control/Alt), the standard Win32 idiom for this. */
-static WPARAM resolve_side(WPARAM vk, LPARAM lp)
-{
-    UINT scancode;
-    int extended;
-
-    switch (vk) {
-    case VK_SHIFT:
-        scancode = (UINT)((lp >> 16) & 0xFF);
-        return MapVirtualKeyA(scancode, MAPVK_VSC_TO_VK_EX);
-    case VK_CONTROL:
-        extended = (lp & 0x01000000) != 0;
-        return extended ? VK_RCONTROL : VK_LCONTROL;
-    case VK_MENU:
-        extended = (lp & 0x01000000) != 0;
-        return extended ? VK_RMENU : VK_LMENU;
-    default:
-        return vk;
-    }
-}
+/* The VK -> keysym translation and the reserved-hotkey table live in
+ * key_translate.c, so they can be unit-tested (keytranslate_test.c) -- this
+ * file cannot be linked against. Declared in key_forward.h. */
 
 static void toggle_fullscreen(HWND hwnd);
 static void open_debugger(void);
@@ -198,73 +241,51 @@ static void open_keypad(void);
 static void open_ecskbd(void);
 static void reset_to_config(void);
 
+
 static void on_key(HWND hwnd, WPARAM vk, LPARAM lp, int down)
 {
-    if (down) {
-        switch (vk) {
-        case VK_F9:
-            open_keypad();
-            return;
-        case VK_F10:
-            /* Claimed here like F9/F11/F12 rather than left to Win32's own
-             * "F10 activates the menu bar" default -- see wnd_proc's own
-             * WM_KEYDOWN/WM_SYSKEYDOWN handling, which no longer lets F10
-             * fall through to DefWindowProc for this reason. */
-            open_ecskbd();
-            return;
-        case VK_F11:
-            toggle_fullscreen(hwnd);
-            return;
-        case VK_F12:
-            open_debugger();
-            return;
-        case 'R':
-            if (GetKeyState(VK_CONTROL) & 0x8000) {
-                reset_to_config();
-                return;
-            }
-            break;
-        default:
-            break;
-        }
-    } else if (vk == VK_F9 || vk == VK_F10 || vk == VK_F11 || vk == VK_F12) {
-        return;
-    } else if (vk == 'R' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+    /* Which keys are hotkeys is intv_key_is_reserved's answer, not a second
+     * list here: a keypad window's Map mode asks the same function so it can
+     * refuse to bind one (key_translate.c), and two lists that had to agree
+     * would eventually stop agreeing -- leaving Map mode either refusing a
+     * key nothing claims, or accepting one this function then shadows. The
+     * switch below only says what each reserved key DOES.
+     *
+     * The release is swallowed too: these never reach the machine, so
+     * forwarding a lone key-up would look like a release of a key that was
+     * never pressed. */
+    if (!intv_key_is_reserved(vk, NULL)) {
+        intv_forward_key(vk, lp, down);
         return;
     }
+    if (!down)
+        return;
 
-    intv_forward_key(vk, lp, down);
+    switch (vk) {
+    case VK_F9:
+        open_keypad();
+        break;
+    case VK_F10:
+        /* Claimed here like F9/F11/F12 rather than left to Win32's own
+         * "F10 activates the menu bar" default -- see wnd_proc's own
+         * WM_KEYDOWN/WM_SYSKEYDOWN handling, which no longer lets F10
+         * fall through to DefWindowProc for this reason. */
+        open_ecskbd();
+        break;
+    case VK_F11:
+        toggle_fullscreen(hwnd);
+        break;
+    case VK_F12:
+        open_debugger();
+        break;
+    case 'R': /* only reserved while Ctrl is held -- see intv_key_is_reserved */
+        reset_to_config();
+        break;
+    default:
+        break;
+    }
 }
 
-/* VK code + message lParam -> intvsession.h's keysym numbering. 0 for keys
- * the emulated machine has no use for. */
-static uint32_t resolve_keysym(WPARAM vk, LPARAM lp)
-{
-    const WPARAM rvk = resolve_side(vk, lp);
-    uint32_t keysym;
-
-    /* Numpad Enter reports as VK_RETURN with the extended-key bit set;
-     * plain Enter has no keypad binding in intv_keymap.c's base controller
-     * map (jzIntv's own mapping.c has no ENTER-key binding outside the
-     * numpad), but the ECS keyboard map does want it, hence
-     * INTVSESSION_KEYSYM_RETURN rather than dropping it outright. */
-    if (rvk == VK_RETURN && (lp & 0x01000000))
-        keysym = INTVSESSION_KEYSYM_KP_ENTER;
-    else if (rvk == VK_RETURN)
-        keysym = INTVSESSION_KEYSYM_RETURN;
-    else
-        keysym = special_keysym(rvk);
-
-    return keysym ? keysym : base_char(rvk);
-}
-
-/* Exported wrapper -- see key_forward.h's own comment on why the keypad
- * window's Map mode needs the translation half of intv_forward_key without
- * its dispatch half. */
-uint32_t intv_keysym_from_msg(WPARAM vk, LPARAM lp)
-{
-    return resolve_keysym(vk, lp);
-}
 
 /* The translate-and-dispatch half of on_key, without any of its hotkey
  * handling -- shared with the keypad window, whose child controls take
@@ -272,7 +293,7 @@ uint32_t intv_keysym_from_msg(WPARAM vk, LPARAM lp)
  * them fall on the floor. Declared in key_forward.h. */
 void intv_forward_key(WPARAM vk, LPARAM lp, int down)
 {
-    const uint32_t keysym = resolve_keysym(vk, lp);
+    const uint32_t keysym = intv_keysym_from_msg(vk, lp);
     intvsession_key_mapping m;
 
     if (!keysym)
@@ -330,7 +351,7 @@ void intv_forward_key(WPARAM vk, LPARAM lp, int down)
  * ports' equivalents. Declared in key_forward.h. */
 void intv_forward_ecs_key(WPARAM vk, LPARAM lp, int down)
 {
-    const uint32_t keysym = resolve_keysym(vk, lp);
+    const uint32_t keysym = intv_keysym_from_msg(vk, lp);
     intvsession_ecs_key key;
 
     if (!keysym)
@@ -500,6 +521,71 @@ static void settings_hw_combo_changed(int ctrl_id, const char *key)
     g_settings_dirty = 1;
 }
 
+/* ---- controller list ----------------------------------------------------
+ * intvsession_gamepad_count/_name/_assign had no caller in any frontend, so
+ * there was no way to tell whether a controller had been detected at all,
+ * let alone which side it was driving. That is a poor experience for any
+ * pad and a blocking one for an Intellivision-to-USB adapter, which
+ * enumerates as one plain HID joystick per controller: "is this one the left
+ * or the right?" is exactly the question the user has to answer to map it.
+ *
+ * Repopulated on a timer rather than on a Refresh button, because a device
+ * can be plugged in while this window is open and a stale list is worse than
+ * none. Rebuilt only when something actually changed, so the selection is
+ * not yanked out from under a click. */
+#define IDT_SETTINGS_PADS 1
+
+static int pad_list_signature(void)
+{
+    /* Cheap "has anything changed" stamp: count, plus each pad's effective
+     * side. Enough to catch connect/disconnect and reassignment, which is
+     * everything the list shows. */
+    int sig = intvsession_gamepad_count(g_session) * 31;
+    for (int i = 0; i < intvsession_gamepad_count(g_session); i++)
+        sig = sig * 7 + intvsession_gamepad_effective_side(g_session, i) + 2;
+    return sig;
+}
+
+static void fill_pad_list(HWND hwnd, int keep_sel)
+{
+    HWND list = GetDlgItem(hwnd, IDC_SET_PAD_LIST);
+    HWND side = GetDlgItem(hwnd, IDC_SET_PAD_SIDE);
+    const int n = intvsession_gamepad_count(g_session);
+    int sel = keep_sel;
+
+    if (!list)
+        return;
+    SendMessageA(list, LB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < n; i++) {
+        char name[128], row[192];
+        const int eff = intvsession_gamepad_effective_side(g_session, i);
+        name[0] = '\0';
+        intvsession_gamepad_name(g_session, i, name, sizeof(name));
+        snprintf(row, sizeof(row), "%s  \xE2\x80\x94  %s", name,
+                eff >= 0 ? intvsession_pad_side_name(
+                               (intvsession_pad_side)eff)
+                         : "not driving a controller");
+        SendMessageA(list, LB_ADDSTRING, 0, (LPARAM)row);
+    }
+    if (n == 0)
+        SendMessageA(list, LB_ADDSTRING, 0,
+                    (LPARAM)"No controllers detected");
+    if (sel < 0 || sel >= n)
+        sel = n > 0 ? 0 : -1;
+    if (sel >= 0)
+        SendMessageA(list, LB_SETCURSEL, (WPARAM)sel, 0);
+
+    if (side) {
+        EnableWindow(side, n > 0);
+        if (sel >= 0) {
+            const int assigned =
+                intvsession_gamepad_assignment(g_session, sel);
+            SendMessageA(side, CB_SETCURSEL,
+                        (WPARAM)(assigned < 0 ? 0 : assigned + 1), 0);
+        }
+    }
+}
+
 static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp,
                                       LPARAM lp)
 {
@@ -525,6 +611,38 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp,
                 }
             }
             return 0;
+        case IDC_SET_PAD_LIST:
+            if (HIWORD(wp) == LBN_SELCHANGE) {
+                HWND side = GetDlgItem(hwnd, IDC_SET_PAD_SIDE);
+                const int sel = (int)SendMessageA(
+                    GetDlgItem(hwnd, IDC_SET_PAD_LIST), LB_GETCURSEL, 0, 0);
+                if (side && sel >= 0) {
+                    const int assigned =
+                        intvsession_gamepad_assignment(g_session, sel);
+                    SendMessageA(side, CB_SETCURSEL,
+                                (WPARAM)(assigned < 0 ? 0 : assigned + 1), 0);
+                }
+            }
+            return 0;
+        case IDC_SET_PAD_SIDE:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                const int sel = (int)SendMessageA(
+                    GetDlgItem(hwnd, IDC_SET_PAD_LIST), LB_GETCURSEL, 0, 0);
+                const int choice = (int)SendMessageA(
+                    GetDlgItem(hwnd, IDC_SET_PAD_SIDE), CB_GETCURSEL, 0, 0);
+                if (sel >= 0 && sel < intvsession_gamepad_count(g_session) &&
+                    choice >= 0) {
+                    /* Entry 0 is "Automatic" (-1); the rest are the four
+                     * sides in intvsession_pad_side order. */
+                    intvsession_gamepad_assign(g_session, sel, choice - 1);
+                    /* A reassignment can move some OTHER pad too -- the
+                     * automatic slots renumber around an explicit one (see
+                     * intv_pad_for_port) -- so redraw the whole list, not
+                     * just this row, and keep the selection. */
+                    fill_pad_list(hwnd, sel);
+                }
+            }
+            return 0;
         case IDC_SET_ECS_KEYBOARD: {
             int on = SendMessageA(GetDlgItem(hwnd, IDC_SET_ECS_KEYBOARD),
                                   BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -540,10 +658,27 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp,
             break;
         }
         break;
+    case WM_TIMER:
+        if (wp == IDT_SETTINGS_PADS) {
+            /* Only when something actually changed, so the timer cannot pull
+             * the selection out from under a click. */
+            static int last_sig;
+            const int sig = pad_list_signature();
+            if (sig != last_sig) {
+                last_sig = sig;
+                fill_pad_list(hwnd,
+                             (int)SendMessageA(
+                                 GetDlgItem(hwnd, IDC_SET_PAD_LIST),
+                                 LB_GETCURSEL, 0, 0));
+            }
+            return 0;
+        }
+        break;
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
+        KillTimer(hwnd, IDT_SETTINGS_PADS);
         g_settings_window = NULL;
         if (g_settings_dirty) {
             g_settings_dirty = 0;
@@ -557,7 +692,7 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp,
 static void show_settings(HINSTANCE inst)
 {
     HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    HWND combo, check, note;
+    HWND combo, check, note, list;
     int y = 16;
     int have_ecs_rom;
 
@@ -582,7 +717,7 @@ static void show_settings(HINSTANCE inst)
     g_settings_window = CreateWindowA(
         "IntvSettingsWindow", "Settings",
         WS_OVERLAPPEDWINDOW & ~(WS_MAXIMIZEBOX | WS_THICKFRAME),
-        CW_USEDEFAULT, CW_USEDEFAULT, 400, 300, NULL, NULL, inst, NULL);
+        CW_USEDEFAULT, CW_USEDEFAULT, 460, 560, NULL, NULL, inst, NULL);
 
     have_ecs_rom = intvsession_has_ecs_rom(g_session);
     CreateWindowExA(0, "STATIC", "ECS:", WS_CHILD | WS_VISIBLE, 16, y, 120,
@@ -631,7 +766,7 @@ static void show_settings(HINSTANCE inst)
 
     check = CreateWindowExA(
         0, "BUTTON", "ECS Keyboard (types on the ECS instead of the hand controllers)",
-        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 16, y, 360, 22,
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 16, y, 420, 22,
         g_settings_window, (HMENU)(INT_PTR)IDC_SET_ECS_KEYBOARD, inst, NULL);
     SendMessageA(check, BM_SETCHECK,
                 intvsession_get_int(g_session, "keyboard_mode", 0)
@@ -645,14 +780,57 @@ static void show_settings(HINSTANCE inst)
         0, "STATIC",
         "ECS/Intellivoice/Video Standard apply when this window is closed "
         "(the session restarts). ECS Keyboard applies immediately.",
-        WS_CHILD | WS_VISIBLE, 16, y, 360, 40, g_settings_window, NULL, inst,
+        WS_CHILD | WS_VISIBLE, 16, y, 420, 80, g_settings_window, NULL, inst,
         NULL);
     SendMessageA(note, WM_SETFONT, (WPARAM)font, TRUE);
+    /* Generous: this wraps to three lines at Windows' own metrics and four
+     * under Wine's chunkier fonts, and a clipped explanation is worse than a
+     * little whitespace. */
+    y += 88;
+
+    CreateWindowExA(0, "STATIC", "Controllers:", WS_CHILD | WS_VISIBLE, 16, y,
+                    120, 20, g_settings_window, NULL, inst, NULL);
+    y += 20;
+    list = CreateWindowExA(
+        WS_EX_CLIENTEDGE, "LISTBOX", "",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY, 16, y, 420, 76,
+        g_settings_window, (HMENU)(INT_PTR)IDC_SET_PAD_LIST, inst, NULL);
+    SendMessageA(list, WM_SETFONT, (WPARAM)font, TRUE);
+    y += 84;
+
+    CreateWindowExA(0, "STATIC", "Drives:", WS_CHILD | WS_VISIBLE, 16, y, 120,
+                    20, g_settings_window, NULL, inst, NULL);
+    combo = CreateWindowExA(
+        0, "COMBOBOX", "",
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 140, y - 2,
+        296, 200, g_settings_window, (HMENU)(INT_PTR)IDC_SET_PAD_SIDE, inst,
+        NULL);
+    SendMessageA(combo, CB_ADDSTRING, 0, (LPARAM)"Automatic");
+    for (int side = 0; side < 4; side++)
+        SendMessageA(combo, CB_ADDSTRING, 0,
+                    (LPARAM)intvsession_pad_side_name(
+                        (intvsession_pad_side)side));
+    SendMessageA(combo, WM_SETFONT, (WPARAM)font, TRUE);
+
+    fill_pad_list(g_settings_window, -1);
+    SetTimer(g_settings_window, IDT_SETTINGS_PADS, 1000, NULL);
 
     ShowWindow(g_settings_window, SW_SHOW);
 }
 
 /* ---- fullscreen ---------------------------------------------------------------- */
+
+/* SWP_FRAMECHANGED rebuilds the window frame, and the client area is
+ * undefined until something paints it -- with the repaint timer up to 8 ms
+ * away, that gap is visible as a black flash on the way into fullscreen and
+ * again on the way out. Repaint synchronously instead of waiting for the
+ * tick. */
+static void fullscreen_repaint(HWND hwnd)
+{
+    g_back_dirty = 1; /* the client size changed, so the letterbox did too */
+    InvalidateRect(hwnd, NULL, FALSE);
+    UpdateWindow(hwnd);
+}
 
 static void toggle_fullscreen(HWND hwnd)
 {
@@ -671,6 +849,7 @@ static void toggle_fullscreen(HWND hwnd)
                          SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
             g_fullscreen = 1;
         }
+        fullscreen_repaint(hwnd);
     } else {
         SetWindowLongPtr(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
         SetMenu(hwnd, g_menu);
@@ -679,6 +858,7 @@ static void toggle_fullscreen(HWND hwnd)
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
                          SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
         g_fullscreen = 0;
+        fullscreen_repaint(hwnd);
     }
 }
 
@@ -723,15 +903,38 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         paint(hwnd);
         return 0;
     case WM_ERASEBKGND:
-        return 1; /* paint() clears; avoid flicker */
+        return 1; /* paint() covers every pixel; never erase underneath it */
     case WM_SIZE:
+        /* The letterbox geometry moved, so the back buffer's contents are
+         * stale as well as the wrong size (ensure_backbuffer would set
+         * g_back_dirty itself on a resize, but not for a restore to the same
+         * size after a minimize). */
+        g_back_dirty = 1;
         InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    case WM_DPICHANGED:
+        /* PerMonitorV2 is declared in app.manifest.in, which obliges the app
+         * to take the suggested rect when the window moves to a monitor at a
+         * different scale. Unhandled, the window kept its old size while
+         * Windows rebuilt the redirection surface underneath it -- a
+         * reliable way to get a black or garbled frame mid-drag. */
+        {
+            const RECT *sug = (const RECT *)lp;
+            SetWindowPos(hwnd, NULL, sug->left, sug->top,
+                        sug->right - sug->left, sug->bottom - sug->top,
+                        SWP_NOZORDER | SWP_NOACTIVATE);
+            g_back_dirty = 1;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
         return 0;
     case WM_TIMER:
         if (wp == TIMER_REPAINT) {
             if (intvsession_copy_frame(g_session, g_frame, &g_serial)) {
                 g_have_frame = 1;
-                InvalidateRect(hwnd, NULL, FALSE);
+                g_back_dirty = 1;
+                /* Only the picture: the bars are unchanged, and repainting
+                 * them every frame is work the compositor has to carry. */
+                InvalidateRect(hwnd, g_back_dc ? &g_pic : NULL, FALSE);
             }
             return 0;
         }
@@ -751,8 +954,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_KILLFOCUS:
         /* Losing keyboard focus shouldn't leave a key stuck down in
          * whichever matrix was active -- see intvsession_ecs_keys_clear's
-         * own comment. */
+         * own comment. Both matrices: the hand controllers were missing
+         * here, so alt-tabbing mid-press left that key held for good, and
+         * widening the bindable key range only makes that easier to hit. */
         intvsession_ecs_keys_clear(g_session);
+        intvsession_pads_clear(g_session);
         break;
     case WM_COMMAND:
         switch (LOWORD(wp)) {
@@ -783,6 +989,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     case WM_DESTROY:
+        free_backbuffer();
         PostQuitMessage(0);
         return 0;
     }
@@ -818,7 +1025,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     wc.lpfnWndProc = wnd_proc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    /* NULL, not BLACK_BRUSH: paint() covers every pixel of the client area
+     * from its back buffer, so the only thing a class brush can still do is
+     * flash black in the gap Windows erases on its own (a resize exposing new
+     * area, SWP_FRAMECHANGED, a monitor change) before WM_PAINT lands. */
+    wc.hbrBackground = NULL;
     wc.lpszClassName = "IntvMainWindow";
     wc.hIcon = LoadIconA(inst, MAKEINTRESOURCEA(IDI_APPICON));
     wc.hIconSm = wc.hIcon;
@@ -832,7 +1043,18 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
         return 1;
     ShowWindow(g_hwnd, show);
 
-    SetTimer(g_hwnd, TIMER_REPAINT, 16, NULL);
+    /* Windows' default timer granularity is ~15.6 ms, so a 16 ms repaint
+     * timer beat against the emulator's own 60 Hz publish rate and dropped or
+     * doubled frames on an irregular cycle. It also clamped every sub-frame
+     * sleep jzIntv's rate control asks for (its plat_delay uses a plain
+     * CreateWaitableTimer), so the emulator itself ran in ~15.6 ms steps and
+     * declared dropped frames. One call fixes both, and since Windows 10 2004
+     * it affects only this process. Paired with a poll at half a frame, so a
+     * published frame is never waiting more than ~8 ms -- copy_frame is a
+     * mutex and a serial compare when nothing changed, so the extra ticks are
+     * close to free. */
+    timeBeginPeriod(1);
+    SetTimer(g_hwnd, TIMER_REPAINT, 8, NULL);
     SetTimer(g_hwnd, TIMER_SYSACT, 100, NULL);
 
     /* Developer affordances, matching the GNOME frontend's own
@@ -841,6 +1063,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
         open_debugger();
     if (getenv("INTV_OPEN_KEYPAD"))
         open_keypad();
+    /* Same affordance for Settings. It earns its place here more than the
+     * other two: the maintainer has no Windows machine, so this window is
+     * only ever seen by cross-building and running under Wine, where there
+     * is no way to drive a menu. */
+    if (getenv("INTV_OPEN_SETTINGS"))
+        show_settings(inst);
 
     while (GetMessageA(&msg, NULL, 0, 0) > 0) {
         if (intv_debugger_pretranslate(&msg))
@@ -855,6 +1083,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 
     KillTimer(g_hwnd, TIMER_REPAINT);
     KillTimer(g_hwnd, TIMER_SYSACT);
+    timeEndPeriod(1);
     intvsession_free(g_session);
     return (int)msg.wParam;
 }

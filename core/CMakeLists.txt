@@ -272,6 +272,7 @@ add_library(intv_session STATIC
   src/session.c
   src/intv_keymap.c
   src/bindings.c
+  src/hid_keys.c
   src/disc_geom.c
   src/gamepad_sdl.c
   src/audio_sdl.c
@@ -328,6 +329,9 @@ add_executable(session_test tests/session_test.c)
 target_link_libraries(session_test intv_session)
 target_include_directories(session_test PRIVATE src)
 
+add_executable(hid_keys_test tests/hid_keys_test.c)
+target_link_libraries(hid_keys_test intv_session)
+
 add_executable(keymap_test tests/keymap_test.c)
 target_link_libraries(keymap_test intv_session)
 
@@ -375,6 +379,7 @@ target_include_directories(symtab_test PRIVATE debugger)
 add_executable(periph_test tests/periph_test.c)
 target_link_libraries(periph_test jzintv_core)
 
+add_test(NAME hid_keys COMMAND hid_keys_test)
 add_test(NAME no_sdl_link COMMAND no_sdl_link_test)
 add_test(NAME boot_smoke COMMAND boot_smoke)
 add_test(NAME reset_test COMMAND reset_test)

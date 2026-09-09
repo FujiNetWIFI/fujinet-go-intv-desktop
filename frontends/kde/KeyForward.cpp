@@ -199,10 +199,32 @@ quint32 intvKeysymForKeyEvent(const QKeyEvent *event)
         event->key() >= Qt::Key_A && event->key() <= Qt::Key_Z)
         return 'a' + (quint32)(event->key() - Qt::Key_A);
 
-    if (!event->text().isEmpty())
-        return event->text().at(0).unicode();
+    if (!event->text().isEmpty()) {
+        const quint32 ch = event->text().at(0).unicode();
+        if (ch >= 0x20 && ch <= 0x7E)
+            return ch;
+    }
 
-    return 0;
+    /* Everything above names only keys with a DEFAULT mapping. A Map mode
+     * has to capture whatever the user presses, including keys a normal PC
+     * keyboard has no cap for -- an Intellivision-to-USB adapter in keyboard
+     * mode emits exactly those. Fall back to intvsession.h's HID band via
+     * the same evdev scancode the table at the top of this file uses, and to
+     * its native band when even that misses. Returning 0 here (as this used
+     * to) meant the capture path dropped the press without a word. */
+    if (g_scanCodesTrusted && event->nativeScanCode() >= EVDEV_OFFSET) {
+        const quint32 keysym = intvsession_keysym_from_hid(
+            intvsession_hid_from_evdev(event->nativeScanCode() -
+                                       EVDEV_OFFSET));
+        if (keysym != 0)
+            return keysym;
+    }
+    if (event->nativeScanCode() != 0)
+        return INTVSESSION_KEYSYM_NATIVE_BASE + event->nativeScanCode();
+    /* No scancode to fall back on (a synthesized event, or a platform
+     * plugin that reports none): key() is at least stable per key. */
+    return event->key() ? INTVSESSION_KEYSYM_NATIVE_BASE +
+                              (quint32)event->key() : 0;
 }
 
 void intvForwardKey(intvsession *session, const QKeyEvent *event, int down)

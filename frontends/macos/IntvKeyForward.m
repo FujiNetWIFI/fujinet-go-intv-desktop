@@ -140,7 +140,19 @@ uint32_t IntvKeysymForEvent(NSEvent *event)
      * keeps them layout-aware the way jzIntv's own SDL keycodes are. */
     NSString *chars = event.charactersIgnoringModifiers;
     unichar c = chars.length ? [chars characterAtIndex:0] : 0;
-    return (c >= 0x20 && c < 0x7F) ? (uint32_t)c : 0;
+    if (c >= 0x20 && c < 0x7F)
+        return (uint32_t)c;
+
+    /* Neither table names only keys with a DEFAULT mapping. A Map mode has
+     * to capture whatever the user presses, including keys a normal
+     * keyboard has no cap for -- an Intellivision-to-USB adapter in keyboard
+     * mode emits exactly those. Fall back to intvsession.h's HID band, and
+     * to its native band when even that misses; returning 0 here (as this
+     * used to) meant the capture path dropped the press without a word. */
+    keysym = intvsession_keysym_from_hid(
+        intvsession_hid_from_macos_keycode(event.keyCode));
+    return keysym ? keysym
+                  : INTVSESSION_KEYSYM_NATIVE_BASE + (uint32_t)event.keyCode;
 }
 
 void IntvForwardKeyEvent(intvsession *session, NSEvent *event, int down)

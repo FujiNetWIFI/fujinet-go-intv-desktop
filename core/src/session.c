@@ -309,3 +309,16 @@ void intvsession_ecs_keys_clear(intvsession *s)
     (void)s;
     intv_host_ecs_keys_clear();
 }
+
+void intvsession_pads_clear(intvsession *s)
+{
+    (void)s;
+    intv_host_pads_clear();
+    /* A gamepad holding a direction would otherwise stay released until it
+     * next CHANGES, since poll_sticks only writes the disc on a change --
+     * this is exactly what forget_disc exists for. Held gamepad *buttons*
+     * are edge-driven and do stay released until the next press; that is the
+     * same trade intvsession_ecs_keys_clear already makes, and a controller
+     * held down through a focus change is the rarer case than a key. */
+    intv_gamepad_forget_disc();
+}

@@ -33,6 +33,35 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.8.0" date="2026-09-08">
+      <description>
+        <p>
+          Intellivision-to-USB adapters can now be mapped in full. The
+          keypad window's Map mode captures any key the host can deliver,
+          including the ones a normal PC keyboard has no cap for -- an
+          adapter in keyboard mode emits exactly those, and they used to be
+          swallowed in silence, so the key simply could not be bound.
+          Adapters that present as a plain USB joystick (the Ultimate PC
+          Interface, raphnet's adapter, the Classic Game Controller) are
+          detected at all now, with every button and hat direction bindable
+          rather than the fifteen a recognised gamepad is limited to, and
+          Settings lists the controllers it has found and which side each one
+          drives.
+        </p>
+        <p>
+          Also fixed: a full two-controller mapping was silently truncated
+          when it was saved, losing everything past the first kilobyte; a
+          bound key with no name of its own displayed as "nothing"; and a key
+          held while the window lost focus stayed held forever.
+        </p>
+        <p>
+          On Windows the display no longer flashes black for a frame or two.
+          The picture is now composed off screen and drawn in one operation,
+          so the compositor can never catch a half-drawn frame, and frame
+          pacing no longer beats against Windows' timer granularity.
+        </p>
+      </description>
+    </release>
     <release version="0.7.6" date="2026-09-02">
       <description>
         <p>

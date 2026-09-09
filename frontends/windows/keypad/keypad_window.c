@@ -232,11 +232,14 @@ static void map_finish(const char *bound_to, const char *stolen)
 
 static void map_complete_key(uint32_t keysym)
 {
-    char stolen[128], namebuf[64];
+    char stolen[128], namebuf[64] = "";
 
     intvsession_target_set_key(g_map_session, g_map_target, keysym, stolen,
                                sizeof(stolen));
     intvsession_gamepad_capture_cancel(g_map_session);
+    /* keysym_name always writes namebuf now (intvsession.h), but initialise
+     * it anyway: this used to print an uninitialised stack buffer whenever
+     * the key had no name, and the cost of not repeating that is one "". */
     intvsession_keysym_name(keysym, namebuf, sizeof(namebuf));
     map_finish(namebuf, stolen);
 }
@@ -255,7 +258,15 @@ static void map_complete_button(intvsession_pad_button button)
 /* Consumes WM_KEYDOWN/UP/SYSKEYDOWN/UP while Map mode wants the *next*
  * keyboard press for itself instead of letting it reach the machine -- same
  * contract as intv_forward_key_msg (see key_forward.h), so every proc below
- * just OR's the two checks together, this one first. */
+ * just OR's the two checks together, this one first.
+ *
+ * A press this cannot use has to SAY so. It is still swallowed (letting it
+ * through would inject the keystroke Map mode exists to intercept), but the
+ * status line changes, because a silently-eaten press is indistinguishable
+ * from a dead Map button: the window just sits there still armed. That is
+ * precisely how the Intellivision-to-USB adapter bug presented -- the keys
+ * translated to 0, this dropped them without a word, and the user concluded
+ * the key "couldn't capture". Only reserved hotkeys reach that path now. */
 static int map_intercept_key_msg(UINT msg, WPARAM wp, LPARAM lp)
 {
     if (g_map_state == MAP_IDLE)
@@ -264,9 +275,22 @@ static int map_intercept_key_msg(UINT msg, WPARAM wp, LPARAM lp)
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
         if (g_map_state == MAP_WAIT_INPUT) {
-            uint32_t keysym = intv_keysym_from_msg(wp, lp);
-            if (keysym)
+            const char *claimed_by = NULL;
+            uint32_t keysym;
+
+            if (intv_key_is_reserved(wp, &claimed_by)) {
+                char status[256];
+                snprintf(status, sizeof(status),
+                        "That key is reserved for %s. Press a different key "
+                        "or gamepad button, or press MAP to abort.",
+                        claimed_by);
+                map_set_status(status);
+            } else if ((keysym = intv_keysym_from_msg(wp, lp)) != 0) {
                 map_complete_key(keysym);
+            } else {
+                map_set_status("Windows reported no key for that press. Try "
+                               "another, or press MAP to abort.");
+            }
         }
         return 1;
     case WM_KEYUP:

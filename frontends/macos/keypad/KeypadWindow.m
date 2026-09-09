@@ -466,11 +466,14 @@ static void MapFinish(NSString *boundTo, const char *stolen)
 static void MapCompleteKey(uint32_t keysym)
 {
     char stolen[128];
-    char namebuf[64];
+    char namebuf[64] = "";
 
     intvsession_target_set_key(gMapSession, gMapTarget, keysym, stolen,
                                sizeof(stolen));
     intvsession_gamepad_capture_cancel(gMapSession);
+    /* keysym_name always writes namebuf now (intvsession.h), but initialise
+     * it anyway: this used to print an uninitialised stack buffer whenever
+     * the key had no name. */
     intvsession_keysym_name(keysym, namebuf, sizeof(namebuf));
     MapFinish([NSString stringWithUTF8String:namebuf], stolen);
 }
@@ -756,8 +759,15 @@ static void MapCompleteButton(intvsession_pad_button button)
         if (gMapState == IntvMapWaitInput) {
             if (down) {
                 uint32_t keysym = IntvKeysymForEvent(event);
+                /* A press this cannot use has to say so rather than be
+                 * swallowed in silence, which is indistinguishable from a
+                 * dead Map button -- that silence was the reported
+                 * Intellivision-to-USB adapter bug. */
                 if (keysym)
                     MapCompleteKey(keysym);
+                else
+                    MapSetStatus(@"No key was reported for that press. "
+                                 @"Try another, or press Map to abort.");
             }
             return YES;
         }

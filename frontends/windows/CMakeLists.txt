@@ -16,6 +16,7 @@ configure_file(app.manifest.in "${CMAKE_CURRENT_BINARY_DIR}/app.manifest" @ONLY)
 
 add_executable(fujinet-go-intv-windows WIN32
   main.c
+  key_translate.c
   debugger/dbg_window.c
   keypad/keypad_window.c
   ecskbd/ecskbd_window.c
@@ -33,6 +34,7 @@ add_executable(fujinet-go-intv-windows WIN32
 target_link_libraries(fujinet-go-intv-windows PRIVATE
   intv_session jzintv_core stdc++
   gdi32 user32 comdlg32 shell32 comctl32
+  winmm  # timeBeginPeriod, for frame pacing -- see main.c's WinMain
 )
 target_include_directories(fujinet-go-intv-windows PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -44,5 +46,23 @@ target_compile_options(fujinet-go-intv-windows PRIVATE -Wall -Wextra)
 # beyond SDL3.dll itself (intv_session links SDL3 for gamepad/audio).
 target_link_options(fujinet-go-intv-windows PRIVATE
   -static -static-libgcc -static-libstdc++)
+
+# The VK -> keysym translation is the one part of this frontend worth
+# testing without a human at a keyboard, and the one that most needs it: the
+# maintainer has no Windows machine, so a gap in it is invisible until a user
+# reports that some key will not map. Same shape as the KDE frontend's own
+# keyforward_test -- a plain console executable over the split-out
+# translation unit, no window and no session required.
+add_executable(keytranslate_test keytranslate_test.c key_translate.c)
+target_link_libraries(keytranslate_test PRIVATE intv_session user32)
+target_include_directories(keytranslate_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_options(keytranslate_test PRIVATE -Wall -Wextra)
+# Same static link as the app below: without it the .exe wants MinGW's
+# libgcc/libstdc++/winpthread DLLs on PATH, which neither a Wine smoke run
+# nor CI's ctest step provides.
+target_link_options(keytranslate_test PRIVATE
+  -static -static-libgcc -static-libstdc++)
+add_test(NAME keytranslate COMMAND keytranslate_test)
 
 install(TARGETS fujinet-go-intv-windows RUNTIME DESTINATION bin)

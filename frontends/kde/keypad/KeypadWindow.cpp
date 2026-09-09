@@ -365,11 +365,14 @@ void mapFinish(const QString &boundTo, const char *stolen)
 void mapCompleteKey(quint32 keysym)
 {
     char stolen[128];
-    char namebuf[64];
+    char namebuf[64] = "";
 
     intvsession_target_set_key(g_mapSession, g_mapTarget, keysym, stolen,
                                sizeof(stolen));
     intvsession_gamepad_capture_cancel(g_mapSession);
+    /* keysym_name always writes namebuf now (intvsession.h), but initialise
+     * it anyway: this used to print an uninitialised stack buffer whenever
+     * the key had no name. */
     intvsession_keysym_name(keysym, namebuf, sizeof(namebuf));
     mapFinish(QString::fromUtf8(namebuf), stolen);
 }
@@ -627,8 +630,17 @@ void KeypadWindow::forwardKey(const QKeyEvent *event, int down)
     if (g_mapState == MapState::WaitInput) {
         if (down) {
             const quint32 keysym = intvKeysymForKeyEvent(event);
+            /* A press this cannot use has to say so rather than be swallowed
+             * in silence, which is indistinguishable from a dead Map button
+             * -- that silence was the reported Intellivision-to-USB adapter
+             * bug. Only an event carrying neither a scancode nor a key()
+             * reaches the else now. */
             if (keysym != 0)
                 mapCompleteKey(keysym);
+            else
+                mapSetStatus(QStringLiteral(
+                    "No key was reported for that press. Try another, or "
+                    "press Map to abort."));
         }
         return;
     }

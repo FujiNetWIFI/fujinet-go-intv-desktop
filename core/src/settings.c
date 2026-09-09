@@ -43,15 +43,51 @@ static void set_locked(struct intvsession *s, const char *key,
     s->settings_dirty = 1;
 }
 
+/* Reads one whole line, however long, growing *buf as needed. Returns 1 on a
+ * line (NUL-terminated, newline retained if there was one), 0 at EOF with
+ * nothing read.
+ *
+ * A fixed buffer will not do here. The "bindings" value packs every
+ * non-default key and gamepad mapping into a single line (see bindings.c's
+ * pack_locked) -- a fully remapped two-controller adapter runs to several
+ * kilobytes. fgets into a 1024-byte buffer used to split such a line, and
+ * because the continuation has no '=' the parser below dropped it: every
+ * binding past the first ~1015 bytes silently vanished on the next launch.
+ * That hit exactly the users who had the most mapping work to lose. */
+static int read_line(FILE *fp, char **buf, size_t *cap)
+{
+    size_t len = 0;
+
+    for (;;) {
+        if (len + 1 >= *cap) {
+            size_t ncap = *cap ? *cap * 2 : 256;
+            char *nbuf = realloc(*buf, ncap);
+            if (!nbuf)
+                return len > 0; /* Out of memory: keep what we have. */
+            *buf = nbuf;
+            *cap = ncap;
+        }
+        if (!fgets(*buf + len, (int)(*cap - len), fp))
+            return len > 0;
+        len += strlen(*buf + len);
+        if (len == 0 || (*buf)[len - 1] == '\n')
+            return 1;
+        /* No newline yet: either the line is longer than the buffer (grow and
+         * read the rest) or this is a last line with no trailing newline,
+         * which the next fgets reports as EOF and the `len > 0` above keeps. */
+    }
+}
+
 void settings_init(struct intvsession *s)
 {
     FILE *fp;
-    char line[1024];
+    char *line = NULL;
+    size_t cap = 0;
 
     pthread_mutex_init(&s->settings_mtx, NULL);
     fp = fopen(s->settings_file, "r");
     if (!fp) return;
-    while (fgets(line, sizeof(line), fp)) {
+    while (read_line(fp, &line, &cap)) {
         char *eq, *end;
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
@@ -63,6 +99,7 @@ void settings_init(struct intvsession *s)
         *end = '\0';
         set_locked(s, p, eq + 1);
     }
+    free(line);
     fclose(fp);
     s->settings_dirty = 0;
 }

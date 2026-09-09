@@ -43,17 +43,26 @@ cmake -B build -DFRONTEND=none -DWITH_INTV_ROMS=OFF
 cmake -B build -DFRONTEND=gnome   # or kde, macos, windows
 ```
 
-`ctest` runs 16 suites covering the headless jzIntv core, ROM embedding, the
+`ctest` runs 17 suites covering the headless jzIntv core, ROM embedding, the
 frame/audio publish contract, pad and keyboard input mapping (including the
 ECS keyboard/second controller pair and the ECS/Intellivoice/PAL machine
-options), the keypad disc's 16-way pointer geometry, the public session API,
-the peripheral bus' address decode teardown (which the FujiNet cart hot-swap
-depends on), the debugger's symbol table and STIC views, and (when
-`WITH_INTV_ROMS=OFF`) that no Mattel firmware bytes ended up in the shipped
-binary.
+options), the Windows/evdev/macOS key-code tables, the keypad disc's 16-way
+pointer geometry, the public session API, the peripheral bus' address decode
+teardown (which the FujiNet cart hot-swap depends on), the debugger's symbol
+table and STIC views, and (when `WITH_INTV_ROMS=OFF`) that no Mattel firmware
+bytes ended up in the shipped binary.
 
-Set `INTV_OPEN_DEBUGGER=1` and/or `INTV_OPEN_KEYPAD=1` in the environment
-before launching a built frontend to have it open those windows on startup.
+`hid_keys` deserves a note: it checks all three platforms' key-code tables
+from whatever host it runs on, deliberately. The maintainer has no Windows
+machine, so a mistake in the Windows table is otherwise invisible until a
+user reports that some key will not map -- which is exactly how the missing
+fallback those tables replaced was found.
+
+Set `INTV_OPEN_DEBUGGER=1`, `INTV_OPEN_KEYPAD=1` and/or (Windows only)
+`INTV_OPEN_SETTINGS=1` in the environment before launching a built frontend
+to have it open those windows on startup. The Windows one exists because
+that frontend is only ever exercised by cross-building and running under
+Wine, where there is no way to drive a menu.
 
 ## Project layout
 

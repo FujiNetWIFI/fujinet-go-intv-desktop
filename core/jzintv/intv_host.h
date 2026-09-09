@@ -210,6 +210,14 @@ void intv_host_ecs_key(intv_ecs_key key, int pressed);
  * stay stuck down in the emulated matrix. */
 void intv_host_ecs_keys_clear(void);
 
+/* Releases every hand-controller key and both discs on all four sides. The
+ * pad half of intv_host_ecs_keys_clear: a frontend losing keyboard focus
+ * would otherwise leave whatever was held at that moment stuck down, and
+ * nothing will ever send the release (the WM_KEYUP goes to whoever took
+ * focus). Safe whether or not the machine is running, same as
+ * intv_host_pad_key. */
+void intv_host_pads_clear(void);
+
 /* Writes PSG0 (the base unit's AY-3-8914) registers intended to produce an
  * audible tone on channel A: register 0 (tone A period, low byte), register
  * 11 (channel A fixed amplitude, max), register 8 (mixer, active-low --

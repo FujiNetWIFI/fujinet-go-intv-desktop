@@ -284,6 +284,14 @@ void intvsession_ecs_key_set(intvsession *s, intvsession_ecs_key key,
                              int pressed);
 void intvsession_ecs_keys_clear(intvsession *s);
 
+/* The hand-controller equivalent: releases every keypad/action key and both
+ * discs on all four sides. A frontend should call BOTH on losing keyboard
+ * focus -- the WM_KEYUP/key-release for whatever was held goes to whoever
+ * took focus, so without this a held key stays down forever. (A gamepad
+ * holding a direction is re-asserted on its next poll; a gamepad button held
+ * across the focus change is released until its next press.) */
+void intvsession_pads_clear(intvsession *s);
+
 /* ---- audio ------------------------------------------------------------
  * jzIntv's PSG mixer produces mono int16 samples (see
  * core/jzintv/intv_audio.h); this is that stream, sample rate
@@ -346,6 +354,66 @@ typedef enum {
     INTVSESSION_KEYSYM_RETURN,
     INTVSESSION_KEYSYM_BACKSPACE,
 } intvsession_keysym;
+
+/* ---- fallback keysym bands -------------------------------------------------
+ * The symbols above name only the keys the *default* controller and ECS
+ * keyboard maps care about. A Map mode has to be able to capture ANY key the
+ * host can deliver, including keys a normal PC keyboard has no cap for at
+ * all: an Intellivision-to-USB adapter in keyboard mode (the Ultimate PC
+ * Interface's ECS-keyboard and Music-Synthesizer personalities, say) emits
+ * HID usages that Windows reports in its OEM-specific/unassigned VK bands
+ * and that X11/AppKit have no named keysym for either. Before these bands
+ * existed every such key translated to 0 and was silently swallowed by the
+ * capture path -- the key simply could not be mapped.
+ *
+ * HID_BASE is the primary band: the USB HID Keyboard usage ID the key
+ * actually came from. Every platform's own key numbering derives from that
+ * table, so it is the one identifier all four frontends can agree on, it
+ * names cleanly (see intvsession_keysym_name), and a persisted binding stays
+ * meaningful across them. NATIVE_BASE is the last resort for a key that
+ * arrives with no usable scancode at all (Windows hands some HID usages a VK
+ * with MakeCode 0); it is platform-local by construction and named as raw
+ * hex.
+ *
+ * Translation MUST try the symbols above first and fall into a band only on
+ * a miss. A key that has a curated symbol must never ALSO be reachable
+ * through a band, or the same physical key would bind under two different
+ * values and a binding made through one path would not match the other.
+ * These bands carry no default mapping (intvsession_key_from_keysym returns
+ * MAP_NONE for them, by construction -- see bindings.c's
+ * compute_defaults_locked, which only ever sweeps printable ASCII plus the
+ * symbols above); they are reachable only through the bindings table. */
+#define INTVSESSION_KEYSYM_HID_BASE    0x10000u /* + USB HID keyboard usage */
+#define INTVSESSION_KEYSYM_NATIVE_BASE 0x20000u /* + the platform's own code */
+
+/* Highest HID keyboard usage the band accepts (the usage page's own last
+ * defined key, Keyboard Right GUI). Anything past it is not a keyboard key. */
+#define INTVSESSION_HID_USAGE_MAX      0xE7u
+
+/* Native key code -> USB HID Keyboard usage ID, one per platform's own
+ * numbering. 0 when the code maps to no keyboard usage (which is the
+ * caller's cue to fall back to INTVSESSION_KEYSYM_NATIVE_BASE).
+ *
+ * All three are compiled and tested on every platform, deliberately: the
+ * maintainer has no Windows machine (see cmake/toolchains/mingw-w64.cmake's
+ * own header), so the Windows table has to be verifiable from Linux CI or a
+ * mistake in it is invisible until a user reports it -- which is exactly how
+ * the bug these bands fix was found.
+ *
+ *   _win_scancode: the PS/2 set-1 code in WM_KEYDOWN's lParam bits 16-23,
+ *                  with `extended` set from lParam bit 24 (0x01000000).
+ *   _evdev:        the Linux evdev code -- GTK's gdk_key_event_get_keycode()
+ *                  and Qt's QKeyEvent::nativeScanCode() both report it
+ *                  biased by 8, so subtract 8 before calling.
+ *   _macos:        AppKit's NSEvent.keyCode (Apple's own virtual key set). */
+uint32_t intvsession_hid_from_win_scancode(unsigned scancode, int extended);
+uint32_t intvsession_hid_from_evdev(unsigned code);
+uint32_t intvsession_hid_from_macos_keycode(unsigned keycode);
+
+/* Wraps a HID usage into the band, or 0 for usage 0 / out of range -- so a
+ * frontend can write `keysym = intvsession_keysym_from_hid(usage)` and test
+ * the result rather than open-coding the arithmetic and the range check. */
+uint32_t intvsession_keysym_from_hid(uint32_t usage);
 
 /* A machine-global action -- distinct from intvsession_key, which is always
  * per-side hardware the CP1610 reads through pad_t. A sysaction target's
@@ -441,8 +509,43 @@ typedef enum {
     INTVSESSION_PAD_BTN_LEFT_SHOULDER, INTVSESSION_PAD_BTN_RIGHT_SHOULDER,
     INTVSESSION_PAD_BTN_DPAD_UP, INTVSESSION_PAD_BTN_DPAD_DOWN,
     INTVSESSION_PAD_BTN_DPAD_LEFT, INTVSESSION_PAD_BTN_DPAD_RIGHT,
-    INTVSESSION_PAD_BTN_COUNT
+    INTVSESSION_PAD_BTN_COUNT,
+
+    /* ---- raw joystick bands ----------------------------------------------
+     * The named buttons above are SDL's *gamepad* abstraction, which only
+     * exists for devices SDL has a mapping for and which tops out at those
+     * 15. An Intellivision-to-USB adapter is a plain HID joystick: the
+     * Ultimate PC Interface reports ~20 buttons and all 16 disc positions
+     * (jzIntv's own HACKFILE.CFG for it names JS0_BTN_00..JS0_BTN_19), and
+     * one Intellivision controller alone is 12 keypad keys plus 3 action
+     * buttons. So gamepad_sdl.c also opens un-mapped devices through
+     * SDL_OpenJoystick and reports their inputs in these bands.
+     *
+     * Values, not enumerators, because the index is the identity: there is
+     * nothing to name. They start past PAD_BTN_COUNT with room to spare so
+     * adding a named gamepad button later cannot collide, and the persisted
+     * form is a plain integer either way (see bindings.c's pack_locked), so
+     * the settings format does not change. */
+    INTVSESSION_PAD_BTN_RAW_BASE  = 64,  /* + raw button index, 0..63 */
+    INTVSESSION_PAD_BTN_RAW_LAST  = 127,
+    INTVSESSION_PAD_HAT_BASE      = 192, /* + hat * 8 + direction, see below */
+    INTVSESSION_PAD_HAT_LAST      = 255
 } intvsession_pad_button;
+
+/* Hat directions within INTVSESSION_PAD_HAT_BASE, clockwise from North --
+ * the 8 positions a HID hat switch can report. A hat's button value is
+ * INTVSESSION_PAD_HAT_BASE + hat_index * 8 + direction. */
+#define INTVSESSION_PAD_HAT_DIRS 8
+
+/* True for a value in the corresponding band. Written as macros rather than
+ * range checks at each use site because gamepad_sdl.c, bindings.c and the
+ * frontends all need the same three tests. */
+#define INTVSESSION_PAD_BTN_IS_NAMED(b) \
+    ((b) >= 0 && (b) < INTVSESSION_PAD_BTN_COUNT)
+#define INTVSESSION_PAD_BTN_IS_RAW(b) \
+    ((b) >= INTVSESSION_PAD_BTN_RAW_BASE && (b) <= INTVSESSION_PAD_BTN_RAW_LAST)
+#define INTVSESSION_PAD_BTN_IS_HAT(b) \
+    ((b) >= INTVSESSION_PAD_HAT_BASE && (b) <= INTVSESSION_PAD_HAT_LAST)
 
 typedef struct {
     uint32_t               keysym; /* 0 = no keyboard binding */
@@ -488,9 +591,20 @@ void intvsession_bindings_reset(intvsession *s);
 intvsession_key_mapping intvsession_key_from_keysym_bound(intvsession *s,
                                                           uint32_t keysym);
 
-/* Human-readable names, for a Map mode's status line. keysym_name returns the
- * string length (0 for an unnamed keysym, dst untouched); the rest are
- * NUL-terminated statics, never NULL. */
+/* Human-readable names, for a Map mode's status line. keysym_name ALWAYS
+ * writes dst (given dstsz > 0) -- the empty string for keysym 0, a
+ * synthesized "HID 0x.." / "Key 0x.." for a fallback-band keysym with no
+ * name of its own -- and returns the string length, so 0 means "no key" and
+ * never "dst left untouched". (It used to leave dst alone for an unnamed
+ * keysym, which every caller then printed as uninitialised stack.)
+ *
+ * pad_button_name returns a NUL-terminated static for a named gamepad
+ * button. The raw joystick bands have no fixed names, so those are formatted
+ * ("Button 17", "Hat 1 NE") into a thread-local buffer that the NEXT
+ * pad_button_name call on the same thread overwrites -- copy the string, do
+ * not hold the pointer. Thread-local rather than plain static because
+ * gamepad_sdl.c's polling thread names buttons too, concurrently with a
+ * frontend's Map mode on the UI thread. Never NULL either way. */
 int         intvsession_keysym_name(uint32_t keysym, char *dst, int dstsz);
 const char *intvsession_pad_button_name(intvsession_pad_button button);
 const char *intvsession_pad_key_name(intvsession_key key);        /* "5", "Clear", "Top" */
@@ -594,6 +708,17 @@ int  intvsession_gamepad_count(intvsession *s);
  * is out of range). */
 int  intvsession_gamepad_name(intvsession *s, int idx, char *dst, int dstsz);
 void intvsession_gamepad_assign(intvsession *s, int idx, int side);
+
+/* What intvsession_gamepad_assign was last told for pad idx: an
+ * intvsession_pad_side, or -1 for automatic (the default) -- so a settings
+ * UI can show the current choice rather than guess at it. */
+int  intvsession_gamepad_assignment(intvsession *s, int idx);
+
+/* Which side pad idx is ACTUALLY driving right now, explicit assignment and
+ * automatic fallback resolved together, or -1 if it drives nothing. This is
+ * the one a user needs to see: "Automatic" alone does not answer "is my
+ * adapter the left controller or the right one?". */
+int  intvsession_gamepad_effective_side(intvsession *s, int idx);
 
 /* ---- paths ----------------------------------------------------------------
  * Directory paths (valid for the session's lifetime). */

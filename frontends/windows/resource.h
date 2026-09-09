@@ -21,5 +21,7 @@
 #define IDC_SET_IVOICE       302
 #define IDC_SET_VIDEO        303
 #define IDC_SET_ECS_KEYBOARD 304
+#define IDC_SET_PAD_LIST     305
+#define IDC_SET_PAD_SIDE     306
 
 #endif

@@ -78,9 +78,34 @@ static inline uint32_t intv_keysym_from_gdk(guint keyval)
         /* Printable ASCII: GDK's own keyval for a letter/digit/punctuation
          * key IS its ASCII value (GDK_KEY_a == 0x61, GDK_KEY_1 == 0x31,
          * ...), which is exactly what intvsession_key_from_keysym's own
-         * ASCII cases expect -- pass through unchanged. */
-        return (uint32_t)keyval;
+         * ASCII cases expect -- pass through unchanged.
+         *
+         * Anything else returns 0, and intv_keysym_from_key_event below
+         * resolves it from the hardware keycode instead. This used to pass
+         * EVERY keyval through, which put GDK's own 0xFF-range values
+         * (GDK_KEY_F1 and friends) straight into the keysym space: not
+         * portable to the other frontends, not nameable by
+         * intvsession_keysym_name, and -- because that function then
+         * returned 0 with the caller's buffer untouched -- printed as
+         * uninitialised stack by the keypad window's Map mode. */
+        return (keyval >= 0x20 && keyval <= 0x7E) ? (uint32_t)keyval : 0;
     }
+}
+
+/* GTK/GDK report the hardware keycode as the evdev code biased by 8, an X11
+ * convention Wayland kept. Everything the curated table above has no symbol
+ * for resolves through here instead, into intvsession.h's HID band (or its
+ * native band when even that misses), so any key the compositor delivers can
+ * be captured and bound. */
+static inline uint32_t intv_keysym_from_keycode(guint keycode)
+{
+    uint32_t keysym;
+
+    if (keycode < 8)
+        return keycode ? INTVSESSION_KEYSYM_NATIVE_BASE + keycode : 0;
+    keysym = intvsession_keysym_from_hid(
+        intvsession_hid_from_evdev((unsigned)keycode - 8));
+    return keysym ? keysym : INTVSESSION_KEYSYM_NATIVE_BASE + keycode;
 }
 
 /* The entry point the key-event handlers should actually call.
@@ -105,20 +130,26 @@ static inline uint32_t intv_keysym_from_key_event(GtkEventControllerKey *ctrl,
     GdkEvent *event;
     GdkDisplay *display;
     guint unshifted = 0;
+    uint32_t keysym;
 
-    if (!(state & GDK_SHIFT_MASK))
-        return intv_keysym_from_gdk(keyval);
+    if (!(state & GDK_SHIFT_MASK)) {
+        keysym = intv_keysym_from_gdk(keyval);
+        return keysym ? keysym : intv_keysym_from_keycode(keycode);
+    }
 
     event = gtk_event_controller_get_current_event(GTK_EVENT_CONTROLLER(ctrl));
     display = event ? gdk_event_get_display(event) : NULL;
     if (display &&
         gdk_display_translate_key(display, keycode, state & ~GDK_SHIFT_MASK,
                                   gdk_key_event_get_layout(event), &unshifted,
-                                  NULL, NULL, NULL))
-        return intv_keysym_from_gdk(unshifted);
+                                  NULL, NULL, NULL)) {
+        keysym = intv_keysym_from_gdk(unshifted);
+        return keysym ? keysym : intv_keysym_from_keycode(keycode);
+    }
 
     /* No event to read the layout from, or no translation for this keycode:
      * the shifted keyval is still better than nothing (letters, arrows and
      * modifiers are all unaffected by Shift anyway). */
-    return intv_keysym_from_gdk(keyval);
+    keysym = intv_keysym_from_gdk(keyval);
+    return keysym ? keysym : intv_keysym_from_keycode(keycode);
 }

@@ -231,10 +231,14 @@ static void map_select_target(intvsession_key_mapping target)
  * above (bindings.c) header describes. */
 static void map_complete_key(uint32_t keysym)
 {
-    char stolen[128], namebuf[64], target[128], status[256];
+    char stolen[128], namebuf[64] = "", target[128], status[256];
 
     intvsession_target_set_key(g_session, g_map_target, keysym, stolen,
                                sizeof(stolen));
+    /* keysym_name always writes namebuf now (intvsession.h), but initialise
+     * it anyway: this used to print an uninitialised stack buffer whenever
+     * the key had no name, which on this frontend was every non-ASCII key,
+     * since keysym_map.h passed raw GDK keyvals straight through. */
     intvsession_keysym_name(keysym, namebuf, sizeof(namebuf));
     intvsession_target_name(g_map_target, target, sizeof(target));
     if (stolen[0])
@@ -658,8 +662,15 @@ static gboolean forward_key(GtkEventControllerKey *c, guint keyval,
      * _released above, so releasing the just-mapped key doesn't also get
      * forwarded as a live keystroke. */
     if (g_map_state == INTV_MAP_WAIT_INPUT) {
-        if (down)
+        /* A press this cannot use has to say so rather than be swallowed in
+         * silence, which is indistinguishable from a dead Map button -- see
+         * the Windows frontend's map_intercept_key_msg, where that silence
+         * was the reported bug. Only a keycode-less event gets here now. */
+        if (down && keysym)
             map_complete_key(keysym);
+        else if (down)
+            map_set_status("No key was reported for that press. Try another, "
+                           "or press Map to abort.");
         return TRUE;
     }
     if (g_map_state == INTV_MAP_PICK_TARGET)

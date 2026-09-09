@@ -17,6 +17,27 @@
  * stops contributing to the raw D-pad reading too (see poll_sticks' own
  * bindings_button_is_free guard) so the same press can't do both at once.
  *
+ * TWO KINDS OF DEVICE. SDL's *gamepad* abstraction only exists for hardware
+ * it has a mapping for, and it tops out at 15 named buttons plus two sticks.
+ * That is the wrong shape for the reason people plug a controller into this
+ * emulator at all: an Intellivision-to-USB adapter. The Ultimate PC
+ * Interface, raphnet's adapter and the Classic Game Controller are all plain
+ * HID joysticks with no entry in SDL's mapping database -- so SDL_GetGamepads
+ * never even listed them, and the app could not see the device, let alone
+ * bind it. And they need far more than 15: one Intellivision controller is
+ * 12 keypad keys plus 3 action buttons, an adapter carries two of them, and
+ * the disc has 16 positions (jzIntv's own HACKFILE.CFG for the Ultimate PC
+ * Interface names JS0_BTN_00..JS0_BTN_19).
+ *
+ * So a slot is either a gamepad (opened with SDL_OpenGamepad, unchanged
+ * behaviour: named buttons, D-pad, analog sticks) or a raw joystick (opened
+ * with SDL_OpenJoystick, reporting buttons and hats in intvsession.h's
+ * INTVSESSION_PAD_BTN_RAW_BASE/_HAT_BASE bands). SDL_IsGamepad decides, once,
+ * at open time. Everything downstream -- bindings.c, Map mode, persistence --
+ * sees only intvsession_pad_button values and does not care which kind it
+ * is; slot_button_pressed and its neighbours below are the only code that
+ * does.
+ *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -133,13 +154,23 @@ int intv_pad_for_port(const int *bindings, int npads, int side)
  * (intv_pad_for_port's own automatic-assignment order). */
 #define NUM_SIDES 4
 
+/* Hats past this are ignored. Real devices have one; the Ultimate PC
+ * Interface reports its disc as buttons rather than as a hat at all. */
+#define MAX_HATS 4
+
 typedef struct {
     SDL_JoystickID id;
+    /* Exactly one of these is non-NULL -- see this file's own header on the
+     * gamepad/joystick split. `handle` non-NULL means a mapped gamepad. */
     SDL_Gamepad *handle;
+    SDL_Joystick *joy;
     int bound_side; /* -1 = automatic */
     int last_disc[NUM_SIDES]; /* last direction sent per side this pad could
                               * drive, to avoid spamming intv_host_pad_disc
                               * every poll */
+    Uint8 last_hat[MAX_HATS]; /* previous hat bitmask: SDL reports a hat as a
+                              * position, so the press/release edges a
+                              * binding needs have to be synthesized here */
 } pad_slot;
 
 static pthread_t s_thread;
@@ -154,8 +185,12 @@ static volatile int s_stop_requested = 0;
  * of reaching handle_button -- not just the one eventually captured, ALL of
  * them, so a Map dialog waiting for a press can't have some other button on
  * the same pad leak a keystroke into the machine underneath it. The first
- * named DOWN latches s_cap_result and s_cap_have; capture_poll consumes it
- * and disarms, same as capture_cancel without a result. */
+ * DOWN latches s_cap_result and s_cap_have; capture_poll consumes it and
+ * disarms, same as capture_cancel without a result. Any button the device
+ * can report qualifies -- a named gamepad button, a raw joystick button, or
+ * a hat direction -- so an adapter's 20th button is as capturable as its
+ * first. It used to be named gamepad buttons only, which left a Map dialog
+ * armed forever in front of a device whose buttons SDL does not name. */
 static volatile int s_cap_active = 0;
 static volatile int s_cap_have = 0;
 static int s_cap_result = -1;
@@ -174,14 +209,17 @@ static int s_cap_result = -1;
 #define DEADZONE_ENTER 0.35f
 #define DEADZONE_EXIT  0.15f
 
-/* Looks `button` up in bindings.c's remappable table for `side` and injects
+/* Looks `b` up in bindings.c's remappable table for `side` and injects
  * whatever pad key (if any) it currently drives there -- the table's own
  * defaults reproduce the old hardcoded SOUTH/EAST/WEST switch this replaced,
- * but any named button on intvsession_pad_button can end up bound to any
- * keypad digit or action button, not just those three. */
-static void handle_button(intv_pad_side side, Uint8 button, int pressed)
+ * but any intvsession_pad_button value can end up bound to any keypad digit
+ * or action button, not just those three. Takes an already-translated value
+ * rather than an SDL button index because its three callers speak three
+ * different dialects: a gamepad button event, a raw joystick button event,
+ * and a synthesized hat edge. */
+static void handle_button(intv_pad_side side, intvsession_pad_button b,
+                          int pressed)
 {
-    intvsession_pad_button b = pad_button_from_sdl(button);
     intvsession_key_mapping m;
 
     if (b == INTVSESSION_PAD_BTN_NONE)
@@ -257,6 +295,97 @@ int sdl_button_from_pad(intvsession_pad_button button)
     }
 }
 
+/* ---- device-kind helpers --------------------------------------------------
+ * The only code that knows whether a slot is a gamepad or a raw joystick.
+ * Everything above and below deals in intvsession_pad_button values. */
+
+/* SDL's hat bitmask -> the 8 clockwise-from-North directions
+ * INTVSESSION_PAD_HAT_BASE numbers. -1 for centered or for a diagonal SDL
+ * does not name (it names all four, so only centered returns -1). */
+static int hat_dir_from_mask(Uint8 mask)
+{
+    switch (mask) {
+    case SDL_HAT_UP:        return 0;
+    case SDL_HAT_RIGHTUP:   return 1;
+    case SDL_HAT_RIGHT:     return 2;
+    case SDL_HAT_RIGHTDOWN: return 3;
+    case SDL_HAT_DOWN:      return 4;
+    case SDL_HAT_LEFTDOWN:  return 5;
+    case SDL_HAT_LEFT:      return 6;
+    case SDL_HAT_LEFTUP:    return 7;
+    default:                return -1;
+    }
+}
+
+static intvsession_pad_button hat_button(int hat, int dir)
+{
+    return (intvsession_pad_button)(INTVSESSION_PAD_HAT_BASE +
+                                    hat * INTVSESSION_PAD_HAT_DIRS + dir);
+}
+
+/* Is `b` held down on `slot` right now? Handles all three bands; 0 for a
+ * button this device does not have, so an unbound-elsewhere value never
+ * reads as pressed. */
+static int slot_button_pressed(const pad_slot *slot, intvsession_pad_button b)
+{
+    if (slot->handle) {
+        const int sdl = sdl_button_from_pad(b);
+        return sdl >= 0 &&
+               SDL_GetGamepadButton(slot->handle, (SDL_GamepadButton)sdl);
+    }
+    if (!slot->joy)
+        return 0;
+    if (INTVSESSION_PAD_BTN_IS_RAW(b)) {
+        const int idx = (int)(b - INTVSESSION_PAD_BTN_RAW_BASE);
+        return idx < SDL_GetNumJoystickButtons(slot->joy) &&
+               SDL_GetJoystickButton(slot->joy, idx);
+    }
+    if (INTVSESSION_PAD_BTN_IS_HAT(b)) {
+        const int idx = (int)(b - INTVSESSION_PAD_HAT_BASE);
+        const int hat = idx / INTVSESSION_PAD_HAT_DIRS;
+        const int dir = idx % INTVSESSION_PAD_HAT_DIRS;
+        return hat < SDL_GetNumJoystickHats(slot->joy) &&
+               hat_dir_from_mask(SDL_GetJoystickHat(slot->joy, hat)) == dir;
+    }
+    return 0; /* a *named* gamepad button on a device with no mapping */
+}
+
+/* The two axes the disc falls back to, normalized to -1..1 with up positive
+ * (intv_disc_from_stick's convention -- SDL's Y is down-positive). A raw
+ * joystick has no notion of a "left stick": axes 0/1 are the X/Y every HID
+ * gamepad-shaped device puts first, which is what an adapter's disc lands on
+ * when it reports one at all. */
+static void slot_stick(const pad_slot *slot, float *x, float *y)
+{
+    *x = 0.0f;
+    *y = 0.0f;
+    if (slot->handle) {
+        *x = SDL_GetGamepadAxis(slot->handle, SDL_GAMEPAD_AXIS_LEFTX) / 32767.0f;
+        *y = -SDL_GetGamepadAxis(slot->handle, SDL_GAMEPAD_AXIS_LEFTY) / 32767.0f;
+    } else if (slot->joy && SDL_GetNumJoystickAxes(slot->joy) >= 2) {
+        *x = SDL_GetJoystickAxis(slot->joy, 0) / 32767.0f;
+        *y = -SDL_GetJoystickAxis(slot->joy, 1) / 32767.0f;
+    }
+}
+
+static void slot_close(pad_slot *slot)
+{
+    if (slot->handle)
+        SDL_CloseGamepad(slot->handle);
+    else if (slot->joy)
+        SDL_CloseJoystick(slot->joy);
+    slot->handle = NULL;
+    slot->joy = NULL;
+}
+
+static const char *slot_name(const pad_slot *slot)
+{
+    const char *name = slot->handle ? SDL_GetGamepadName(slot->handle)
+                     : slot->joy    ? SDL_GetJoystickName(slot->joy)
+                                    : NULL;
+    return name ? name : (slot->handle ? "Gamepad" : "Joystick");
+}
+
 static int slot_for_id(SDL_JoystickID id)
 {
     for (int i = 0; i < s_pad_count; i++)
@@ -265,20 +394,33 @@ static int slot_for_id(SDL_JoystickID id)
     return -1;
 }
 
+/* Idempotent, and the single place the gamepad/joystick decision is made --
+ * both SDL_EVENT_JOYSTICK_ADDED and SDL_EVENT_GAMEPAD_ADDED land here (SDL
+ * posts both for a mapped device) and the slot_for_id guard makes the second
+ * one a no-op. */
 static void open_pad(SDL_JoystickID id)
 {
     pthread_mutex_lock(&s_lock);
     if (s_pad_count < MAX_PADS && slot_for_id(id) < 0)
     {
-        SDL_Gamepad *h = SDL_OpenGamepad(id);
-        if (h)
+        SDL_Gamepad *g = SDL_IsGamepad(id) ? SDL_OpenGamepad(id) : NULL;
+        /* Not an else-if on SDL_IsGamepad: a device SDL calls a gamepad can
+         * still fail to open as one (a mapping naming an axis the hardware
+         * does not report, say). Falling through to the raw joystick keeps
+         * it usable -- every button is still bindable, just unnamed. */
+        SDL_Joystick *j = g ? NULL : SDL_OpenJoystick(id);
+        if (g || j)
         {
             pad_slot *slot = &s_pads[s_pad_count++];
+            memset(slot, 0, sizeof(*slot));
             slot->id = id;
-            slot->handle = h;
+            slot->handle = g;
+            slot->joy = j;
             slot->bound_side = -1;
             for (int side = 0; side < NUM_SIDES; side++)
                 slot->last_disc[side] = -1;
+            for (int h = 0; h < MAX_HATS; h++)
+                slot->last_hat[h] = SDL_HAT_CENTERED;
         }
     }
     pthread_mutex_unlock(&s_lock);
@@ -290,7 +432,7 @@ static void close_pad(SDL_JoystickID id)
     int idx = slot_for_id(id);
     if (idx >= 0)
     {
-        SDL_CloseGamepad(s_pads[idx].handle);
+        slot_close(&s_pads[idx]);
         for (int i = idx; i < s_pad_count - 1; i++)
             s_pads[i] = s_pads[i + 1];
         s_pad_count--;
@@ -340,12 +482,9 @@ static void poll_sticks(void)
         {
             for (int d = 0; d < INTVSESSION_DISC_POSITIONS; d++)
             {
-                int sdl;
                 if (disc_btn[d] == INTVSESSION_PAD_BTN_NONE)
                     continue;
-                sdl = sdl_button_from_pad(disc_btn[d]);
-                if (sdl >= 0 &&
-                    SDL_GetGamepadButton(slot->handle, (SDL_GamepadButton)sdl))
+                if (slot_button_pressed(slot, disc_btn[d]))
                 {
                     dir = d;
                     break;
@@ -365,34 +504,60 @@ static void poll_sticks(void)
          * physical press can't do both at once (see this file's own
          * header). */
         if (dir == -1)
+        {
+            /* A raw joystick has no D-pad; hat 0 is the same four digital
+             * directions in the same role, so it takes this rung. Both go
+             * through the same bindings_button_is_free gate, on whichever
+             * band names the direction. */
+            const intvsession_pad_button up =
+                slot->handle ? INTVSESSION_PAD_BTN_DPAD_UP    : hat_button(0, 0);
+            const intvsession_pad_button rt =
+                slot->handle ? INTVSESSION_PAD_BTN_DPAD_RIGHT : hat_button(0, 2);
+            const intvsession_pad_button dn =
+                slot->handle ? INTVSESSION_PAD_BTN_DPAD_DOWN  : hat_button(0, 4);
+            const intvsession_pad_button lf =
+                slot->handle ? INTVSESSION_PAD_BTN_DPAD_LEFT  : hat_button(0, 6);
+            const intvsession_pad_side ps = (intvsession_pad_side)side;
+
             dir = intv_disc_from_dpad(
-                bindings_button_is_free((intvsession_pad_side)side,
-                                        INTVSESSION_PAD_BTN_DPAD_UP) &&
-                    SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_UP),
-                bindings_button_is_free((intvsession_pad_side)side,
-                                        INTVSESSION_PAD_BTN_DPAD_DOWN) &&
-                    SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_DOWN),
-                bindings_button_is_free((intvsession_pad_side)side,
-                                        INTVSESSION_PAD_BTN_DPAD_LEFT) &&
-                    SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_LEFT),
-                bindings_button_is_free((intvsession_pad_side)side,
-                                        INTVSESSION_PAD_BTN_DPAD_RIGHT) &&
-                    SDL_GetGamepadButton(slot->handle, SDL_GAMEPAD_BUTTON_DPAD_RIGHT));
+                bindings_button_is_free(ps, up) && slot_button_pressed(slot, up),
+                bindings_button_is_free(ps, dn) && slot_button_pressed(slot, dn),
+                bindings_button_is_free(ps, lf) && slot_button_pressed(slot, lf),
+                bindings_button_is_free(ps, rt) && slot_button_pressed(slot, rt));
+
+            /* A hat only ever reports one position, so the diagonals a
+             * gamepad reaches by holding two D-pad buttons need reading off
+             * the hat itself -- intv_disc_from_dpad above sees at most one
+             * of the four set. */
+            if (dir == -1 && !slot->handle)
+                for (int d = 1; d < INTVSESSION_PAD_HAT_DIRS; d += 2)
+                {
+                    const intvsession_pad_button b = hat_button(0, d);
+                    if (bindings_button_is_free(ps, b) &&
+                        slot_button_pressed(slot, b))
+                    {
+                        /* Hat direction (clockwise from N) -> disc clock
+                         * position (counter-clockwise from E, see
+                         * intv_host.h): NE=1 -> 2, SE=3 -> 14, SW=5 -> 10,
+                         * NW=7 -> 6. */
+                        static const int diag[INTVSESSION_PAD_HAT_DIRS] = {
+                            4, 2, 0, 14, 12, 10, 8, 6
+                        };
+                        dir = diag[d];
+                        break;
+                    }
+                }
+        }
 
         if (dir == -1)
         {
-            const float x =
-                SDL_GetGamepadAxis(slot->handle, SDL_GAMEPAD_AXIS_LEFTX) /
-                32767.0f;
-            const float y =
-                -SDL_GetGamepadAxis(slot->handle, SDL_GAMEPAD_AXIS_LEFTY) /
-                32767.0f; /* SDL: down is positive; disc math wants up
-                          * positive, see intv_disc_from_stick. */
+            float x, y;
             /* See DEADZONE_ENTER/_EXIT's own comment: use the narrower
              * exit radius while already pushed, the wider entry radius
              * while centered, so boundary wobble can't rapid-fire
              * centered/pushed transitions. */
             const int was_active = slot->last_disc[side] != -1;
+            slot_stick(slot, &x, &y);
             dir = intv_disc_from_stick(
                 x, y, was_active ? DEADZONE_EXIT : DEADZONE_ENTER);
         }
@@ -406,15 +571,82 @@ static void poll_sticks(void)
     pthread_mutex_unlock(&s_lock);
 }
 
+/* One button edge from any of the three sources, already translated. Latches
+ * a Map-mode capture if one is armed, otherwise injects. Shared so a gamepad
+ * button, a raw joystick button and a synthesized hat edge all behave
+ * identically -- including the swallow-everything-while-capturing rule (see
+ * this file's own header on why ALL of them, not just the one eventually
+ * recorded). */
+static void dispatch_button(SDL_JoystickID which, intvsession_pad_button b,
+                            int down)
+{
+    int idx;
+    int bindings[MAX_PADS];
+    int capturing;
+
+    if (b == INTVSESSION_PAD_BTN_NONE)
+        return;
+
+    pthread_mutex_lock(&s_lock);
+    capturing = s_cap_active;
+    if (capturing && down && !s_cap_have) {
+        s_cap_result = (int)b;
+        s_cap_have = 1;
+    }
+    idx = slot_for_id(which);
+    for (int i = 0; i < s_pad_count; i++)
+        bindings[i] = s_pads[i].bound_side;
+    pthread_mutex_unlock(&s_lock);
+
+    if (capturing || idx < 0)
+        return;
+    for (int side = 0; side < NUM_SIDES; side++)
+        if (intv_pad_for_port(bindings, s_pad_count, side) == idx)
+            handle_button((intv_pad_side)side, b, down);
+}
+
+/* SDL reports a hat as an absolute position, so the release of the old
+ * direction and the press of the new one have to be synthesized from the
+ * change. Reads and updates the slot's remembered mask under the lock, then
+ * dispatches outside it (dispatch_button takes the same lock). */
+static void handle_hat_motion(SDL_JoystickID which, int hat, Uint8 mask)
+{
+    int prev_dir, new_dir, idx;
+
+    if (hat < 0 || hat >= MAX_HATS)
+        return;
+
+    pthread_mutex_lock(&s_lock);
+    idx = slot_for_id(which);
+    if (idx < 0) {
+        pthread_mutex_unlock(&s_lock);
+        return;
+    }
+    prev_dir = hat_dir_from_mask(s_pads[idx].last_hat[hat]);
+    s_pads[idx].last_hat[hat] = mask;
+    pthread_mutex_unlock(&s_lock);
+
+    new_dir = hat_dir_from_mask(mask);
+    if (new_dir == prev_dir)
+        return;
+    if (prev_dir >= 0)
+        dispatch_button(which, hat_button(hat, prev_dir), 0);
+    if (new_dir >= 0)
+        dispatch_button(which, hat_button(hat, new_dir), 1);
+}
+
 static void *thread_main(void *arg)
 {
     (void)arg;
 
-    int gp_count = 0;
-    SDL_JoystickID *ids = SDL_GetGamepads(&gp_count);
+    /* Every joystick, not just the ones SDL has a gamepad mapping for --
+     * SDL_GetGamepads would silently omit an Intellivision-to-USB adapter
+     * entirely. open_pad sorts out which kind each one is. */
+    int js_count = 0;
+    SDL_JoystickID *ids = SDL_GetJoysticks(&js_count);
     if (ids)
     {
-        for (int i = 0; i < gp_count; i++)
+        for (int i = 0; i < js_count; i++)
             open_pad(ids[i]);
         SDL_free(ids);
     }
@@ -426,6 +658,16 @@ static void *thread_main(void *arg)
         {
             switch (ev.type)
             {
+            /* SDL posts the JOYSTICK_ pair for every device and the GAMEPAD_
+             * pair as well for a mapped one; open_pad/close_pad are
+             * idempotent, so taking all four costs nothing and means neither
+             * kind can be missed. */
+            case SDL_EVENT_JOYSTICK_ADDED:
+                open_pad(ev.jdevice.which);
+                break;
+            case SDL_EVENT_JOYSTICK_REMOVED:
+                close_pad(ev.jdevice.which);
+                break;
             case SDL_EVENT_GAMEPAD_ADDED:
                 open_pad(ev.gdevice.which);
                 break;
@@ -434,39 +676,33 @@ static void *thread_main(void *arg)
                 break;
             case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
             case SDL_EVENT_GAMEPAD_BUTTON_UP:
+                dispatch_button(ev.gbutton.which,
+                                pad_button_from_sdl(ev.gbutton.button),
+                                ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN);
+                break;
+            case SDL_EVENT_JOYSTICK_BUTTON_DOWN:
+            case SDL_EVENT_JOYSTICK_BUTTON_UP:
             {
-                int down = ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
-                int idx;
-                int bindings[MAX_PADS];
-                int capturing;
-
+                /* A mapped gamepad also emits these, for the same press it
+                 * already reported as a GAMEPAD_BUTTON event -- taking both
+                 * would fire every binding twice. The slot's kind decides. */
+                int gamepad;
                 pthread_mutex_lock(&s_lock);
-                capturing = s_cap_active;
-                if (capturing && down && !s_cap_have) {
-                    intvsession_pad_button b =
-                        pad_button_from_sdl(ev.gbutton.button);
-                    if (b != INTVSESSION_PAD_BTN_NONE) {
-                        s_cap_result = (int)b;
-                        s_cap_have = 1;
-                    }
-                }
-                idx = slot_for_id(ev.gbutton.which);
-                for (int i = 0; i < s_pad_count; i++)
-                    bindings[i] = s_pads[i].bound_side;
+                const int idx = slot_for_id(ev.jbutton.which);
+                gamepad = idx >= 0 && s_pads[idx].handle != NULL;
                 pthread_mutex_unlock(&s_lock);
-
-                /* Swallow every button event while capturing (see this
-                 * file's own header on why ALL of them, not just the one
-                 * eventually recorded) -- normal injection resumes only
-                 * once a Map dialog consumes the result or aborts. */
-                if (capturing || idx < 0)
+                if (gamepad || ev.jbutton.button >= 64)
                     break;
-                for (int side = 0; side < NUM_SIDES; side++)
-                    if (intv_pad_for_port(bindings, s_pad_count, side) == idx)
-                        handle_button((intv_pad_side)side, ev.gbutton.button,
-                                     down);
+                dispatch_button(ev.jbutton.which,
+                                (intvsession_pad_button)
+                                    (INTVSESSION_PAD_BTN_RAW_BASE +
+                                     ev.jbutton.button),
+                                ev.type == SDL_EVENT_JOYSTICK_BUTTON_DOWN);
                 break;
             }
+            case SDL_EVENT_JOYSTICK_HAT_MOTION:
+                handle_hat_motion(ev.jhat.which, ev.jhat.hat, ev.jhat.value);
+                break;
             default:
                 break;
             }
@@ -478,7 +714,7 @@ static void *thread_main(void *arg)
 
     pthread_mutex_lock(&s_lock);
     for (int i = 0; i < s_pad_count; i++)
-        SDL_CloseGamepad(s_pads[i].handle);
+        slot_close(&s_pads[i]);
     s_pad_count = 0;
     pthread_mutex_unlock(&s_lock);
 
@@ -546,9 +782,7 @@ int intvsession_gamepad_name(intvsession *s, int idx, char *dst, int dstsz)
     pthread_mutex_lock(&s_lock);
     if (idx >= 0 && idx < s_pad_count)
     {
-        const char *name = SDL_GetGamepadName(s_pads[idx].handle);
-        if (!name)
-            name = "Gamepad";
+        const char *name = slot_name(&s_pads[idx]);
         len = (int)strlen(name);
         if (dst && dstsz > 0)
             snprintf(dst, (size_t)dstsz, "%s", name);
@@ -564,6 +798,33 @@ void intvsession_gamepad_assign(intvsession *s, int idx, int side)
     if (idx >= 0 && idx < s_pad_count)
         s_pads[idx].bound_side = side;
     pthread_mutex_unlock(&s_lock);
+}
+
+int intvsession_gamepad_assignment(intvsession *s, int idx)
+{
+    (void)s;
+    int side = -1;
+    pthread_mutex_lock(&s_lock);
+    if (idx >= 0 && idx < s_pad_count)
+        side = s_pads[idx].bound_side;
+    pthread_mutex_unlock(&s_lock);
+    return side;
+}
+
+int intvsession_gamepad_effective_side(intvsession *s, int idx)
+{
+    (void)s;
+    int bindings[MAX_PADS];
+    int found = -1;
+
+    pthread_mutex_lock(&s_lock);
+    for (int i = 0; i < s_pad_count; i++)
+        bindings[i] = s_pads[i].bound_side;
+    for (int side = 0; side < NUM_SIDES && found < 0; side++)
+        if (intv_pad_for_port(bindings, s_pad_count, side) == idx)
+            found = side;
+    pthread_mutex_unlock(&s_lock);
+    return found;
 }
 
 void intvsession_gamepad_capture_begin(intvsession *s)

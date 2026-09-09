@@ -44,10 +44,24 @@ void intv_forward_ecs_key(WPARAM vk, LPARAM lp, int down);
  * VK+lParam -> intvsession.h keysym translation to know WHICH key was
  * pressed while capturing, without intv_forward_key's own dispatch (which
  * would inject the keystroke into the machine, exactly what capturing is
- * supposed to prevent). 0 for a key the emulated machine has no use for.
- * Defined in main.c, next to the VK translation tables it wraps
+ * supposed to prevent).
+ *
+ * Non-zero for any key Windows actually delivered -- including keys with no
+ * default mapping and keys a normal PC keyboard has no cap for, which land
+ * in intvsession.h's HID/native fallback bands. (It used to return 0 for
+ * those, and Map mode dropped the press: that is what made an
+ * Intellivision-to-USB adapter unmappable.) 0 only for a message carrying no
+ * VK at all. Defined in main.c, next to the VK translation tables it wraps
  * (special_keysym/base_char/resolve_side). */
 uint32_t intv_keysym_from_msg(WPARAM vk, LPARAM lp);
+
+/* Non-zero if `vk` is one of the hotkeys the main window claims before any
+ * binding is consulted (F9-F12, Ctrl-R). Map mode asks so it can refuse the
+ * key with an explanation instead of storing a binding on_key would shadow.
+ * On a non-zero return *what (if non-NULL) names what claims it, e.g.
+ * "fullscreen"; it is set to NULL otherwise. Defined in main.c beside
+ * on_key, the function whose behaviour it describes. */
+int intv_key_is_reserved(WPARAM vk, const char **what);
 
 /* Handle WM_KEYDOWN/WM_KEYUP/WM_SYSKEYDOWN/WM_SYSKEYUP, returning 1 if the
  * message was consumed. Anything else returns 0 and should be passed on as

@@ -38,6 +38,14 @@
 #include <string.h>
 
 #include "bindings.h"
+#include "hid_keys.h"
+
+/* Per-thread, because gamepad_sdl.c's polling thread names buttons while a
+ * frontend's Map mode may be naming one on the UI thread -- see
+ * intvsession_pad_button_name's contract in intvsession.h. C11 keyword
+ * rather than __thread so this stays portable across the four toolchains
+ * (MinGW, glibc, clang) core builds on. */
+#define INTV_TLS _Thread_local
 
 #define NUM_SIDES 4
 #define PACKED_BUF_SIZE 8192
@@ -576,13 +584,36 @@ const char *intvsession_pad_button_name(intvsession_pad_button button)
     case INTVSESSION_PAD_BTN_DPAD_DOWN:      return "D-Pad Down";
     case INTVSESSION_PAD_BTN_DPAD_LEFT:      return "D-Pad Left";
     case INTVSESSION_PAD_BTN_DPAD_RIGHT:     return "D-Pad Right";
-    default:                                return "?";
+    default:                                break;
     }
+
+    /* The raw joystick bands have no names to return -- the index IS the
+     * identity (see intvsession.h). Format into a thread-local buffer, whose
+     * lifetime rule the header spells out for callers. */
+    if (INTVSESSION_PAD_BTN_IS_RAW(button)) {
+        static INTV_TLS char buf[32];
+        snprintf(buf, sizeof(buf), "Button %d",
+                (int)(button - INTVSESSION_PAD_BTN_RAW_BASE));
+        return buf;
+    }
+    if (INTVSESSION_PAD_BTN_IS_HAT(button)) {
+        /* Clockwise from North, the 8 positions a HID hat switch reports. */
+        static const char *const dirs[INTVSESSION_PAD_HAT_DIRS] = {
+            "N", "NE", "E", "SE", "S", "SW", "W", "NW"
+        };
+        const int idx = (int)(button - INTVSESSION_PAD_HAT_BASE);
+        static INTV_TLS char buf[32];
+        snprintf(buf, sizeof(buf), "Hat %d %s", idx / INTVSESSION_PAD_HAT_DIRS,
+                dirs[idx % INTVSESSION_PAD_HAT_DIRS]);
+        return buf;
+    }
+    return "?";
 }
 
 int intvsession_keysym_name(uint32_t keysym, char *dst, int dstsz)
 {
     char letter[2];
+    char synth[32];
     const char *name = NULL;
 
     if (keysym >= 0x20 && keysym <= 0x7E) {
@@ -626,8 +657,28 @@ int intvsession_keysym_name(uint32_t keysym, char *dst, int dstsz)
         default:                          name = NULL; break;
         }
     }
+
+    /* Fallback bands (intvsession.h). A key with no name of its own still
+     * gets one: this function's contract is that dst is ALWAYS written, so
+     * that a Map mode can report what it just bound instead of printing an
+     * uninitialised buffer -- which is what every caller did back when an
+     * unnamed keysym returned 0 with dst untouched. */
+    if (!name && keysym >= INTVSESSION_KEYSYM_HID_BASE &&
+        keysym <= INTVSESSION_KEYSYM_HID_BASE + INTVSESSION_HID_USAGE_MAX) {
+        const uint32_t usage = keysym - INTVSESSION_KEYSYM_HID_BASE;
+        name = intv_hid_usage_name(usage);
+        if (!name) {
+            snprintf(synth, sizeof(synth), "HID 0x%02X", (unsigned)usage);
+            name = synth;
+        }
+    } else if (!name && keysym >= INTVSESSION_KEYSYM_NATIVE_BASE) {
+        snprintf(synth, sizeof(synth), "Key 0x%04X",
+                (unsigned)(keysym - INTVSESSION_KEYSYM_NATIVE_BASE));
+        name = synth;
+    }
+
     if (!name)
-        return 0;
+        name = ""; /* keysym 0, i.e. "no key" -- still writes dst. */
     if (dst && dstsz > 0)
         snprintf(dst, (size_t)dstsz, "%s", name);
     return (int)strlen(name);

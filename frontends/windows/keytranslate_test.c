@@ -52,6 +52,11 @@ static uint32_t sym(WPARAM vk, UINT scancode, int extended)
     return intv_keysym_from_msg(vk, lp_for(scancode, extended));
 }
 
+static uint32_t chr(WPARAM vk, UINT scancode, int shift)
+{
+    return intv_char_from_msg(vk, lp_for(scancode, 0), shift);
+}
+
 static void eq(const char *what, uint32_t got, uint32_t want)
 {
     if (got != want) {
@@ -176,6 +181,77 @@ int main(void)
         check("intv_key_is_reserved tolerates a NULL out-parameter",
               intv_key_is_reserved(VK_F12, NULL));
     }
+
+    /* ---- ECS keyboard characters --------------------------------------
+     * intv_char_from_msg is a SEPARATE table from everything above, and the
+     * two answer different questions: the keysym is a key's persisted
+     * binding identity, the character is what the user just typed, which in
+     * ECS keyboard mode is what picks the key. The ECS's shifted layer is
+     * nothing like a PC's -- '/' is SHIFT+7 over there, '%' is
+     * SHIFT+LEFT-ARROW -- so the symbols are unreachable except by
+     * character. */
+    eq("Shift+5 types '%'",     chr('5', 0x06, 1), '%');
+    eq("unshifted 5 types '5'", chr('5', 0x06, 0), '5');
+    eq("Shift+6 types '^'",     chr('6', 0x07, 1), '^');
+    eq("Shift+9 types '('",     chr('9', 0x0A, 1), '(');
+    /* The two cases base_char must NOT have, and this table must. */
+    eq("'/' types '/'",         chr(VK_OEM_2, 0x35, 0), '/');
+    eq("Shift+/ types '?'",     chr(VK_OEM_2, 0x35, 1), '?');
+    eq("apostrophe types '\''", chr(VK_OEM_7, 0x28, 0), '\'');
+    eq("Shift+' types '\"'",    chr(VK_OEM_7, 0x28, 1), '"');
+    eq("'-' types '-'",         chr(VK_OEM_MINUS, 0x0C, 0), '-');
+    eq("Shift+= types '+'",     chr(VK_OEM_PLUS, 0x0D, 1), '+');
+    eq("Shift+; types ':'",     chr(VK_OEM_1, 0x27, 1), ':');
+    eq("Shift+, types '<'",     chr(VK_OEM_COMMA, 0x33, 1), '<');
+    eq("Shift+. types '>'",     chr(VK_OEM_PERIOD, 0x34, 1), '>');
+    eq("letters fold to one case per side",
+       chr('A', 0x1E, 0), 'a');
+    eq("Shift+A types 'A'",     chr('A', 0x1E, 1), 'A');
+    /* The numpad types nothing here on purpose: its VKs carry digits, but
+     * the ECS map sends KP_7 to ECS "1" (upstream's keypad-shaped layout),
+     * so letting a character through would silently re-lay the whole
+     * numpad. intvsession_ecs_key_from_char refuses it too -- this is the
+     * belt to that suspenders. */
+    eq("numpad 7 types nothing", chr(VK_NUMPAD7, 0x47, 0), 0);
+    eq("numpad / types nothing", chr(VK_DIVIDE, 0x35, 0), 0);
+    /* Modifiers and F-keys type nothing. */
+    eq("Shift itself types nothing", chr(VK_LSHIFT, 0x2A, 0), 0);
+    eq("F5 types nothing",           chr(VK_F5, 0x3F, 0), 0);
+
+    /* ---- the ECS held-key id -------------------------------------------
+     * intvsession_ecs_key_event looks a release up by this, so the ONE
+     * thing it must never do is collapse two physically distinct keys.
+     * Windows reports the generic VK_SHIFT for both shift keys, which is
+     * exactly the collapse to guard against: hold one, release the other,
+     * and an ECS key still being held would be released. */
+    check("the two Shift keys get distinct ids",
+          intv_host_key_from_msg(VK_SHIFT, lp_for(0x2A, 0)) !=
+          intv_host_key_from_msg(VK_SHIFT, lp_for(0x36, 0)));
+    check("the two Ctrl keys get distinct ids",
+          intv_host_key_from_msg(VK_CONTROL, lp_for(0x1D, 0)) !=
+          intv_host_key_from_msg(VK_CONTROL, lp_for(0x1D, 1)));
+    check("a key's id is the same on press and release",
+          intv_host_key_from_msg('5', lp_for(0x06, 0)) ==
+          intv_host_key_from_msg('5', lp_for(0x06, 0)));
+    check("different keys get different ids",
+          intv_host_key_from_msg('5', lp_for(0x06, 0)) !=
+          intv_host_key_from_msg('6', lp_for(0x07, 0)));
+    /* Windows gives some HID usages a VK with a MakeCode of 0; those must
+     * still get a non-zero id of their own, or they would all collapse
+     * together AND read as "no id" to the session. */
+    check("a VK with no scancode still gets a distinct non-zero id",
+          intv_host_key_from_msg(0xFF, 0) != 0 &&
+          intv_host_key_from_msg(0xFF, 0) != intv_host_key_from_msg(0xFE, 0));
+
+    /* ---- and binding identity did NOT move ----------------------------
+     * The whole point of keeping the two tables apart. If base_char had
+     * grown a VK_OEM_2 case to serve the character path, "/" would stop
+     * landing in the HID band and every persisted binding for that key
+     * would silently change meaning. */
+    eq("'/' still lands in the HID band, unchanged",
+       sym(VK_OEM_2, 0x35, 0), INTVSESSION_KEYSYM_HID_BASE + 0x38);
+    eq("apostrophe still lands in the HID band, unchanged",
+       sym(VK_OEM_7, 0x28, 0), INTVSESSION_KEYSYM_HID_BASE + 0x34);
 
     if (failed) {
         fprintf(stderr, "keytranslate_test: FAILED\n");

@@ -701,9 +701,8 @@ static gboolean forward_key(GtkEventControllerKey *c, guint keyval,
      * the same keystroke meant two different things depending on which of
      * the app's windows happened to be focused. */
     if (intvsession_get_int(g_session, "keyboard_mode", 0)) {
-        intvsession_ecs_key key = intvsession_ecs_key_from_keysym(keysym);
-        if (key != INTVSESSION_ECS_KEY_NONE)
-            intvsession_ecs_key_set(g_session, key, down);
+        intvsession_ecs_key_event(g_session, keycode, keysym,
+                                  intv_char_from_keyval(keyval), down);
         return TRUE;
     }
 

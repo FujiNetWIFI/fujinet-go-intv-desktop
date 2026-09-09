@@ -94,7 +94,10 @@ SettingsDialog::SettingsDialog(intvsession *session, QWidget *parent)
     inputForm->addRow(QStringLiteral("ECS Keyboard"), ecsKeyboard);
     auto *inputNote = new QLabel(
         QStringLiteral("When on, the keyboard types on the ECS instead of "
-                       "driving the hand controllers (applies immediately)."),
+                       "driving the hand controllers (applies immediately).\n"
+                       "Warning: the FujiNet CONFIG ROM has no ECS keyboard "
+                       "support yet, so while this is on its menus can only "
+                       "be driven by a gamepad or the keypad window (F9)."),
         inputBox);
     inputNote->setWordWrap(true);
     inputForm->addRow(inputNote);

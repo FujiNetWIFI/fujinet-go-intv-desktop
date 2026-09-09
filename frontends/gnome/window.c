@@ -99,11 +99,17 @@ static gboolean forward_key(IntvWindow *self, GtkEventControllerKey *ctrl,
     /* "ECS Keyboard" input mode (Preferences -> Input, or toggled live from
      * there) steals the host keyboard for the ECS's own keyboard instead of
      * the hand controllers -- the two can't both claim it at once. See
-     * intvsession_ecs_key_from_keysym's own comment. */
+     * intvsession_ecs_key_from_keysym's own comment.
+     *
+     * The already-shifted keyval goes over as the character (the ECS's
+     * shifted layer is nothing like a PC's -- '%' is SHIFT+LEFT-ARROW over
+     * there -- so symbols only reach the machine by character), the
+     * shift-stripped keysym as the fallback for keys that produce none, and
+     * the hardware keycode as the stable id the release is looked up by.
+     * See intvsession_ecs_key_event. */
     if (intvsession_get_int(self->session, "keyboard_mode", 0)) {
-        intvsession_ecs_key key = intvsession_ecs_key_from_keysym(keysym);
-        if (key != INTVSESSION_ECS_KEY_NONE)
-            intvsession_ecs_key_set(self->session, key, down);
+        intvsession_ecs_key_event(self->session, keycode, keysym,
+                                  intv_char_from_keyval(keyval), down);
         return TRUE;
     }
 

@@ -48,6 +48,26 @@ struct intvsession {
     int  fujinet_running;
 
     void *audio;   /* audio_sdl.c state */
+
+    /* ---- ECS keyboard held keys (intvsession_ecs_key_event) -------------
+     * Which ECS key each currently-held HOST key asserted, so the release
+     * can clear that one rather than whatever the key resolves to at
+     * release time -- see intvsession_ecs_key_event's own comment on why
+     * those differ. Keyed by that function's `host_key`, not by the keysym,
+     * for the reason spelled out there. host_key 0 marks a free slot; a
+     * caller passing 0 substitutes its keysym before reaching here.
+     *
+     * 16 is far more than a keyboard can hold down at once through a matrix
+     * that ghosts the way pads.c models the ECS's own doing, let alone more
+     * than anyone types with.
+     *
+     * No lock: every writer is a frontend key handler on the UI thread,
+     * the same thread that already writes the intv global directly through
+     * intv_host_ecs_key. */
+    struct {
+        uint32_t host_key;
+        uint16_t key;      /* an intvsession_ecs_key */
+    } ecs_held[16];
 };
 
 void settings_init(struct intvsession *s);

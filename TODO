@@ -1046,6 +1046,154 @@ frontends -- requested 2026-08-12:
   [x] README.md's frontends paragraph and ctest suite count (12 -> 14)
       updated; COMPLIANCE.md's EXEC/GROM section extended to EXEC/GROM/ECS.
 
+M13 -- Natural ECS keyboard mapping:
+
+  [x] The complaint: with ECS Keyboard input mode on, typing symbols was
+      awful. Host keys mapped POSITIONALLY, so Shift+5 sent ECS SHIFT+5
+      and typed "+" instead of "%"; Shift+7 typed "/" instead of "&"; and
+      "/", "-", "=" and "+" typed nothing at all (intv_keymap.c mapped
+      neither "-" nor "=", and on Windows "/" never even reached the ECS
+      map -- base_char has no VK_OEM_2 case, so it lands in the HID band).
+      Root cause is that the ECS's shifted layer bears no relation to a
+      PC's: SHIFT+1..0 are = " # $ + - / * ( ), and "%" / "'" / "^" / "?"
+      live on SHIFT plus the LEFT/RIGHT/UP/DOWN arrow keys.
+  [x] The fix was finishing the port, not inventing anything. jzIntv has a
+      "fake shift" mechanism (src/pads/pads.c's fake_shift_bits): a bit set
+      in the HIGH byte of pad1.k[row] makes pad_eval_keyboard assert SHIFT
+      in row 6 / col 7 for the scan and fold the bit down into the real
+      key. Upstream's own mapping.c uses it for 17 KEYB_* actions bound to
+      the SHIFTED SDL keysyms -- i.e. upstream jzIntv already types
+      naturally -- and this port deliberately skipped exactly those entries
+      when it transcribed the table (M8's own comment argued for omitting
+      them, on the theory that holding Shift with the base key was the
+      faithful thing; it is, on the ECS's layout, which is the problem).
+  [x] core/jzintv/intv_host.{h,c}: intv_ecs_key gained a 17-member shifted
+      band after a new INTV_ECS_KEY_PHYSICAL_COUNT marker (the 48 real key
+      caps end there, which is what the on-screen keyboards draw), each
+      entry the base key's own {row, mask << 8}. Nothing iterates the enum
+      or assumes 48, and core/src/bindings.c has no ECS-key target kind, so
+      no ECS key value is persisted anywhere -- renumbering
+      INTVSESSION_ECS_KEY_NONE from 48 to 65 is invisible. Both existing
+      bound checks (>= INTV_ECS_KEY_COUNT, >= INTVSESSION_ECS_KEY_NONE)
+      keep working unedited.
+  [x] core/src/intv_keymap.c: the 17 characters added to
+      intvsession_ecs_key_from_keysym, plus a new pure
+      intvsession_ecs_key_from_char(keysym, ch) that prefers the character
+      the host layout produced. Two deliberate divergences from upstream,
+      both improvements: upstream binds NO host key to KEYB_PCT at all, and
+      sends KEYB_QUOTE (a double quote) for the apostrophe key -- here "'"
+      reaches KEYB_SQUOTE and "%" KEYB_PCT, so the whole ECS character set
+      is typeable for the first time.
+  [x] REAL BUG caught in review before it shipped: "character wins" would
+      have silently re-laid the numeric keypad. With NumLock on every
+      toolkit reports a digit for it (GDK_KEY_KP_7 unicodes to '7', Qt's
+      text() is "7", AppKit's characters is @"7"), while the ECS map sends
+      KP_7 to ECS "1" -- upstream's keypad-shaped layout. Fixed by giving
+      any key with a CURATED symbol (the 0x1000 band: numpad, arrows,
+      Enter/Esc/Backspace, modifiers) its positional meaning regardless of
+      character. Deliberately NOT `keysym >= 0x1000`: the HID and native
+      fallback bands must still resolve by character, because that is
+      exactly where Windows' "/" key lands.
+  [x] SECOND real bug, same review: the release path. A press resolved by
+      character and a release resolved afresh do not agree -- press Shift,
+      press "5" and the character is '%', release Shift FIRST and the "5"
+      key-up arrives as '5'. The release would then clear ECS "5" and
+      strand the "%" key's fake-shift bit, and since pads.c re-derives the
+      pending shift from every row on every scan, ONE stranded bit leaves
+      the machine reading SHIFT on every later keystroke -- whole-session
+      corruption, not a lost key. Fixed with a 16-entry held-key table in
+      struct intvsession (core/src/session_internal.h) and a new
+      intvsession_ecs_key_event(), which records what each press asserted
+      and clears exactly that on release. intvsession_ecs_keys_clear()
+      empties the table too, so every existing focus-loss path is already
+      the backstop.
+  [x] The table is keyed on a frontend-supplied host_key (GDK keycode, Qt
+      nativeScanCode, AppKit keyCode, Win32 VK), NOT the keysym. Two of the
+      four frontends do not produce a shift-stable keysym: KeyForward.cpp's
+      scancode table and IntvKeyForward.m's keyCode table cover neither "/"
+      nor "'", so Qt's text() and AppKit's charactersIgnoringModifiers
+      (which ignores every modifier EXCEPT Shift) decide those and Shift
+      moves them. Those tables can NOT simply be extended -- a curated
+      symbol is also a key's persisted binding identity, and
+      keytranslate_test pins "/" to the HID band.
+  [x] All four frontends: the ECS branch became one intvsession_ecs_key_event
+      call at each of the nine dispatch sites, each passing the character it
+      already had -- GNOME gdk_keyval_to_unicode on the raw shifted keyval
+      (new intv_char_from_keyval in keysym_map.h), KDE event->text() (new
+      intvEcsCharForKeyEvent), macOS -characters (new IntvCharForEvent),
+      Windows a new US-layout shifted_char/unshifted_char pair in
+      key_translate.c. The three on-screen ECS keyboard windows still route
+      unconditionally, ignoring keyboard_mode, as before. NONE of the four
+      shift-stripping pad translators was touched.
+      macOS gotcha, also from review: -characters RAISES on an
+      NSEventTypeFlagsChanged event, and both macOS forwarders are reached
+      from -flagsChanged: for the modifier keys -- IntvCharForEvent guards
+      on event.type, which is load bearing, not defensive.
+      Windows deliberately uses a table rather than ToUnicodeEx:
+      keytranslate_test is this file's only safety net (no Windows machine
+      here) and a table asserts deterministically. It is kept strictly
+      separate from base_char, which must NOT gain the VK_OEM_2/VK_OEM_7
+      cases, since that would move those keys' binding identity.
+  [x] New tests: core/tests/ecs_scan_test.c drives intv.pad1 over the
+      peripheral bus the way the ECS's own scan does (reg 8 for I/O
+      direction, reg 14 row select, reg 15 read-back, swept twice because
+      pads.c only ENGAGES a pending fake shift on the pass that selects
+      row 6) and confirms "/" reads as the "7" key WITH shift asserted
+      while a plain "7" asserts none -- the only test that proves the
+      synthesised shift reaches a scan at all, which no bit-level assertion
+      can. core/tests/ecs_key_event_test.c covers the host-side
+      bookkeeping: the release-tracking regression above, the numpad guard,
+      auto-repeat, a character that changes mid-hold, Ctrl combos, the HID
+      band, table overflow, and a release arriving after a focus-loss
+      clear. It needs no ROMs (intv_host_ecs_key writes the intv global
+      whether or not the machine runs), so unlike ecs_key it runs in the
+      WITH_INTV_ROMS=OFF config too. Extended ecs_key_test.c (all 17
+      shifted keys bit-exact against mapping.c, plus clear-all with a
+      fake-shift key held), keymap_test.c (all 17 characters, the
+      apostrophe/double-quote split, the unshifted keys not having moved,
+      "!"/"@"/"&" resolving to nothing, and every
+      intvsession_ecs_key_from_char branch), keyforward_test.cpp (ECS
+      resolution off the same QKeyEvents the pad assertions use, plus
+      proof the keysyms did NOT move), and keytranslate_test.c (the new
+      character table both ways, and re-assertion that "/" and "'" still
+      land in the HID band unchanged).
+      VERIFIED both new tests FAIL when the behaviour they pin is broken --
+      dropping the << 8 from KEYB_SLASH, and re-resolving on release --
+      rather than being green by construction.
+  [x] Windows also gained intv_host_key_from_msg: the held-key table cannot
+      be keyed on the raw VK there, because WM_(SYS)KEYDOWN/UP report the
+      generic VK_SHIFT for BOTH shift keys (and VK_CONTROL/VK_MENU for
+      theirs), so holding one and releasing the other would release an ECS
+      key still held. It composes the VK with the scancode and the
+      extended bit -- the scancode separates the shift pair, the extended
+      bit separates the Ctrl/Alt pairs that share a scancode, and the VK
+      keeps the MakeCode-0 HID usages from collapsing onto one id.
+  [x] Settings dialogs, all four: the ECS Keyboard note now warns that the
+      FujiNet CONFIG ROM has no ECS keyboard support yet, so while the mode
+      is on CONFIG's own menus can only be driven by a gamepad or the
+      keypad window. Windows' and macOS' fixed-size Settings windows grew
+      to fit (460x560 -> 460x610, 420x260 -> 420x320); GNOME and KDE
+      auto-size. Requested by the user mid-implementation.
+  [x] VERIFIED: full ctest green natively in both WITH_INTV_ROMS=ON (26
+      suites, up from 24) and =OFF (22, all pass or skip -- ecs_scan needed
+      adding to the SKIP_RETURN_CODE 77 list beside ecs_key, since it wants
+      a real ecs.bin), and Windows cross-built with mingw-w64 and
+      ctest-passed under Wine (21/22). NOTE for next time: WINEPATH must
+      point at BOTH /usr/x86_64-w64-mingw32/bin and the x86_64 SDL3 bin
+      dir, or every session-creating test (session, ecs_key_event) dies at
+      load with no output at all -- an SDL3.dll miss, not a test failure,
+      and it looks exactly like a broken test.
+      The one failure in each config, `debug` ("pc in a mapped ROM range"),
+      is PRE-EXISTING -- confirmed by stashing this work and re-running it
+      on a clean tree.
+      macOS is source-complete but, as ever, not compiled here.
+      NOT verified: typing in a real ECS BASIC session. This environment is
+      Wayland-only with no working input-injection tool (no ydotool/wtype,
+      and xdotool cannot see a Wayland client), so the GUI could be
+      launched and screenshotted but not typed into. ecs_scan_test is the
+      substitute and is a close one -- it reads the matrix back over the
+      peripheral bus exactly as the ECS ROM's own scan does.
+
 NOT STARTED:
 
   Pushing to https://github.com/FujiNetWIFI/fujinet-go-intv-desktop,

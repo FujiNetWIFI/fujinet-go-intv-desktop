@@ -101,9 +101,12 @@ static HWND make_mod_key(HWND parent, HINSTANCE inst, const char *text,
 }
 
 /* ---- layout ---------------------------------------------------------------
- * Four QWERTY-ish rows plus a function row, covering all 48 keys of
- * intv_ecs_key exactly once. See core/jzintv/intv_host.h for the row/mask
- * this ultimately maps to. */
+ * Four QWERTY-ish rows plus a function row, covering all 48 PHYSICAL keys of
+ * intv_ecs_key exactly once -- the physical caps, i.e. everything below
+ * INTV_ECS_KEY_PHYSICAL_COUNT. The shifted band past it is not drawn: those
+ * are not extra buttons, they are these same keys with SHIFT, and the
+ * latching SHIFT button below already chords them exactly as a hand would.
+ * See core/jzintv/intv_host.h for the row/mask this ultimately maps to. */
 
 typedef struct { const char *label; intvsession_ecs_key key; } ecs_key_label;
 

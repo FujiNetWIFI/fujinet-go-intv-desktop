@@ -227,6 +227,20 @@ quint32 intvKeysymForKeyEvent(const QKeyEvent *event)
                               (quint32)event->key() : 0;
 }
 
+quint32 intvEcsCharForKeyEvent(const QKeyEvent *event)
+{
+    /* text(), not the scancode path above: this is the one place that WANTS
+     * what Shift and the layout did to the key. Qt reports no text at all
+     * for a Ctrl combo and a control code for some others, so anything
+     * outside printable ASCII returns 0 and lets the caller fall back to the
+     * physical key. */
+    if (event->text().isEmpty())
+        return 0;
+
+    const quint32 ch = event->text().at(0).unicode();
+    return (ch >= 0x20 && ch < 0x7F) ? ch : 0;
+}
+
 void intvForwardKey(intvsession *session, const QKeyEvent *event, int down)
 {
     const quint32 keysym = intvKeysymForKeyEvent(event);
@@ -261,11 +275,19 @@ void intvForwardKey(intvsession *session, const QKeyEvent *event, int down)
     /* "ECS Keyboard" input mode (Settings, or toggled live from there)
      * steals the host keyboard for the ECS's own keyboard instead of the
      * hand controllers -- see intvsession_ecs_key_from_keysym's own comment
-     * on why the two can't both claim it at once. */
+     * on why the two can't both claim it at once.
+     *
+     * All three parts matter: the character resolves the key (the ECS's
+     * shifted layer is nothing like a PC's, so '%' and '/' only reach it
+     * this way), the keysym is the fallback for keys that produce no
+     * character at all, and nativeScanCode() is what lets the RELEASE find
+     * what the press asserted. The keysym cannot do that last job here:
+     * keysymForScanCode above covers neither "/" nor "'", so Qt's own
+     * already-shifted text() decides those, and Shift moves them between
+     * press and release. See intvsession_ecs_key_event. */
     if (intvsession_get_int(session, "keyboard_mode", 0)) {
-        intvsession_ecs_key key = intvsession_ecs_key_from_keysym(keysym);
-        if (key != INTVSESSION_ECS_KEY_NONE)
-            intvsession_ecs_key_set(session, key, down);
+        intvsession_ecs_key_event(session, event->nativeScanCode(), keysym,
+                                  intvEcsCharForKeyEvent(event), down);
         return;
     }
 

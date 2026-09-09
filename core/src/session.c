@@ -306,8 +306,93 @@ void intvsession_ecs_key_set(intvsession *s, intvsession_ecs_key key,
 
 void intvsession_ecs_keys_clear(intvsession *s)
 {
-    (void)s;
+    /* The held-key table has to go with the matrix, not just alongside it:
+     * a stale entry would make the NEXT release of that host key clear an
+     * ECS key nobody pressed. */
+    if (s)
+        memset(s->ecs_held, 0, sizeof(s->ecs_held));
     intv_host_ecs_keys_clear();
+}
+
+/* See intvsession.h for the contract: why the release cannot simply
+ * re-resolve the event it is releasing, and why the table is keyed on
+ * host_key rather than on the keysym. */
+void intvsession_ecs_key_event(intvsession *s, uint32_t host_key,
+                               uint32_t keysym, uint32_t ch, int down)
+{
+    intvsession_ecs_key key;
+    int i, slots, free_slot = -1;
+
+    if (!s)
+        return;
+
+    slots = (int)(sizeof(s->ecs_held) / sizeof(s->ecs_held[0]));
+
+    /* A frontend with no stable physical-key id falls back to the keysym --
+     * exactly right for any key with a curated symbol (those never move
+     * under Shift), and no worse than resolving afresh for the rest. */
+    if (!host_key)
+        host_key = keysym;
+    if (!host_key)
+        return;
+
+    if (!down)
+    {
+        for (i = 0; i < slots; i++)
+            if (s->ecs_held[i].host_key == host_key)
+            {
+                intvsession_ecs_key_set(
+                    s, (intvsession_ecs_key)s->ecs_held[i].key, 0);
+                s->ecs_held[i].host_key = 0;
+                return;
+            }
+        /* No record: either the press resolved to nothing, or it happened
+         * before an intvsession_ecs_keys_clear (a focus loss, a mode
+         * toggle). Nothing to release either way -- and deliberately NOT a
+         * re-resolve, which is the bug this table exists to prevent. */
+        return;
+    }
+
+    key = intvsession_ecs_key_from_char(keysym, ch);
+    if (key == INTVSESSION_ECS_KEY_NONE)
+        return;
+
+    for (i = 0; i < slots; i++)
+    {
+        if (s->ecs_held[i].host_key == host_key)
+        {
+            /* Auto-repeat (GTK and Win32 both deliver it; Qt and AppKit
+             * drop it before this point), or a press whose release was
+             * swallowed. Reusing the slot keeps a held key from filling the
+             * table -- and releasing the old ECS key first matters when the
+             * character CHANGED mid-hold, e.g. Shift pressed after the key
+             * with the toolkit still repeating it: without this the old
+             * key's bit would stay down for good. */
+            if (s->ecs_held[i].key != (uint16_t)key)
+                intvsession_ecs_key_set(
+                    s, (intvsession_ecs_key)s->ecs_held[i].key, 0);
+            s->ecs_held[i].key = (uint16_t)key;
+            intvsession_ecs_key_set(s, key, 1);
+            return;
+        }
+        if (free_slot < 0 && s->ecs_held[i].host_key == 0)
+            free_slot = i;
+    }
+
+    /* Table full -- 16 keys physically held at once, which the emulated
+     * matrix could not resolve anyway (pads.c models the ECS's own
+     * ghosting). Evict slot 0 rather than either dropping the keystroke or
+     * leaking its assertion: the evicted key's own release will find no
+     * record and do nothing, and the focus-loss clear is the backstop. */
+    if (free_slot < 0)
+    {
+        intvsession_ecs_key_set(s, (intvsession_ecs_key)s->ecs_held[0].key, 0);
+        free_slot = 0;
+    }
+
+    s->ecs_held[free_slot].host_key = host_key;
+    s->ecs_held[free_slot].key = (uint16_t)key;
+    intvsession_ecs_key_set(s, key, 1);
 }
 
 void intvsession_pads_clear(intvsession *s)

@@ -274,6 +274,35 @@ typedef enum {
     INTVSESSION_ECS_KEY_RIGHT, INTVSESSION_ECS_KEY_CTRL,
     INTVSESSION_ECS_KEY_A,
     INTVSESSION_ECS_KEY_SHIFT,
+    INTVSESSION_ECS_KEY_PHYSICAL_COUNT, /* the 48 real key caps end here --
+                                         * what an on-screen ECS keyboard
+                                         * draws a button for. */
+
+    /* ---- shifted symbols -------------------------------------------------
+     * The second character printed on an ECS key cap. On real hardware the
+     * only way to reach one is to hold SHIFT with the base key, and these
+     * do exactly that: each is the base key's own matrix bit written into
+     * the high byte of intv.pad1.k[row], which is jzIntv's "fake shift"
+     * convention -- pads.c asserts SHIFT for the scan on their behalf. See
+     * core/jzintv/intv_host.h's intv_ecs_key for the full mechanism.
+     *
+     * Which base key each rides on is the ECS's own layout, NOT a PC's:
+     * '%' is SHIFT+LEFT-ARROW, "'" is SHIFT+RIGHT-ARROW, '^' is SHIFT+UP,
+     * '?' is SHIFT+DOWN, '/' is SHIFT+7, '+' is SHIFT+5, '-' is SHIFT+6,
+     * '=' is SHIFT+1. That mismatch is why the host keyboard is resolved by
+     * CHARACTER (intvsession_ecs_key_from_char) rather than by key
+     * position: typing '%' should not require knowing it lives on an arrow
+     * key over here. */
+    INTVSESSION_ECS_KEY_EQUAL = INTVSESSION_ECS_KEY_PHYSICAL_COUNT,
+    INTVSESSION_ECS_KEY_QUOTE, INTVSESSION_ECS_KEY_HASH,
+    INTVSESSION_ECS_KEY_DOLLAR, INTVSESSION_ECS_KEY_PLUS,
+    INTVSESSION_ECS_KEY_MINUS, INTVSESSION_ECS_KEY_SLASH,
+    INTVSESSION_ECS_KEY_STAR, INTVSESSION_ECS_KEY_LPAREN,
+    INTVSESSION_ECS_KEY_RPAREN, INTVSESSION_ECS_KEY_CARET,
+    INTVSESSION_ECS_KEY_QUEST, INTVSESSION_ECS_KEY_PCT,
+    INTVSESSION_ECS_KEY_SQUOTE, INTVSESSION_ECS_KEY_COLON,
+    INTVSESSION_ECS_KEY_GREATER, INTVSESSION_ECS_KEY_LESS,
+
     INTVSESSION_ECS_KEY_NONE, /* returned by intvsession_ecs_key_from_keysym
                               * for a keysym with no ECS keyboard mapping;
                               * not a real key -- never pass this to
@@ -283,6 +312,40 @@ typedef enum {
 void intvsession_ecs_key_set(intvsession *s, intvsession_ecs_key key,
                              int pressed);
 void intvsession_ecs_keys_clear(intvsession *s);
+
+/* One host key event in "ECS keyboard" mode -- what a frontend's key handler
+ * should call instead of resolving and injecting itself.
+ *
+ * `keysym` and `ch` are intvsession_ecs_key_from_char's two arguments; see
+ * that function for how a press resolves.
+ *
+ * `host_key` is the frontend's own raw identifier for the PHYSICAL key --
+ * GDK's hardware keycode, Qt's nativeScanCode(), AppKit's keyCode, Win32's
+ * VK -- and exists purely so a release can find what its own press
+ * asserted. It cannot be `keysym`: a press and its release do not always
+ * produce the same keysym. Two of the four frontends resolve a key with no
+ * curated symbol of its own through the toolkit's text, which Shift moves
+ * (Qt and AppKit both report "?" for the "/" key while Shift is held --
+ * frontends/kde/KeyForward.cpp's scancode table and
+ * frontends/macos/IntvKeyForward.m's keyCode table cover neither "/" nor
+ * "'"), and those tables cannot simply be extended, because a curated
+ * symbol is also a key's PERSISTED BINDING IDENTITY -- see the fallback
+ * keysym bands' own comment on why a key must be reachable through exactly
+ * one of them. Pass 0 if the frontend genuinely has no stable id (a
+ * synthesized event); `keysym` is then used instead, which is right for
+ * every key that has a curated symbol and merely no better than today's
+ * behaviour for the rest.
+ *
+ * Why the bookkeeping exists at all: press Shift, press "5" and `ch` is
+ * '%', which is ECS SHIFT+LEFT-ARROW; release Shift first and the "5"
+ * key-up arrives as plain '5'. A release resolved afresh would clear ECS
+ * "5" and leave the '%' key's fake-shift bit down -- and pads.c re-reads
+ * every row's fake-shift bits on every scan, so one stranded bit leaves the
+ * machine reading SHIFT on every later keystroke. intvsession_ecs_keys_clear
+ * forgets every held key too, so a focus-loss clear cannot leave stale
+ * entries behind. */
+void intvsession_ecs_key_event(intvsession *s, uint32_t host_key,
+                               uint32_t keysym, uint32_t ch, int down);
 
 /* The hand-controller equivalent: releases every keypad/action key and both
  * discs on all four sides. A frontend should call BOTH on losing keyboard
@@ -473,6 +536,26 @@ intvsession_key_mapping intvsession_key_from_keysym(uint32_t keysym);
  * F10/F11/F12 stay reserved for the frontends here too. Pure function;
  * unit-tested in core/tests/keymap_test.c. */
 intvsession_ecs_key intvsession_ecs_key_from_keysym(uint32_t keysym);
+
+/* The same, but read the way a key cap reads: `ch` is the character the host
+ * layout actually produced (0 if none), `keysym` the shift-independent
+ * identity of the same physical key.
+ *
+ * A printable `ch` wins, because the ECS's shifted layer is nothing like a
+ * PC's -- ECS SHIFT+5 is '+', not '%' -- so passing the physical key plus a
+ * SHIFT chord through positionally types the wrong character, and leaves
+ * '/', '-', '=' and '+' unreachable entirely (the ECS has no unshifted key
+ * for any of them). Resolving by character puts every symbol on the host key
+ * that prints it, which is also what upstream jzIntv does: its own
+ * cfg_key_bind[] binds the SHIFTED SDL keysyms to the KEYB_SLASH/KEYB_PLUS/
+ * ... fake-shift actions (mapping.c's "ECS Keyboard 'Shifted' Keys" block).
+ *
+ * `keysym` is the fallback for every key that produces no character at all
+ * -- arrows, Enter, Esc, the numeric keypad, Shift/Ctrl themselves, and Ctrl
+ * combos, for which no toolkit reports text. Pure function; unit-tested in
+ * core/tests/keymap_test.c. */
+intvsession_ecs_key intvsession_ecs_key_from_char(uint32_t keysym,
+                                                  uint32_t ch);
 
 /* ---- remappable bindings (core/src/bindings.c) -----------------------------
  * intvsession_key_from_keysym above and the gamepad face buttons (core/src/

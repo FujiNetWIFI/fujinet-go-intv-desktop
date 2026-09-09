@@ -133,16 +133,21 @@ intvsession_key_mapping intvsession_key_from_keysym(uint32_t keysym)
  * transcribed, matching the column-0 mapping's own choice to only use the
  * table's first (default) block.
  *
- * Several host keys in that block bind ONLY to one of upstream's shifted-
- * symbol convenience actions (KEYB_MINUS, KEYB_EQUAL, KEYB_QUOTE,
- * KEYB_HASH, KEYB_DOLLAR, KEYB_PLUS, KEYB_SLASH, KEYB_STAR, KEYB_LPAREN,
- * KEYB_RPAREN, KEYB_CARET, KEYB_QUEST, KEYB_COLON, KEYB_GREATER,
- * KEYB_LESS) -- intv_host.h's ecs_key_codes table deliberately omits those
- * (see its own comment): the real shifted character reaches the emulated
- * ECS the same way it does on real hardware, by holding
- * INTVSESSION_ECS_KEY_SHIFT with the unshifted base key, so those host keys
- * map to no ECS key here (INTVSESSION_ECS_KEY_NONE) rather than silently
- * doing nothing useful. */
+ * Upstream's block also binds the SHIFTED characters -- '"', '#', '+', '/',
+ * '?', ':', '<' and the rest -- to its KEYB_QUOTE/KEYB_HASH/KEYB_PLUS/
+ * KEYB_SLASH/... "fake shift" actions, and those are carried over here too,
+ * as the INTVSESSION_ECS_KEY_* shifted band (see intvsession.h's enum). They
+ * are keyed by the character itself rather than by any physical key, because
+ * the ECS's shifted layer bears no relation to a PC's: '/' is SHIFT+7 over
+ * there, '+' is SHIFT+5, '%' is SHIFT+LEFT-ARROW. Two of them improve on
+ * upstream, which binds nothing at all to KEYB_PCT and sends KEYB_QUOTE
+ * ('"') for the apostrophe key; here "'" reaches KEYB_SQUOTE and '%'
+ * KEYB_PCT, so the whole ECS character set is typeable.
+ *
+ * A few host keys still map to nothing (INTVSESSION_ECS_KEY_NONE) because
+ * the ECS keyboard simply has no such character anywhere on it: '!', '@',
+ * '&', '_', '~', backtick, the brackets, the braces, the backslash and the
+ * pipe. */
 intvsession_ecs_key intvsession_ecs_key_from_keysym(uint32_t keysym)
 {
     if (keysym >= 'a' && keysym <= 'z')
@@ -166,8 +171,7 @@ intvsession_ecs_key intvsession_ecs_key_from_keysym(uint32_t keysym)
     case INTVSESSION_KEYSYM_KP_PERIOD: return INTVSESSION_ECS_KEY_PERIOD;
     case INTVSESSION_KEYSYM_KP_ENTER:  return INTVSESSION_ECS_KEY_ENTER;
 
-    /* ---- the number row -- mapping.c: "1".."0" (its "-"/"=" are
-     * shifted-symbol-only, see the function comment) ---------------------- */
+    /* ---- the number row -- mapping.c: "1".."0" ------------------------- */
     case '1': return INTVSESSION_ECS_KEY_1;
     case '2': return INTVSESSION_ECS_KEY_2;
     case '3': return INTVSESSION_ECS_KEY_3;
@@ -235,6 +239,74 @@ intvsession_ecs_key intvsession_ecs_key_from_keysym(uint32_t keysym)
     case INTVSESSION_KEYSYM_RETURN:    return INTVSESSION_ECS_KEY_ENTER;
     case INTVSESSION_KEYSYM_BACKSPACE: return INTVSESSION_ECS_KEY_LEFT;
 
+    /* ---- the shifted layer -- mapping.c's "ECS Keyboard 'Shifted' Keys"
+     * block, reached by the character rather than by the key that carries
+     * it on an ECS (which is where the comment on ';' and ',' above stops
+     * being enough: ':' and '<' are the SAME two keys shifted, but '/' and
+     * '%' are on 7 and the left arrow, nowhere a PC would look). --------- */
+    case '=':  return INTVSESSION_ECS_KEY_EQUAL;   /* ECS SHIFT+1 */
+    case '"':  return INTVSESSION_ECS_KEY_QUOTE;   /* ECS SHIFT+2 */
+    case '#':  return INTVSESSION_ECS_KEY_HASH;    /* ECS SHIFT+3 */
+    case '$':  return INTVSESSION_ECS_KEY_DOLLAR;  /* ECS SHIFT+4 */
+    case '+':  return INTVSESSION_ECS_KEY_PLUS;    /* ECS SHIFT+5 */
+    case '-':  return INTVSESSION_ECS_KEY_MINUS;   /* ECS SHIFT+6 */
+    case '/':  return INTVSESSION_ECS_KEY_SLASH;   /* ECS SHIFT+7 */
+    case '*':  return INTVSESSION_ECS_KEY_STAR;    /* ECS SHIFT+8 */
+    case '(':  return INTVSESSION_ECS_KEY_LPAREN;  /* ECS SHIFT+9 */
+    case ')':  return INTVSESSION_ECS_KEY_RPAREN;  /* ECS SHIFT+0 */
+    case '^':  return INTVSESSION_ECS_KEY_CARET;   /* ECS SHIFT+UP */
+    case '?':  return INTVSESSION_ECS_KEY_QUEST;   /* ECS SHIFT+DOWN */
+    case '%':  return INTVSESSION_ECS_KEY_PCT;     /* ECS SHIFT+LEFT */
+    case '\'': return INTVSESSION_ECS_KEY_SQUOTE;  /* ECS SHIFT+RIGHT */
+    case ':':  return INTVSESSION_ECS_KEY_COLON;   /* ECS SHIFT+; */
+    case '>':  return INTVSESSION_ECS_KEY_GREATER; /* ECS SHIFT+. */
+    case '<':  return INTVSESSION_ECS_KEY_LESS;    /* ECS SHIFT+, */
+
     default: return INTVSESSION_ECS_KEY_NONE;
     }
+}
+
+/* See intvsession.h for why a printable character outranks the physical key
+ * here, and for what falls through to intvsession_ecs_key_from_keysym. */
+intvsession_ecs_key intvsession_ecs_key_from_char(uint32_t keysym, uint32_t ch)
+{
+    /* A key with a CURATED symbol keeps its positional meaning, character or
+     * no character. This is not a nicety: with NumLock on, every toolkit
+     * reports a digit for the numeric keypad (GDK_KEY_KP_7 unicodes to '7',
+     * Qt's text() is "7", AppKit's characters is @"7"), while the map above
+     * deliberately sends KP_7 to ECS "1" -- upstream's own keypad-shaped
+     * layout, see intvsession_ecs_key_from_keysym. Letting the character
+     * win would silently re-lay the whole numpad from 1..0 to 7,8,9,4,5,6,
+     * 1,2,3,0. Same argument, less visibly, for the arrows: '^' and '?' are
+     * SHIFT+UP/SHIFT+DOWN on an ECS, and the cursor keys have to stay
+     * cursor keys.
+     *
+     * The test is the curated 0x1000 band ONLY, deliberately not
+     * `keysym >= 0x1000`: the HID and native fallback bands (0x10000 up)
+     * must still resolve by character, because that is where a key with no
+     * curated symbol of its own lands -- on Windows the "/" key resolves to
+     * HID usage 0x38, and reaching ECS "/" through it is the entire point
+     * of this function. */
+    if (keysym >= INTVSESSION_KEYSYM_UP &&
+        keysym <= INTVSESSION_KEYSYM_BACKSPACE)
+        return intvsession_ecs_key_from_keysym(keysym);
+
+    /* Printable ASCII only. A control code (Ctrl+letter, where the toolkits
+     * that report text at all report \x01..\x1A) or anything outside the
+     * ECS's own 7-bit repertoire has to fall through to the physical key --
+     * Ctrl+A must reach ECS CTRL+A, not nothing. */
+    if (ch >= 0x20 && ch < 0x7F)
+    {
+        const intvsession_ecs_key key = intvsession_ecs_key_from_keysym(ch);
+        if (key != INTVSESSION_ECS_KEY_NONE)
+            return key;
+
+        /* A printable character the ECS has no key for at all ('!', '@',
+         * '&', ...) stops here rather than falling back to the physical
+         * key: Shift+1 typing '=' because '!' happens to sit above the "1"
+         * cap is exactly the positional behaviour this replaces. */
+        return INTVSESSION_ECS_KEY_NONE;
+    }
+
+    return intvsession_ecs_key_from_keysym(keysym);
 }

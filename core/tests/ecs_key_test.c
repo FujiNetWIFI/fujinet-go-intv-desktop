@@ -109,6 +109,66 @@ int main(void)
     intv_host_ecs_key(INTV_ECS_KEY_SHIFT, 0);
     failed |= check("Shift released", intv.pad1.k[6], 0);
 
+    /* ---- the shifted band -------------------------------------------
+     * KEYB_PCT (mapping.c's "ECS Keyboard 'Shifted' Keys" block) writes
+     * pad1.k[0] bit (1 << 8) -- the SAME column bit as KEYB_LEFT (row 0,
+     * mask 1), just eight bits up. That high byte is jzIntv's own fake-
+     * shift convention: pads.c's fake_shift_bits() reads (k[row] >> 8) &
+     * 0xFF and asserts SHIFT for the scan on the key's behalf. So assert
+     * on the whole word, never on (k[0] & 0xFF), or the distinction this
+     * whole band rests on goes untested. */
+    intv_host_ecs_key(INTV_ECS_KEY_PCT, 1);
+    failed |= check("'%' sets the fake-shift bit, not the base bit",
+                    intv.pad1.k[0], 1u << 8);
+    intv_host_ecs_key(INTV_ECS_KEY_PCT, 0);
+    failed |= check("'%' released", intv.pad1.k[0], 0);
+
+    /* '%' and LEFT are the same column bit in the same row and must still
+     * be independently holdable -- they differ only by the byte. */
+    intv_host_ecs_key(INTV_ECS_KEY_LEFT, 1);
+    intv_host_ecs_key(INTV_ECS_KEY_PCT, 1);
+    failed |= check("LEFT + '%' chorded", intv.pad1.k[0], 1u | (1u << 8));
+    intv_host_ecs_key(INTV_ECS_KEY_PCT, 0);
+    failed |= check("releasing '%' leaves LEFT held", intv.pad1.k[0], 1u);
+    intv_host_ecs_key(INTV_ECS_KEY_LEFT, 0);
+    failed |= check("releasing LEFT clears the row", intv.pad1.k[0], 0);
+
+    /* Every one of the 17, against mapping.c:500-516's literal
+     * {pad1.k[row], mask << 8} pairs. A transposition error here is
+     * invisible in play -- it types some OTHER valid character -- so it is
+     * pinned exhaustively rather than sampled. */
+    {
+        static const struct {
+            const char *name; intv_ecs_key key; uint8_t row; uint32_t bit;
+        } shifted[] = {
+            { "'=' (KEYB_EQUAL)",   INTV_ECS_KEY_EQUAL,   5, 16 },
+            { "'\"' (KEYB_QUOTE)",  INTV_ECS_KEY_QUOTE,   4, 32 },
+            { "'#' (KEYB_HASH)",    INTV_ECS_KEY_HASH,    4, 16 },
+            { "'$' (KEYB_DOLLAR)",  INTV_ECS_KEY_DOLLAR,  3, 32 },
+            { "'+' (KEYB_PLUS)",    INTV_ECS_KEY_PLUS,    3, 16 },
+            { "'-' (KEYB_MINUS)",   INTV_ECS_KEY_MINUS,   2, 32 },
+            { "'/' (KEYB_SLASH)",   INTV_ECS_KEY_SLASH,   2, 16 },
+            { "'*' (KEYB_STAR)",    INTV_ECS_KEY_STAR,    1, 32 },
+            { "'(' (KEYB_LPAREN)",  INTV_ECS_KEY_LPAREN,  1, 16 },
+            { "')' (KEYB_RPAREN)",  INTV_ECS_KEY_RPAREN,  0, 32 },
+            { "'^' (KEYB_CARET)",   INTV_ECS_KEY_CARET,   5,  4 },
+            { "'?' (KEYB_QUEST)",   INTV_ECS_KEY_QUEST,   5,  2 },
+            { "'%' (KEYB_PCT)",     INTV_ECS_KEY_PCT,     0,  1 },
+            { "''' (KEYB_SQUOTE)",  INTV_ECS_KEY_SQUOTE,  5, 32 },
+            { "':' (KEYB_COLON)",   INTV_ECS_KEY_COLON,   0,  4 },
+            { "'>' (KEYB_GREATER)", INTV_ECS_KEY_GREATER, 0,  2 },
+            { "'<' (KEYB_LESS)",    INTV_ECS_KEY_LESS,    1,  1 },
+        };
+        for (size_t i = 0; i < sizeof(shifted) / sizeof(shifted[0]); i++)
+        {
+            intv_host_ecs_key(shifted[i].key, 1);
+            failed |= check(shifted[i].name, intv.pad1.k[shifted[i].row],
+                            shifted[i].bit << 8);
+            intv_host_ecs_key(shifted[i].key, 0);
+            failed |= check("released", intv.pad1.k[shifted[i].row], 0);
+        }
+    }
+
     /* Chording: A (row5 mask128) held with 1 (row5 mask16) should OR into
      * the same row, and releasing one must not clear the other's bit --
      * unlike the disc, which always overwrites. */
@@ -125,6 +185,11 @@ int main(void)
     intv_host_ecs_key(INTV_ECS_KEY_Q, 1);   /* row 5 */
     intv_host_ecs_key(INTV_ECS_KEY_L, 1);   /* row 1 */
     intv_host_ecs_key(INTV_ECS_KEY_SHIFT, 1); /* row 6 */
+    /* And a fake-shift key, whose bit lives in the HIGH byte of a row the
+     * loop below reads whole. Leaving one of these down would keep pads.c
+     * asserting SHIFT on every later scan, so "cleared" has to mean the
+     * whole word, not just the low byte. */
+    intv_host_ecs_key(INTV_ECS_KEY_SLASH, 1); /* row 2, bit 16 << 8 */
     intv_host_ecs_keys_clear();
     for (int row = 0; row < 7; row++)
     {

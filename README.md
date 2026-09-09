@@ -43,7 +43,7 @@ cmake -B build -DFRONTEND=none -DWITH_INTV_ROMS=OFF
 cmake -B build -DFRONTEND=gnome   # or kde, macos, windows
 ```
 
-`ctest` runs 17 suites covering the headless jzIntv core, ROM embedding, the
+`ctest` runs 21 suites covering the headless jzIntv core, ROM embedding, the
 frame/audio publish contract, pad and keyboard input mapping (including the
 ECS keyboard/second controller pair and the ECS/Intellivoice/PAL machine
 options), the Windows/evdev/macOS key-code tables, the keypad disc's 16-way
@@ -51,6 +51,14 @@ pointer geometry, the public session API, the peripheral bus' address decode
 teardown (which the FujiNet cart hot-swap depends on), the debugger's symbol
 table and STIC views, and (when `WITH_INTV_ROMS=OFF`) that no Mattel firmware
 bytes ended up in the shipped binary.
+
+The ECS keyboard has three of those to itself, because its shifted layer is
+reached by synthesising SHIFT rather than by a key of its own: `ecs_key`
+pins the matrix bit each key writes, `ecs_scan` reads the result back over
+the emulated bus to prove the synthesised SHIFT actually reaches a scan, and
+`ecs_key_event` covers the host-side bookkeeping -- releasing Shift before
+the key it shifted must not strand a bit, which would leave the machine
+reading SHIFT on every later keystroke.
 
 `hid_keys` deserves a note: it checks all three platforms' key-code tables
 from whatever host it runs on, deliberately. The maintainer has no Windows
@@ -83,8 +91,12 @@ Wine, where there is no way to drive a menu.
   changing any of the three restarts the emulator to apply. The ECS
   keyboard has its own input-mode toggle (in Settings, or live from a
   frontend's View menu) since the host keyboard can't drive both the ECS
-  keyboard and the hand controllers at once. ECS is only selectable once an
-  `ecs.bin` has been embedded or imported -- see `COMPLIANCE.md`.
+  keyboard and the hand controllers at once. In that mode keys are read by
+  the character they type rather than by position, so `%`, `/`, `+`, `-`,
+  `=`, `?` and the rest reach the machine from the key that prints them --
+  the ECS's own shifted layer is nothing like a PC's (`%` lives on
+  SHIFT+left-arrow over there, `/` on SHIFT+7). ECS is only selectable once
+  an `ecs.bin` has been embedded or imported -- see `COMPLIANCE.md`.
 - `tools/jzintv/` -- the jzIntv source patch, staging/patch scripts, and the
   Mattel EXEC/GROM/ECS images used for `WITH_INTV_ROMS=ON` builds.
 - `tools/icons/` -- icon rendering (`make-icons.py`) from `data/icons/src/`

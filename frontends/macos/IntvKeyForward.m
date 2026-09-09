@@ -155,6 +155,22 @@ uint32_t IntvKeysymForEvent(NSEvent *event)
                   : INTVSESSION_KEYSYM_NATIVE_BASE + (uint32_t)event.keyCode;
 }
 
+uint32_t IntvCharForEvent(NSEvent *event)
+{
+    /* -characters is only defined on a key event. Both forwarders below are
+     * also reached from -flagsChanged: (DisplayView.m and IntvKeyWindow's
+     * own handler, via IntvModifierKeyState), and reading -characters on an
+     * NSEventTypeFlagsChanged event raises -- so the type check is load
+     * bearing, not defensive. Modifiers type nothing anyway; they resolve
+     * through the keysym. */
+    if (event.type != NSEventTypeKeyDown && event.type != NSEventTypeKeyUp)
+        return 0;
+
+    NSString *chars = event.characters;
+    unichar c = chars.length ? [chars characterAtIndex:0] : 0;
+    return (c >= 0x20 && c < 0x7F) ? (uint32_t)c : 0;
+}
+
 void IntvForwardKeyEvent(intvsession *session, NSEvent *event, int down)
 {
     uint32_t keysym = IntvKeysymForEvent(event);
@@ -189,11 +205,19 @@ void IntvForwardKeyEvent(intvsession *session, NSEvent *event, int down)
     /* "ECS Keyboard" input mode (Settings, or toggled live from there)
      * steals the keyboard for the ECS's own keyboard instead of the hand
      * controllers -- see intvsession_ecs_key_from_keysym's own comment on
-     * why the two can't both claim it at once. */
+     * why the two can't both claim it at once.
+     *
+     * The typed character picks the ECS key (its shifted layer is nothing
+     * like a PC's, so '%' and '/' only reach the machine this way); the
+     * keysym is the fallback for keys that type nothing; keyCode is the
+     * stable id the release is looked up by, which the keysym cannot be
+     * here -- IntvKeysymForKeyCode covers neither '/' nor "'", so
+     * -charactersIgnoringModifiers decides those and Shift moves them (it
+     * ignores every modifier EXCEPT Shift, see the keyCode enum's comment).
+     * See intvsession_ecs_key_event. */
     if (intvsession_get_int(session, "keyboard_mode", 0)) {
-        intvsession_ecs_key key = intvsession_ecs_key_from_keysym(keysym);
-        if (key != INTVSESSION_ECS_KEY_NONE)
-            intvsession_ecs_key_set(session, key, down);
+        intvsession_ecs_key_event(session, (uint32_t)event.keyCode, keysym,
+                                  IntvCharForEvent(event), down);
         return;
     }
 
@@ -206,14 +230,12 @@ void IntvForwardKeyEvent(intvsession *session, NSEvent *event, int down)
 void IntvForwardEcsKeyEvent(intvsession *session, NSEvent *event, int down)
 {
     uint32_t keysym = IntvKeysymForEvent(event);
-    intvsession_ecs_key key;
 
     if (!keysym)
         return;
 
-    key = intvsession_ecs_key_from_keysym(keysym);
-    if (key != INTVSESSION_ECS_KEY_NONE)
-        intvsession_ecs_key_set(session, key, down);
+    intvsession_ecs_key_event(session, (uint32_t)event.keyCode, keysym,
+                              IntvCharForEvent(event), down);
 }
 
 BOOL IntvModifierKeyState(NSEvent *event, int *down)

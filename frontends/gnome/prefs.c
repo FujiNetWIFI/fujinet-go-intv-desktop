@@ -202,7 +202,9 @@ void intv_prefs_show(IntvWindow *parent, intvsession *session)
         switch_row(state, "ECS Keyboard",
                   "When on, the keyboard types on the ECS instead of "
                   "driving the hand controllers (toggle any time, applies "
-                  "immediately)",
+                  "immediately). Warning: the FujiNet CONFIG ROM has no ECS "
+                  "keyboard support yet, so while this is on its menus can "
+                  "only be driven by a gamepad or the keypad window (F9)",
                   "keyboard_mode", 0));
 
     adw_preferences_page_add(page, machine);

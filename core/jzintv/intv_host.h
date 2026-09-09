@@ -197,6 +197,30 @@ typedef enum {
     INTV_ECS_KEY_SPACE, INTV_ECS_KEY_DOWN, INTV_ECS_KEY_UP, INTV_ECS_KEY_Q,
     INTV_ECS_KEY_1, INTV_ECS_KEY_RIGHT, INTV_ECS_KEY_CTRL, INTV_ECS_KEY_A,
     INTV_ECS_KEY_SHIFT,
+    INTV_ECS_KEY_PHYSICAL_COUNT,    /* the 48 real key caps end here */
+
+    /* ---- shifted symbols ---------------------------------------------
+     * The ECS prints a second character on most of its keys, and the only
+     * way to reach one on real hardware is to hold SHIFT with the key --
+     * so these are not extra matrix bits, they are the SAME bit written
+     * into the HIGH byte of intv.pad1.k[row]. That high byte is jzIntv's
+     * own "fake shift" convention (pads.c's fake_shift_bits): when
+     * pad_eval_keyboard sees any of those bits set it asserts SHIFT in
+     * row 6 / col 7 for the scan and folds the bit down into the real
+     * key, exactly as if a hand were holding both. Transcribed from
+     * mapping.c's own "ECS Keyboard 'Shifted' Keys" block.
+     *
+     * Which base key each one rides on is NOT guessable from a PC layout
+     * -- '%' is SHIFT+LEFT-ARROW on an ECS, '/' is SHIFT+7, '+' is
+     * SHIFT+5 -- which is the whole reason intvsession_ecs_key_from_char
+     * resolves by character rather than by key position. */
+    INTV_ECS_KEY_EQUAL = INTV_ECS_KEY_PHYSICAL_COUNT,
+    INTV_ECS_KEY_QUOTE, INTV_ECS_KEY_HASH, INTV_ECS_KEY_DOLLAR,
+    INTV_ECS_KEY_PLUS, INTV_ECS_KEY_MINUS, INTV_ECS_KEY_SLASH,
+    INTV_ECS_KEY_STAR, INTV_ECS_KEY_LPAREN, INTV_ECS_KEY_RPAREN,
+    INTV_ECS_KEY_CARET, INTV_ECS_KEY_QUEST, INTV_ECS_KEY_PCT,
+    INTV_ECS_KEY_SQUOTE, INTV_ECS_KEY_COLON, INTV_ECS_KEY_GREATER,
+    INTV_ECS_KEY_LESS,
     INTV_ECS_KEY_COUNT
 } intv_ecs_key;
 

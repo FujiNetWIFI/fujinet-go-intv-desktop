@@ -43,6 +43,29 @@ void expectKey(const char *what, const QKeyEvent &event,
     }
 }
 
+/* ECS keyboard mode resolves by the character, so what this asserts is the
+ * pair the dispatcher hands intvsession_ecs_key_from_char -- the character
+ * from intvEcsCharForKeyEvent, the keysym from intvKeysymForKeyEvent. */
+void expectEcs(const char *what, const QKeyEvent &event,
+               intvsession_ecs_key want)
+{
+    const intvsession_ecs_key got =
+        intvsession_ecs_key_from_char(intvKeysymForKeyEvent(&event),
+                                      intvEcsCharForKeyEvent(&event));
+    if (got != want) {
+        std::fprintf(stderr, "keyforward_test: FAILED: %s\n", what);
+        failed = 1;
+    }
+}
+
+void expectKeysym(const char *what, const QKeyEvent &event, quint32 want)
+{
+    if (intvKeysymForKeyEvent(&event) != want) {
+        std::fprintf(stderr, "keyforward_test: FAILED: %s\n", what);
+        failed = 1;
+    }
+}
+
 void expectDisc(const char *what, const QKeyEvent &event,
                 intvsession_pad_side side, int direction)
 {
@@ -141,6 +164,52 @@ int main()
     /* Arrows carry no useful scancode entry and resolve by Qt::Key. */
     expectDisc("Up -> left disc N", makeEvent(Qt::Key_Up, Qt::NoModifier, 111, ""),
                INTVSESSION_PAD_LEFT, 4);
+
+    /* ---- ECS keyboard mode ----------------------------------------------
+     * The mirror image of the block at the top of this file. There, Shift+1
+     * must NOT read as "!" because the number row is the right controller's
+     * keypad; here the shifted character is exactly what is wanted, because
+     * the ECS's own shifted layer is nothing like a PC's and the symbols
+     * are unreachable any other way. Both must hold at once, off the same
+     * QKeyEvent -- which is the whole reason the two live in one file. */
+    expectEcs("Shift+5 -> ECS '%' (which is SHIFT+LEFT-ARROW over there)",
+              makeEvent(Qt::Key_Percent, Qt::ShiftModifier, 14, "%"),
+              INTVSESSION_ECS_KEY_PCT);
+    expectEcs("unshifted 5 -> ECS 5",
+              makeEvent(Qt::Key_5, Qt::NoModifier, 14, "5"),
+              INTVSESSION_ECS_KEY_5);
+    /* The "/" key has no scancode entry, so Qt's own already-shifted text
+     * decides it -- both halves must land right. */
+    expectEcs("'/' -> ECS '/' (SHIFT+7 over there)",
+              makeEvent(Qt::Key_Slash, Qt::NoModifier, 61, "/"),
+              INTVSESSION_ECS_KEY_SLASH);
+    expectEcs("Shift+/ -> ECS '?' (SHIFT+DOWN-ARROW over there)",
+              makeEvent(Qt::Key_Question, Qt::ShiftModifier, 61, "?"),
+              INTVSESSION_ECS_KEY_QUEST);
+    expectEcs("Shift+= -> ECS '+' (SHIFT+5 over there)",
+              makeEvent(Qt::Key_Plus, Qt::ShiftModifier, 21, "+"),
+              INTVSESSION_ECS_KEY_PLUS);
+    expectEcs("'-' -> ECS '-' (SHIFT+6 over there; dead before this)",
+              makeEvent(Qt::Key_Minus, Qt::NoModifier, 20, "-"),
+              INTVSESSION_ECS_KEY_MINUS);
+    /* Curated symbols keep their positional meaning even though Qt reports
+     * a digit for the numpad with NumLock on -- see
+     * intvsession_ecs_key_from_char. */
+    expectEcs("numpad 7 -> ECS 1, not ECS 7",
+              makeEvent(Qt::Key_7, Qt::KeypadModifier, 79, "7"),
+              INTVSESSION_ECS_KEY_1);
+    /* Qt reports no text for a Ctrl combo; the keysym has to carry it. */
+    expectEcs("Ctrl+A -> ECS A",
+              makeEvent(Qt::Key_A, Qt::ControlModifier, 38, ""),
+              INTVSESSION_ECS_KEY_A);
+
+    /* And the binding identity must NOT have moved: these are the same two
+     * events, asserted against the keysym the pad map and the persisted
+     * bindings both key on. */
+    expectKeysym("Shift+5's keysym is still '5'",
+                 makeEvent(Qt::Key_Percent, Qt::ShiftModifier, 14, "%"), '5');
+    expectKeysym("Shift+/'s keysym is still Qt's shifted text",
+                 makeEvent(Qt::Key_Question, Qt::ShiftModifier, 61, "?"), '?');
 
     if (failed) {
         std::fprintf(stderr, "keyforward_test: FAILED\n");

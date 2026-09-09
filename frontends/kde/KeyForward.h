@@ -32,6 +32,13 @@ class QKeyEvent;
  * for keys the emulated machine has no use for. */
 quint32 intvKeysymForKeyEvent(const QKeyEvent *event);
 
+/* The character the host layout produced for this event -- what ECS keyboard
+ * mode resolves through (intvsession_ecs_key_from_char), as opposed to the
+ * shift-stripped physical key intvKeysymForKeyEvent deliberately returns for
+ * the hand-controller map. Returns 0 when the event carries no printable
+ * character, which is the signal to fall back to that physical key. */
+quint32 intvEcsCharForKeyEvent(const QKeyEvent *event);
+
 /* Translates and dispatches: routes to the ECS keyboard matrix when the
  * session's "keyboard_mode" setting is on, otherwise to the hand
  * controllers. `down` is 1 for a press, 0 for a release -- both matter,

@@ -33,6 +33,28 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.9.0" date="2026-09-09">
+      <description>
+        <p>
+          Typing on the ECS keyboard now follows your own. Symbols reach the
+          machine from the key that prints them, so %, /, +, -, =, ?, ^, *
+          and the rest all type what the cap says. They did not before: the
+          ECS's own shifted layer bears no relation to a modern keyboard's
+          -- % lives on Shift plus the left arrow key over there, / on
+          Shift+7, + on Shift+5 -- so Shift+5 typed a plus sign, and /, -, =
+          and + typed nothing at all.
+        </p>
+        <p>
+          The numeric keypad, the arrow keys and Ctrl combinations keep the
+          positions they had, and the on-screen ECS keyboard is unchanged.
+        </p>
+        <p>
+          Settings now warns that the FujiNet CONFIG ROM has no ECS keyboard
+          support yet: while ECS Keyboard mode is on, CONFIG's own menus can
+          only be driven by a gamepad or the keypad window.
+        </p>
+      </description>
+    </release>
     <release version="0.8.0" date="2026-09-08">
       <description>
         <p>

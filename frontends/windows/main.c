@@ -330,11 +330,21 @@ void intv_forward_key(WPARAM vk, LPARAM lp, int down)
     /* "ECS Keyboard" input mode (Settings, or toggled live from there)
      * steals the keyboard for the ECS's own keyboard instead of the hand
      * controllers -- see intvsession_ecs_key_from_keysym's own comment on
-     * why the two can't both claim it at once. */
+     * why the two can't both claim it at once.
+     *
+     * The typed character picks the ECS key (its shifted layer is nothing
+     * like a PC's, so "%" and "/" only reach the machine this way); the
+     * keysym is the fallback for keys that type nothing;
+     * intv_host_key_from_msg is the stable id the release is looked up by
+     * (NOT the raw VK -- both shift keys share one). GetKeyState is
+     * message-queue-synchronised, so it reports Shift as of when THIS
+     * message was generated -- correct on both edges. See
+     * intvsession_ecs_key_event. */
     if (intvsession_get_int(g_session, "keyboard_mode", 0)) {
-        intvsession_ecs_key key = intvsession_ecs_key_from_keysym(keysym);
-        if (key != INTVSESSION_ECS_KEY_NONE)
-            intvsession_ecs_key_set(g_session, key, down);
+        const int shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        intvsession_ecs_key_event(g_session, intv_host_key_from_msg(vk, lp),
+                                  keysym, intv_char_from_msg(vk, lp, shift),
+                                  down);
         return;
     }
 
@@ -352,14 +362,13 @@ void intv_forward_key(WPARAM vk, LPARAM lp, int down)
 void intv_forward_ecs_key(WPARAM vk, LPARAM lp, int down)
 {
     const uint32_t keysym = intv_keysym_from_msg(vk, lp);
-    intvsession_ecs_key key;
+    const int shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
 
     if (!keysym)
         return;
 
-    key = intvsession_ecs_key_from_keysym(keysym);
-    if (key != INTVSESSION_ECS_KEY_NONE)
-        intvsession_ecs_key_set(g_session, key, down);
+    intvsession_ecs_key_event(g_session, intv_host_key_from_msg(vk, lp),
+                              keysym, intv_char_from_msg(vk, lp, shift), down);
 }
 
 /* ---- menu actions ------------------------------------------------------------ */
@@ -717,7 +726,7 @@ static void show_settings(HINSTANCE inst)
     g_settings_window = CreateWindowA(
         "IntvSettingsWindow", "Settings",
         WS_OVERLAPPEDWINDOW & ~(WS_MAXIMIZEBOX | WS_THICKFRAME),
-        CW_USEDEFAULT, CW_USEDEFAULT, 460, 560, NULL, NULL, inst, NULL);
+        CW_USEDEFAULT, CW_USEDEFAULT, 460, 610, NULL, NULL, inst, NULL);
 
     have_ecs_rom = intvsession_has_ecs_rom(g_session);
     CreateWindowExA(0, "STATIC", "ECS:", WS_CHILD | WS_VISIBLE, 16, y, 120,
@@ -779,14 +788,17 @@ static void show_settings(HINSTANCE inst)
     note = CreateWindowExA(
         0, "STATIC",
         "ECS/Intellivoice/Video Standard apply when this window is closed "
-        "(the session restarts). ECS Keyboard applies immediately.",
-        WS_CHILD | WS_VISIBLE, 16, y, 420, 80, g_settings_window, NULL, inst,
+        "(the session restarts). ECS Keyboard applies immediately. "
+        "Warning: the FujiNet CONFIG ROM has no ECS keyboard support yet, "
+        "so while ECS Keyboard is on its menus can only be driven by a "
+        "gamepad or the keypad window (F9).",
+        WS_CHILD | WS_VISIBLE, 16, y, 420, 130, g_settings_window, NULL, inst,
         NULL);
     SendMessageA(note, WM_SETFONT, (WPARAM)font, TRUE);
-    /* Generous: this wraps to three lines at Windows' own metrics and four
+    /* Generous: this wraps to five lines at Windows' own metrics and more
      * under Wine's chunkier fonts, and a clipped explanation is worse than a
      * little whitespace. */
-    y += 88;
+    y += 138;
 
     CreateWindowExA(0, "STATIC", "Controllers:", WS_CHILD | WS_VISIBLE, 16, y,
                     120, 20, g_settings_window, NULL, inst, NULL);

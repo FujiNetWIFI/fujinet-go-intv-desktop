@@ -108,6 +108,22 @@ static inline uint32_t intv_keysym_from_keycode(guint keycode)
     return keysym ? keysym : INTVSESSION_KEYSYM_NATIVE_BASE + keycode;
 }
 
+/* The character the LAYOUT produced for this event, Shift and all -- the
+ * deliberate opposite of intv_keysym_from_key_event below, which goes out of
+ * its way to mask Shift out. GTK hands the key handlers an already-shifted
+ * keyval, which is exactly what ECS keyboard mode wants
+ * (intvsession_ecs_key_from_char): the ECS's shifted layer is nothing like a
+ * PC's, so '%' and '/' only reach the machine by character.
+ *
+ * Returns 0 for anything that is not printable ASCII -- a modifier, an
+ * arrow, a Ctrl combo (GDK unicodes those to a control code), an F-key --
+ * which is the caller's signal to fall back to the physical key. */
+static inline uint32_t intv_char_from_keyval(guint keyval)
+{
+    const guint32 ch = gdk_keyval_to_unicode(keyval);
+    return (ch >= 0x20 && ch < 0x7F) ? (uint32_t)ch : 0;
+}
+
 /* The entry point the key-event handlers should actually call.
  *
  * GTK hands its key-pressed/key-released signals an ALREADY-SHIFTED keyval:

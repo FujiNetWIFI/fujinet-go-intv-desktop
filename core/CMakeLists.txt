@@ -321,6 +321,21 @@ add_executable(ecs_key_test tests/ecs_key_test.c)
 target_link_libraries(ecs_key_test jzintv_core)
 target_include_directories(ecs_key_test PRIVATE src)
 
+# ecs_key_event_test links intv_session (which PUBLIC-links jzintv_core, so
+# the intv global stays reachable): intvsession_ecs_key_event is the first
+# ECS entry point with session state behind it. Needs no ROMs, so unlike
+# ecs_key_test it runs in the WITH_INTV_ROMS=OFF config too.
+add_executable(ecs_key_event_test tests/ecs_key_event_test.c)
+target_link_libraries(ecs_key_event_test intv_session)
+target_include_directories(ecs_key_event_test PRIVATE src)
+
+# ecs_scan_test -- the shifted keys as the emulated BUS sees them, which
+# needs a real ecs.bin (pad1 is only registered when ECS is on) and so
+# skips like the other ROM-gated suites.
+add_executable(ecs_scan_test tests/ecs_scan_test.c)
+target_link_libraries(ecs_scan_test jzintv_core)
+target_include_directories(ecs_scan_test PRIVATE src)
+
 add_executable(hwopts_test tests/hwopts_test.c)
 target_link_libraries(hwopts_test jzintv_core)
 target_include_directories(hwopts_test PRIVATE src)
@@ -385,6 +400,8 @@ add_test(NAME boot_smoke COMMAND boot_smoke)
 add_test(NAME reset_test COMMAND reset_test)
 add_test(NAME pad_test COMMAND pad_test)
 add_test(NAME ecs_key COMMAND ecs_key_test)
+add_test(NAME ecs_scan COMMAND ecs_scan_test)
+add_test(NAME ecs_key_event COMMAND ecs_key_event_test)
 add_test(NAME hwopts COMMAND hwopts_test)
 add_test(NAME session COMMAND session_test)
 add_test(NAME keymap COMMAND keymap_test)
@@ -401,7 +418,7 @@ add_test(NAME periph COMMAND periph_test)
 set_tests_properties(fujibus_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
                      RUN_SERIAL ON)
 set_tests_properties(debug stic PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
-set_tests_properties(pad_test ecs_key hwopts boot_smoke audio PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+set_tests_properties(pad_test ecs_key ecs_scan hwopts boot_smoke audio PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 # Needs WITH_INTV_ROMS=ON to have anything to provision; reported as 77
 # (skipped) rather than a failure otherwise, and it boots a real machine, so
 # these are the two tests here that take real wall-clock time.

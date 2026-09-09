@@ -31,6 +31,17 @@ uint32_t IntvKeysymForKeyCode(unsigned short keyCode);
  * 0 for keys the emulated machine has no use for. */
 uint32_t IntvKeysymForEvent(NSEvent *event);
 
+/* The character AppKit's layout produced for this event, Shift and all --
+ * -characters, deliberately NOT the -charactersIgnoringModifiers that
+ * IntvKeysymForEvent uses. ECS keyboard mode resolves through this
+ * (intvsession_ecs_key_from_char): the ECS's shifted layer is nothing like a
+ * PC's, so '%' and '/' only reach the machine by character.
+ *
+ * Returns 0 for anything that is not printable ASCII, and for a
+ * flagsChanged event -- -characters raises on one of those, and both
+ * forwarders below are reached from -flagsChanged: for the modifier keys. */
+uint32_t IntvCharForEvent(NSEvent *event);
+
 /* Translate and dispatch: routes to the ECS keyboard matrix when the
  * session's "keyboard_mode" setting is on, otherwise to the hand
  * controllers. `down` is 1 for a press, 0 for a release -- both matter,

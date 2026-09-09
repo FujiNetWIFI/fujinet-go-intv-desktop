@@ -55,6 +55,20 @@ void intv_forward_ecs_key(WPARAM vk, LPARAM lp, int down);
  * (special_keysym/base_char/resolve_side). */
 uint32_t intv_keysym_from_msg(WPARAM vk, LPARAM lp);
 
+/* The US-layout character a key message types, for ECS keyboard mode only.
+ * DELIBERATELY independent of intv_keysym_from_msg: that one answers "which
+ * key is this" and its result is a persisted binding identity, while this
+ * answers "what did the user type", which is what picks an ECS key. See
+ * key_translate.c's own comment on why the two tables must not be merged --
+ * "/" and "'" appear here and must NOT appear in base_char. `shift` is the
+ * live Shift state; returns 0 for a key that types nothing. */
+uint32_t intv_char_from_msg(WPARAM vk, LPARAM lp, int shift);
+
+/* A stable id for the physical key a message came from -- what
+ * intvsession_ecs_key_event's held-key table is keyed on. Never the VK
+ * alone; see key_translate.c's own comment on the shift keys. */
+uint32_t intv_host_key_from_msg(WPARAM vk, LPARAM lp);
+
 /* Non-zero if `vk` is one of the hotkeys the main window claims before any
  * binding is consulted (F9-F12, Ctrl-R). Map mode asks so it can refuse the
  * key with an explanation instead of storing a binding on_key would shadow.

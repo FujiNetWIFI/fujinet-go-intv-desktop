@@ -539,7 +539,10 @@ void intv_host_pad_disc(intv_pad_side side, int direction)
 
 /* Indexed by intv_ecs_key; {row, mask} into intv.pad1.k[row]. Transposed
  * entry-by-entry from mapping.c's "KEYB_*" table (cfg_key_bind[] column 3,
- * pad1.k[0..6]) -- see intv_host.h's own comment on this table. */
+ * pad1.k[0..6]) -- see intv_host.h's own comment on this table. Masks below
+ * INTV_ECS_KEY_PHYSICAL_COUNT are a single low-byte bit (one key cap);
+ * everything after it is a high-byte "fake shift" bit, which pads.c reads as
+ * "this key WITH shift" (see the enum's own comment). */
 static const struct { uint8_t row; uint32_t mask; }
 ecs_key_codes[INTV_ECS_KEY_COUNT] = {
     [INTV_ECS_KEY_LEFT]    = { 0, 1   },
@@ -596,6 +599,30 @@ ecs_key_codes[INTV_ECS_KEY_COUNT] = {
     [INTV_ECS_KEY_A]       = { 5, 128 },
 
     [INTV_ECS_KEY_SHIFT]   = { 6, 128 },
+
+    /* Shifted symbols: the base key's own row and mask, moved into the high
+     * byte -- pads.c's fake_shift_bits() reads exactly (k[row] >> 8) & 0xFF
+     * and asserts SHIFT for the scan on its behalf. Mirrors mapping.c's
+     * "ECS Keyboard 'Shifted' Keys" block one entry at a time; the comment
+     * on each line is the base key it rides on, which is the ECS's own
+     * layout and nothing like a PC's. */
+    [INTV_ECS_KEY_EQUAL]   = { 5,  16 << 8 },   /* SHIFT+1 */
+    [INTV_ECS_KEY_QUOTE]   = { 4,  32 << 8 },   /* SHIFT+2 */
+    [INTV_ECS_KEY_HASH]    = { 4,  16 << 8 },   /* SHIFT+3 */
+    [INTV_ECS_KEY_DOLLAR]  = { 3,  32 << 8 },   /* SHIFT+4 */
+    [INTV_ECS_KEY_PLUS]    = { 3,  16 << 8 },   /* SHIFT+5 */
+    [INTV_ECS_KEY_MINUS]   = { 2,  32 << 8 },   /* SHIFT+6 */
+    [INTV_ECS_KEY_SLASH]   = { 2,  16 << 8 },   /* SHIFT+7 */
+    [INTV_ECS_KEY_STAR]    = { 1,  32 << 8 },   /* SHIFT+8 */
+    [INTV_ECS_KEY_LPAREN]  = { 1,  16 << 8 },   /* SHIFT+9 */
+    [INTV_ECS_KEY_RPAREN]  = { 0,  32 << 8 },   /* SHIFT+0 */
+    [INTV_ECS_KEY_CARET]   = { 5,   4 << 8 },   /* SHIFT+UP */
+    [INTV_ECS_KEY_QUEST]   = { 5,   2 << 8 },   /* SHIFT+DOWN */
+    [INTV_ECS_KEY_PCT]     = { 0,   1 << 8 },   /* SHIFT+LEFT */
+    [INTV_ECS_KEY_SQUOTE]  = { 5,  32 << 8 },   /* SHIFT+RIGHT */
+    [INTV_ECS_KEY_COLON]   = { 0,   4 << 8 },   /* SHIFT+; */
+    [INTV_ECS_KEY_GREATER] = { 0,   2 << 8 },   /* SHIFT+. */
+    [INTV_ECS_KEY_LESS]    = { 1,   1 << 8 },   /* SHIFT+, */
 };
 
 void intv_host_ecs_key(intv_ecs_key key, int pressed)
@@ -614,6 +641,11 @@ void intv_host_ecs_key(intv_ecs_key key, int pressed)
 
 void intv_host_ecs_keys_clear(void)
 {
+    /* Whole words, so this releases the high-byte fake-shift bits along with
+     * the plain key bits -- leaving one of those set would keep pads.c
+     * asserting SHIFT on every subsequent scan. pad_t.fake_shift itself needs
+     * no reset: pad_eval_keyboard recomputes it from k[] each scan and drops
+     * back to PAD_FS_IDLE once no row has a fake-shift bit left. */
     for (int row = 0; row < 7; row++)
         intv.pad1.k[row] = 0;
 }

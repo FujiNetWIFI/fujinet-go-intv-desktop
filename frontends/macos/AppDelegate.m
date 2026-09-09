@@ -347,10 +347,16 @@ static NSArray<NSString *> *restartSettingKeys(void)
     NSTextField *note = [NSTextField
         labelWithString:@"ECS/Intellivoice/Video Standard apply when this "
                         @"window is closed (the session restarts). ECS "
-                        @"Keyboard applies immediately."];
+                        @"Keyboard applies immediately.\n\nWarning: the "
+                        @"FujiNet CONFIG ROM has no ECS keyboard support "
+                        @"yet, so while ECS Keyboard is on its menus can "
+                        @"only be driven by a gamepad or the keypad "
+                        @"window."];
     note.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
     note.textColor = NSColor.secondaryLabelColor;
     note.preferredMaxLayoutWidth = 360;
+    note.lineBreakMode = NSLineBreakByWordWrapping;
+    note.maximumNumberOfLines = 0;
 
     NSStackView *root = [NSStackView stackViewWithViews:@[ grid, note ]];
     root.orientation = NSUserInterfaceLayoutOrientationVertical;
@@ -359,7 +365,7 @@ static NSArray<NSString *> *restartSettingKeys(void)
     root.edgeInsets = NSEdgeInsetsMake(16, 16, 16, 16);
 
     _settingsWindow = [[NSWindow alloc]
-        initWithContentRect:NSMakeRect(0, 0, 420, 260)
+        initWithContentRect:NSMakeRect(0, 0, 420, 320)
                   styleMask:NSWindowStyleMaskTitled |
                             NSWindowStyleMaskClosable |
                             NSWindowStyleMaskMiniaturizable

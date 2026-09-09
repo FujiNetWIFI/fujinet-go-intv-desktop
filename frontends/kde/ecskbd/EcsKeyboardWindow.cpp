@@ -70,9 +70,12 @@ QPushButton *makeModKey(const QString &label, intvsession *session,
 
 struct EcsKeyLabel { const char *label; intvsession_ecs_key key; };
 
-/* Four QWERTY-ish rows plus a function row, covering all 48 keys of
- * intv_ecs_key exactly once. See core/jzintv/intv_host.h for the row/mask
- * this ultimately maps to. */
+/* Four QWERTY-ish rows plus a function row, covering all 48 PHYSICAL keys of
+ * intv_ecs_key exactly once -- the physical caps, i.e. everything below
+ * INTV_ECS_KEY_PHYSICAL_COUNT. The shifted band past it is not drawn: those
+ * are not extra buttons, they are these same keys with SHIFT, and the
+ * latching SHIFT button below already chords them exactly as a hand would.
+ * See core/jzintv/intv_host.h for the row/mask this ultimately maps to. */
 constexpr EcsKeyLabel kRowDigits[10] = {
     {"1", INTVSESSION_ECS_KEY_1}, {"2", INTVSESSION_ECS_KEY_2},
     {"3", INTVSESSION_ECS_KEY_3}, {"4", INTVSESSION_ECS_KEY_4},
@@ -203,9 +206,8 @@ void EcsKeyboardWindow::forwardKey(const QKeyEvent *event, int down)
     if (keysym == 0)
         return;
 
-    intvsession_ecs_key key = intvsession_ecs_key_from_keysym(keysym);
-    if (key != INTVSESSION_ECS_KEY_NONE)
-        intvsession_ecs_key_set(m_session, key, down);
+    intvsession_ecs_key_event(m_session, event->nativeScanCode(), keysym,
+                              intvEcsCharForKeyEvent(event), down);
 }
 
 void EcsKeyboardWindow::releaseAll()

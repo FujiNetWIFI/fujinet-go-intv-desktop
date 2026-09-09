@@ -107,9 +107,12 @@ static GtkWidget *make_mod_key(const char *label, intvsession *session,
 }
 
 /* ---- layout --------------------------------------------------------------
- * Four QWERTY-ish rows plus a function row, covering all 48 keys of
- * intv_ecs_key exactly once. See core/jzintv/intv_host.h for the row/mask
- * this ultimately maps to. */
+ * Four QWERTY-ish rows plus a function row, covering all 48 PHYSICAL keys of
+ * intv_ecs_key exactly once -- the physical caps, i.e. everything below
+ * INTV_ECS_KEY_PHYSICAL_COUNT. The shifted band past it is not drawn: those
+ * are not extra buttons, they are these same keys with SHIFT, and the
+ * latching SHIFT button below already chords them exactly as a hand would.
+ * See core/jzintv/intv_host.h for the row/mask this ultimately maps to. */
 
 typedef struct { const char *label; intvsession_ecs_key key; } EcsKeyLabel;
 
@@ -197,13 +200,12 @@ static GtkWidget *build_keyboard(intvsession *session)
 static gboolean forward_key(GtkEventControllerKey *c, guint keyval,
                             guint keycode, GdkModifierType state, int down)
 {
-    intvsession_ecs_key key;
     if (!g_session)
         return FALSE;
-    key = intvsession_ecs_key_from_keysym(
-        intv_keysym_from_key_event(c, keyval, keycode, state));
-    if (key != INTVSESSION_ECS_KEY_NONE)
-        intvsession_ecs_key_set(g_session, key, down);
+    intvsession_ecs_key_event(g_session, keycode,
+                              intv_keysym_from_key_event(c, keyval, keycode,
+                                                         state),
+                              intv_char_from_keyval(keyval), down);
     return TRUE;
 }
 

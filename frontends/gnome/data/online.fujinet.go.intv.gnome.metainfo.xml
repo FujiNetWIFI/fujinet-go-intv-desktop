@@ -34,6 +34,28 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.9.1" date="2026-09-18">
+      <description>
+        <p>
+          CONFIG now reads the ECS keyboard. Arrow keys move the selection,
+          Return opens a host or a folder, Escape goes back, and host names,
+          directory filters, network names and Wi-Fi passwords can simply be
+          typed instead of spelled out one character at a time on the
+          on-screen character grid. While typing, the left arrow key
+          backspaces and holding it repeats.
+        </p>
+        <p>
+          On the host slot screen, typing a letter starts renaming that slot
+          from the character you typed. The character grid is still there for
+          the handful of characters the ECS keyboard has no key for, such as
+          !, @, &amp; and _.
+        </p>
+        <p>
+          The hand controller is unaffected, and so is everything else if you
+          have no ECS enabled.
+        </p>
+      </description>
+    </release>
     <release version="0.9.0" date="2026-09-09">
       <description>
         <p>

@@ -34,6 +34,24 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.9.2" date="2026-09-19">
+      <description>
+        <p>
+          Network connections no longer stall between messages. The bundled
+          FujiNet runtime now turns off Nagle's algorithm on TCP sockets, in
+          both directions. N: traffic is made of small interactive writes, and
+          the kernel had been holding each one back for a fraction of a second
+          waiting for more data to pack alongside it -- data that, in a
+          request-and-reply conversation, only arrives after the reply.
+        </p>
+        <p>
+          The runtime is also refreshed off a much newer upstream. It had been
+          thirty-seven commits behind, so the device and network unification,
+          the Odyssey 2 and Macintosh 68k bringups and a round of memory-leak
+          fixes all arrive here as well.
+        </p>
+      </description>
+    </release>
     <release version="0.9.1" date="2026-09-18">
       <description>
         <p>

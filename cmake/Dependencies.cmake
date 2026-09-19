@@ -39,13 +39,20 @@ set(JZINTV_VERSION "20200712")
 set(JZINTV_URL "http://spatula-city.org/~im14u2c/intv/dl/jzintv-${JZINTV_VERSION}-src.zip")
 set(JZINTV_SHA256 "b36b3b274d0fc05cb227818d4957f96620d23d8d6b7596c24f07675ced7129f3")
 
-# fujinet-firmware master (13465cdd). PR #1595 -- the Mbed TLS 4.x rejection
-# the previous pin was branched for -- landed as 2a9e2c23f, so this moves off
-# force-mbedtls-3 and back onto master proper. That branch was never an
-# ancestor of master, so nothing here was tracking upstream while it was
-# pinned; anything merged in the meantime (DaisyChain, the Drivewire cas
-# media format) arrives with this bump.
-set(FUJINET_COMMIT "13465cdd044304ff96ad41a5f029087b28bed17f")
+# fujinet-firmware tcp-protocol-disable-nagle (c68e8630), which is master
+# (baa314e8) plus one commit: TCP.cpp now sets TCP_NODELAY on both the
+# connecting and the accepted socket. N: traffic is small interactive writes,
+# so without it every exchange pays a Nagle delay waiting for the kernel to
+# coalesce a segment that never comes. A branch rather than master because
+# that commit is not on master yet -- the same shape as the force-mbedtls-3
+# pin two bumps ago, and it drops back to master once the commit lands there.
+#
+# The previous pin (13465cdd) was 37 commits back, so this is a runtime
+# refresh as much as a fix: the device/network unification (#1624),
+# ProtocolParser -> NetworkProtocolFactory (#1600), fujiDeviceID_t as an enum
+# class (#1602), the systembus removal from media (#1646), the O2 and Mac 68k
+# bringups and a round of heap-leak fixes all arrive with it.
+set(FUJINET_COMMIT "c68e863034737611415ca568c3ea4607a2220c7e")
 set(FUJINET_URL "https://github.com/FujiNetWIFI/fujinet-firmware")
 
 # intv_provide_dependency(NAME <n> PATH <p> SENTINEL <file> OVERRIDE <VAR>

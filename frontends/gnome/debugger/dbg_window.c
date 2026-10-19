@@ -7,6 +7,11 @@
  * register text), retargeted to the STIC's own BACKTAB/MOB/GRAM-GROM-card/
  * palette views from intvstic.h.
  *
+ * A FujiNet tab, last, shows every FujiBus packet between the machine and
+ * FujiNet (intvdebug_fujinet_trace, always on) beside the mailbox's state.
+ * It is the one view that changes while the machine runs, so the frame
+ * clock also refreshes it twice a second while it shows.
+ *
  * The disassembly, register and memory views drive intvdebug.h directly.
  * The symbol table (core/debugger/symbols.h) is not owned by intvdebug --
  * unlike cocodebug's built-in one -- so this window uses the process-wide
@@ -33,6 +38,7 @@
 #define MEM_WORDS_PER_ROW 8
 #define MEM_ROWS 16
 #define CARD_ROWS_PER_PAGE 8 /* 128 cards/page at CARDS_PER_ROW=16 */
+#define FUJI_REFRESH_US 500000 /* the FujiNet tab, while it shows */
 
 typedef struct {
     GtkWindow *win;
@@ -66,6 +72,14 @@ typedef struct {
     int card_first;
     int card_total;
 
+    GtkNotebook *notebook;
+    GtkWidget *fuji_page;
+    GtkLabel *fuji_note;
+    GtkTextView *fuji_text, *fuji_state;
+    uint64_t fuji_last;
+    int fuji_count;
+    gint64 fuji_at;
+
     guint tick_id;
     uint64_t seen_serial;
     int was_paused;
@@ -88,6 +102,84 @@ static void set_picture(GtkPicture *pic, const uint8_t *rgba, int w, int h)
     GdkTexture *tex = texture_from_rgba(rgba, w, h);
     gtk_picture_set_paintable(pic, GDK_PAINTABLE(tex));
     g_object_unref(tex);
+}
+
+/* ---- logs ------------------------------------------------------------------ */
+
+static GtkAdjustment *vadj(GtkTextView *view)
+{
+    GtkWidget *parent = gtk_widget_get_parent(GTK_WIDGET(view));
+    return GTK_IS_SCROLLED_WINDOW(parent)
+        ? gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(parent)) : NULL;
+}
+
+static gboolean at_end(GtkAdjustment *adj)
+{
+    return gtk_adjustment_get_value(adj) + gtk_adjustment_get_page_size(adj) >=
+           gtk_adjustment_get_upper(adj) - 2.0;
+}
+
+/* A log follows its end while its reader is there. New text grows the view
+ * only once it is laid out (or its tab first shows), so the end is pinned
+ * whenever the view's height changes; whether to follow is decided as text
+ * arrives. */
+static gboolean following(GtkTextView *view)
+{
+    return GPOINTER_TO_INT(g_object_get_data(G_OBJECT(view), "follow")) != 0;
+}
+
+static void on_log_resized(GtkAdjustment *adj, gpointer view)
+{
+    if (following(view))
+        gtk_adjustment_set_value(adj, gtk_adjustment_get_upper(adj) -
+                                      gtk_adjustment_get_page_size(adj));
+}
+
+static void make_log(GtkTextView *view)
+{
+    g_object_set_data(G_OBJECT(view), "follow", GINT_TO_POINTER(1));
+    g_signal_connect(vadj(view), "changed", G_CALLBACK(on_log_resized), view);
+}
+
+/* Before new text: follow if the reader is at the end (or never looked). */
+static void log_note_reader(GtkTextView *view)
+{
+    GtkAdjustment *adj = vadj(view);
+    g_object_set_data(G_OBJECT(view), "follow", GINT_TO_POINTER(
+        gtk_adjustment_get_page_size(adj) <= 0.0 || at_end(adj)));
+}
+
+static void log_to_end(GtkTextView *view)
+{
+    g_object_set_data(G_OBJECT(view), "follow", GINT_TO_POINTER(1));
+    on_log_resized(vadj(view), view);
+}
+
+/* Replaces a view's text where the reader left it (a refresh must not throw
+ * a scrolled view back to its top), or, following, at its end. */
+static void set_text_at(GtkTextView *view, const char *text, gboolean follow)
+{
+    GtkTextBuffer *b = gtk_text_view_get_buffer(view);
+    GtkAdjustment *adj = vadj(view);
+    GtkTextMark *mark;
+    GtkTextIter it;
+    int top = 0;
+
+    if (!follow && adj && gtk_adjustment_get_value(adj) > 0.0) {
+        gtk_text_view_get_line_at_y(view, &it, (int)gtk_adjustment_get_value(adj), NULL);
+        top = gtk_text_iter_get_line(&it);
+    }
+    gtk_text_buffer_set_text(b, text, -1);
+    if (follow) {
+        log_to_end(view);
+        return;
+    }
+    if (top <= 0) return;
+    /* scroll_to_mark waits for the new text's layout */
+    gtk_text_buffer_get_iter_at_line(b, &it, top);
+    mark = gtk_text_buffer_create_mark(b, NULL, &it, TRUE);
+    gtk_text_view_scroll_to_mark(view, mark, 0.0, TRUE, 0.0, 0.0);
+    gtk_text_buffer_delete_mark(b, mark);
 }
 
 /* ---- refreshers ----------------------------------------------------------- */
@@ -321,6 +413,59 @@ static void refresh_stic(DbgWin *w)
                              -1);
 }
 
+static gboolean fuji_showing(DbgWin *w)
+{
+    return gtk_notebook_get_nth_page(
+               w->notebook, gtk_notebook_get_current_page(w->notebook)) ==
+           w->fuji_page;
+}
+
+static void refresh_fujinet(DbgWin *w, gboolean force)
+{
+    static intvdebug_fuji_packet p[INTVDEBUG_FUJI_TRACE_MAX];
+    static char state[2048];
+    GtkTextBuffer *sb = gtk_text_view_get_buffer(w->fuji_state);
+    GtkTextIter a, b;
+    GString *t;
+    char *cur;
+    int n = intvdebug_fujinet_trace(w->dbg, p, INTVDEBUG_FUJI_TRACE_MAX), i;
+
+    w->fuji_at = g_get_monotonic_time();
+    if (!w->session || !intvsession_fujinet_running(w->session))
+        gtk_label_set_text(w->fuji_note, "FujiNet is not running.");
+    else
+        gtk_label_set_text(w->fuji_note,
+                           intvsession_fujinet_link(w->session)
+                               ? "FujiNet cartridge, connected."
+                               : "FujiNet cartridge, not connected.");
+    intvdebug_fujinet_state(w->dbg, state, (int)sizeof(state));
+    gtk_text_buffer_get_bounds(sb, &a, &b);
+    cur = gtk_text_buffer_get_text(sb, &a, &b, FALSE);
+    if (strcmp(cur, state) != 0) /* unchanged keeps a selection */
+        set_text_at(w->fuji_state, state, FALSE);
+    g_free(cur);
+
+    if (!force && n == w->fuji_count &&
+        (n == 0 || p[n - 1].serial == w->fuji_last))
+        return;
+    w->fuji_count = n;
+    w->fuji_last = n > 0 ? p[n - 1].serial : 0;
+    log_note_reader(w->fuji_text);
+    t = g_string_new(NULL);
+    for (i = 0; i < n; i++) {
+        int k;
+        g_string_append_printf(t, "%s%s\n     ", i ? "\n" : "", p[i].text);
+        for (k = 0; k < p[i].nbytes && k < (int)sizeof(p[i].data); k++)
+            g_string_append_printf(t, "%02X ", p[i].data[k]);
+        if (p[i].nbytes > (int)sizeof(p[i].data))
+            g_string_append(t, "\xe2\x80\xa6");
+    }
+    if (n == 0)
+        g_string_append(t, "(no FujiBus packets since the trace was cleared)");
+    set_text_at(w->fuji_text, t->str, force || following(w->fuji_text));
+    g_string_free(t, TRUE);
+}
+
 static void refresh_all(DbgWin *w)
 {
     int paused = intvdebug_is_paused(w->dbg);
@@ -341,6 +486,8 @@ static void refresh_all(DbgWin *w)
      * not machine state, and is cheap to skip when nothing changed (see
      * refresh_symbols's own comment). */
     refresh_symbols(w);
+    if (fuji_showing(w))
+        refresh_fujinet(w, FALSE);
     w->was_paused = paused;
 }
 
@@ -360,6 +507,10 @@ static gboolean tick_cb(GtkWidget *widget, GdkFrameClock *clock,
         intvdebug_is_paused(w->dbg) != w->was_paused) {
         w->seen_serial = serial;
         refresh_all(w);
+    } else if (fuji_showing(w) &&
+               g_get_monotonic_time() - w->fuji_at >= FUJI_REFRESH_US) {
+        /* the one view that moves while the machine runs */
+        refresh_fujinet(w, FALSE);
     }
     return G_SOURCE_CONTINUE;
 }
@@ -513,6 +664,24 @@ static void on_clear_symbols(GtkButton *b, gpointer u)
     w->seen_serial = 0;
 }
 
+static void on_fuji_clear(GtkButton *b, gpointer u)
+{
+    DbgWin *w = u;
+    (void)b;
+    intvdebug_fujinet_trace_clear(w->dbg);
+    refresh_fujinet(w, TRUE);
+}
+
+static void on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num,
+                           gpointer user_data)
+{
+    DbgWin *w = user_data;
+    (void)nb;
+    (void)num;
+    if (page == w->fuji_page)
+        refresh_fujinet(w, FALSE);
+}
+
 static gboolean on_key(GtkEventControllerKey *c, guint keyval, guint keycode,
                        GdkModifierType state, gpointer user_data)
 {
@@ -590,6 +759,71 @@ static GtkWidget *mono_view(GtkTextView **out)
     gtk_widget_set_hexpand(scroll, TRUE);
     *out = GTK_TEXT_VIEW(view);
     return scroll;
+}
+
+static GtkWidget *build_fujinet(DbgWin *w)
+{
+    GtkWidget *paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    GtkWidget *left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *note = gtk_label_new("");
+    GtkWidget *clear = gtk_button_new_with_label("Clear");
+    GtkWidget *log_scroll, *state_scroll;
+
+    gtk_widget_add_css_class(note, "dim-label");
+    gtk_label_set_xalign(GTK_LABEL(note), 0);
+    gtk_label_set_wrap(GTK_LABEL(note), TRUE);
+    gtk_widget_set_hexpand(note, TRUE);
+    w->fuji_note = GTK_LABEL(note);
+    gtk_widget_set_tooltip_text(clear, "Forget the packets so far");
+    g_signal_connect(clear, "clicked", G_CALLBACK(on_fuji_clear), w);
+    gtk_box_append(GTK_BOX(row), note);
+    gtk_box_append(GTK_BOX(row), clear);
+
+    log_scroll = mono_view(&w->fuji_text);
+    gtk_text_view_set_wrap_mode(w->fuji_text, GTK_WRAP_NONE);
+    make_log(w->fuji_text);
+    gtk_box_append(GTK_BOX(left), row);
+    gtk_box_append(GTK_BOX(left), log_scroll);
+    state_scroll = mono_view(&w->fuji_state);
+
+    gtk_paned_set_start_child(GTK_PANED(paned),
+                              labeled("FujiBus packets (SLIP-decoded)", left));
+    gtk_paned_set_end_child(GTK_PANED(paned),
+                            labeled("FujiNet's mailbox", state_scroll));
+    gtk_paned_set_shrink_start_child(GTK_PANED(paned), FALSE);
+    gtk_paned_set_shrink_end_child(GTK_PANED(paned), FALSE);
+    gtk_paned_set_resize_end_child(GTK_PANED(paned), FALSE);
+    gtk_widget_set_size_request(log_scroll, 560, -1);
+    gtk_widget_set_size_request(state_scroll, 320, -1);
+    gtk_widget_set_margin_top(paned, 6);
+    gtk_widget_set_margin_bottom(paned, 6);
+    gtk_widget_set_margin_start(paned, 6);
+    gtk_widget_set_margin_end(paned, 6);
+    w->fuji_count = -1;
+    return paned;
+}
+
+/* The notebook's pages, in order; INTV_DEBUGGER_TAB picks one by number or
+ * by the start of its name (any case), for tests and captures. */
+static const char *const k_tab_names[] = { "CPU", "STIC", "Symbols", "FujiNet" };
+
+static int tab_from_env(void)
+{
+    const char *tab = g_getenv("INTV_DEBUGGER_TAB");
+    char *end;
+    long n;
+    size_t i;
+
+    if (!tab || !*tab)
+        return -1;
+    n = strtol(tab, &end, 10);
+    if (end != tab && *end == '\0')
+        return n >= 0 && n < (long)G_N_ELEMENTS(k_tab_names) ? (int)n : -1;
+    for (i = 0; i < G_N_ELEMENTS(k_tab_names); i++)
+        if (g_ascii_strncasecmp(tab, k_tab_names[i], strlen(tab)) == 0)
+            return (int)i;
+    return -1;
 }
 
 void intv_debugger_show(GtkWindow *parent, intvsession *session)
@@ -784,14 +1018,15 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
                     labeled("Registers & mode", stic_scroll), 0, 2, 2, 1);
 
     notebook = gtk_notebook_new();
+    w->notebook = GTK_NOTEBOOK(notebook);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), panes,
-                             gtk_label_new("CPU"));
+                             gtk_label_new(k_tab_names[0]));
     {
         GtkWidget *outer_scroll = gtk_scrolled_window_new();
         gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(outer_scroll),
                                       stic_grid);
         gtk_notebook_append_page(GTK_NOTEBOOK(notebook), outer_scroll,
-                                 gtk_label_new("STIC"));
+                                 gtk_label_new(k_tab_names[1]));
     }
     {
         GtkWidget *sym_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
@@ -823,8 +1058,14 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
         gtk_box_append(GTK_BOX(sym_box), sym_filter_bar);
         gtk_box_append(GTK_BOX(sym_box), sym_scroll);
         gtk_notebook_append_page(GTK_NOTEBOOK(notebook), sym_box,
-                                 gtk_label_new("Symbols"));
+                                 gtk_label_new(k_tab_names[2]));
     }
+    w->fuji_page = build_fujinet(w);
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), w->fuji_page,
+                             gtk_label_new(k_tab_names[3]));
+    g_signal_connect(notebook, "switch-page", G_CALLBACK(on_switch_page), w);
+    if (tab_from_env() >= 0)
+        gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), tab_from_env());
 
     box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_box_append(GTK_BOX(box), header);

@@ -175,6 +175,7 @@ list(APPEND JZINTV_CORE_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/jzintv/intv_audio.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/jzintv/intv_host.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/debugger.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/debugger/fujitrace.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/sticview.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/symbols.c"
 )
@@ -389,6 +390,11 @@ add_executable(symtab_test tests/symtab_test.c)
 target_link_libraries(symtab_test jzintv_core)
 target_include_directories(symtab_test PRIVATE debugger)
 
+# Pure decoder test: synthetic SLIP bytes, no ROMs, no network.
+add_executable(fujitrace_test tests/fujitrace_test.c)
+target_link_libraries(fujitrace_test jzintv_core)
+target_include_directories(fujitrace_test PRIVATE debugger)
+
 # Pure bus test -- no ROMs, no emulator boot, so it runs in every build
 # configuration. Guards the FujiNet hot-swap's address-decode teardown.
 add_executable(periph_test tests/periph_test.c)
@@ -414,6 +420,7 @@ add_test(NAME fujibus_smoke COMMAND fujibus_smoke)
 add_test(NAME debug COMMAND debug_test)
 add_test(NAME stic COMMAND stic_test)
 add_test(NAME symtab COMMAND symtab_test)
+add_test(NAME fujitrace COMMAND fujitrace_test)
 add_test(NAME periph COMMAND periph_test)
 set_tests_properties(fujibus_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
                      RUN_SERIAL ON)

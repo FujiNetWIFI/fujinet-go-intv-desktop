@@ -43,12 +43,15 @@
 #include "event/event.h"
 #include "ivoice/ivoice.h"
 #include "jlp/jlp.h"
+#include "fujinet/fujibus.h"
 #include "fujinet/fujinet.h"
 #include "locutus/locutus_adapt.h"
 #include "cheat/cheat.h"
 #include "cfg/mapping.h"
 #include "cfg/cfg.h"
 
+#include "fujitrace.h"
+#include "intv_host.h"
 #include "intvdebug.h"
 
 struct intvdebug {
@@ -62,11 +65,15 @@ struct intvdebug {
 
     uint16_t breakpoints[INTVDEBUG_MAX_BREAKPOINTS];
     int      breakpoint_count;
+
+    pthread_mutex_t trace_lock; /* the FujiNet trace's alone */
+    fujitrace trace;
 };
 
 static struct intvdebug g_debug = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .cond = PTHREAD_COND_INITIALIZER,
+    .trace_lock = PTHREAD_MUTEX_INITIALIZER,
 };
 
 intvdebug *intvdebug_get(void)
@@ -355,3 +362,125 @@ int intvdebug_breakpoint_list(intvdebug *d, uint16_t *out, int max)
     memcpy(out, d->breakpoints, (size_t)n * sizeof(uint16_t));
     return n;
 }
+
+/* ---- FujiNet trace ------------------------------------------------------- */
+
+/* fn_sock's tap: on the emulator thread, inside each send/recv. */
+static void fujinet_tap(int dir, const uint8_t *buf, size_t len)
+{
+    pthread_mutex_lock(&g_debug.trace_lock);
+    fujitrace_feed(&g_debug.trace, dir, buf, len);
+    pthread_mutex_unlock(&g_debug.trace_lock);
+}
+
+/* The trace is always on: it is cheap, and it is most useful about what
+ * happened before anyone thought to look. It installs itself as the program
+ * loads, because the session cannot call in here: Android's fujinet-go-intv
+ * builds core/src/session.c without core/debugger/. Every frontend links
+ * this file through its debugger window, so that is enough. */
+__attribute__((constructor)) static void fujinet_tap_install(void)
+{
+    fn_sock_set_trace(fujinet_tap);
+}
+
+int intvdebug_fujinet_trace(intvdebug *d, intvdebug_fuji_packet *out, int max)
+{
+    int n;
+    pthread_mutex_lock(&d->trace_lock);
+    n = fujitrace_copy(&d->trace, out, max);
+    pthread_mutex_unlock(&d->trace_lock);
+    return n;
+}
+
+void intvdebug_fujinet_trace_clear(intvdebug *d)
+{
+    pthread_mutex_lock(&d->trace_lock);
+    fujitrace_clear(&d->trace);
+    pthread_mutex_unlock(&d->trace_lock);
+}
+
+/* Reads the peripheral without stopping the machine: single bytes and ints,
+ * shown, never acted on, so a torn read costs one stale line. */
+#define MB(x) (fn->ram[(x) - FUJI_MB_BASE])
+int intvdebug_fujinet_state(intvdebug *d, char *dst, int dstsz)
+{
+    static const char *const link_names[] = {
+        "disconnected", "connecting", "connected, idle",
+        "connected, sending", "connected, awaiting the reply",
+    };
+    static const char *const status_names[] = { "IDLE", "BUSY", "OK", "ERR" };
+    static const char *const err_names[] = {
+        "OK", "no link", "timeout", "bad frame", "too big",
+    };
+    static const char *const boot_names[] = {
+        "idle", "opening", "transferring", "mapping",
+    };
+    const fujinet_t *const fn = &intv.fujinet;
+    const unsigned state = (unsigned)fn->state;
+    const unsigned status = MB(FUJI_MB_STATUS);
+    const unsigned err = MB(FUJI_MB_ERR);
+    const unsigned boot = MB(FUJI_MB_BOOT_STATE);
+    const unsigned reply = MB(FUJI_MB_REPLY_CMD);
+    const unsigned m0 = MB(FUJI_MB_MAGIC0), m1 = MB(FUJI_MB_MAGIC1);
+    char boot_text[48], path[201];
+    int i;
+    (void)d;
+
+    if (!intv_host_is_running())
+        return snprintf(dst, (size_t)dstsz, "The Intellivision is off.\n");
+    if (!fn->periph.tick)
+        return snprintf(dst, (size_t)dstsz, "No FujiNet mailbox this session.\n");
+
+    if (boot == FUJI_BOOT_FAILED)
+        snprintf(boot_text, sizeof(boot_text), "failed, reason %u",
+                 (unsigned)MB(FUJI_MB_BOOT_ERR));
+    else if (boot < sizeof(boot_names) / sizeof(boot_names[0]))
+        snprintf(boot_text, sizeof(boot_text), "%s, %u%%", boot_names[boot],
+                 (unsigned)MB(FUJI_MB_BOOT_PCT));
+    else
+        snprintf(boot_text, sizeof(boot_text), "%02X", boot);
+    /* The guest sent it: printable ASCII only. */
+    for (i = 0; i < (int)sizeof(path) - 1 && fn->last_boot_path[i]; i++)
+        path[i] = fn->last_boot_path[i] >= 0x20 && fn->last_boot_path[i] < 0x7F
+                      ? fn->last_boot_path[i] : '.';
+    path[i] = '\0';
+
+    return snprintf(dst, (size_t)dstsz,
+        "Link        %s\n"
+        "BoIP port   %d\n"
+        "Mailbox     $9C00, %s\n"
+        "Magic       %c%c, protocol %u\n"
+        "\n"
+        "SEQ         %02X\n"
+        "ACKSEQ      %02X\n"
+        "Device      %02X\n"
+        "Command     %02X\n"
+        "Params      %u\n"
+        "TX length   %u\n"
+        "\n"
+        "Status      %s\n"
+        "Error       %s\n"
+        "Reply       %02X%s\n"
+        "RX length   %u\n"
+        "LINK cell   %u\n"
+        "\n"
+        "Boot        %s\n"
+        "Boot path   %s\n",
+        state < sizeof(link_names) / sizeof(link_names[0]) ? link_names[state] : "?",
+        fn->port,
+        fn->mailbox_active ? "active" : "off (the cart's memory map covers it)",
+        m0 >= 0x20 && m0 < 0x7F ? (int)m0 : '.',
+        m1 >= 0x20 && m1 < 0x7F ? (int)m1 : '.',
+        (unsigned)MB(FUJI_MB_PROTO_VER),
+        (unsigned)MB(FUJI_MB_SEQ), (unsigned)MB(FUJI_MB_ACKSEQ),
+        (unsigned)MB(FUJI_MB_DEVICE), (unsigned)MB(FUJI_MB_CMD),
+        (unsigned)MB(FUJI_MB_NPARAM),
+        (unsigned)(MB(FUJI_MB_TXLEN_LO) | (MB(FUJI_MB_TXLEN_HI) << 8)),
+        status < 4 ? status_names[status] : "?",
+        err < sizeof(err_names) / sizeof(err_names[0]) ? err_names[err] : "?",
+        reply, reply == FUJICMD_ACK ? " ACK" : reply == FUJICMD_NAK ? " NAK" : "",
+        (unsigned)(MB(FUJI_MB_RXLEN_LO) | (MB(FUJI_MB_RXLEN_HI) << 8)),
+        (unsigned)MB(FUJI_MB_LINK), boot_text,
+        path[0] ? path : "(none)");
+}
+#undef MB

@@ -774,6 +774,9 @@ int  intvsession_sysaction_take(intvsession *s, intvsession_sysaction *out);
  * jzIntv's own --fujinet peripheral simply keeps retrying the connection
  * non-blockingly (see core/jzintv/intv_host.h's own comment on that). */
 int         intvsession_fujinet_running(const intvsession *s);
+/* Whether the emulator's FujiNet mailbox is connected to FujiNet over BoIP
+ * (it keeps retrying while not). */
+int         intvsession_fujinet_link(const intvsession *s);
 const char *intvsession_fujinet_webui_url(const intvsession *s);
 /* Copies the most recent FujiNet console output (NUL-terminated) into dst;
  * returns the number of bytes written (excluding the NUL). */

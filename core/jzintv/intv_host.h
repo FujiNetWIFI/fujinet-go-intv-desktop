@@ -108,6 +108,10 @@ void intv_host_reset(void);
 
 int intv_host_is_running(void);
 
+/* Whether jzIntv's FujiNet mailbox has its BoIP connection up: its state
+ * machine (src/fujinet/fujinet.h) is past CONNECTING. 0 when not running. */
+int intv_host_fujinet_link(void);
+
 /* Registers a callback fired once, at the very top of the emulator thread
  * (before jzintv_entry_point() is called), with that thread's own OS thread
  * id. Unused by any desktop frontend, which have no need to name or

@@ -23,7 +23,9 @@
  * While the machine is paused the emulator thread is parked inside the
  * hook, so the machine is quiescent and reading its memory/registers from
  * another thread is safe; that is why those calls are only valid while
- * paused, and say so. Nothing here is safe to call while it is running.
+ * paused, and say so. Nothing here is safe to call while it is running,
+ * except the FujiNet trace and state near the end, which have a lock of
+ * their own.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -135,6 +137,25 @@ int  intvdebug_breakpoint_is_set(intvdebug *d, uint16_t addr);
 void intvdebug_breakpoint_clear_all(intvdebug *d);
 /* Copies the set addresses into out (ascending); returns how many. */
 int  intvdebug_breakpoint_list(intvdebug *d, uint16_t *out, int max);
+
+/* ---- FujiNet: the mailbox's BoIP bytes, as FujiBus packets ---------------
+ * A tap on the staged tree's fn_sock (fn_sock_set_trace) feeds this from
+ * the moment the program starts, engaged or not, so it shows what happened
+ * before anyone opened a debugger. Safe while running. */
+typedef struct {
+    uint64_t serial;        /* new whenever this entry changes */
+    int      to_host;       /* 1: FujiNet -> Intellivision, 0: Intellivision -> FujiNet */
+    int      device, command, length;   /* from the FujiBus header, -1 if short */
+    int      nbytes;
+    uint32_t repeat;        /* identical exchanges folded into this one, >= 1 */
+    uint8_t  data[64];      /* the decoded packet's first bytes */
+    char     text[96];      /* "Intellivision -> FujiNet 70 F2 READ DEVICE SLOTS (6 bytes)" */
+} intvdebug_fuji_packet;
+#define INTVDEBUG_FUJI_TRACE_MAX 512
+int  intvdebug_fujinet_trace(intvdebug *d, intvdebug_fuji_packet *out, int max);  /* oldest first */
+void intvdebug_fujinet_trace_clear(intvdebug *d);
+/* The mailbox and its link to FujiNet, as text lines. */
+int  intvdebug_fujinet_state(intvdebug *d, char *dst, int dstsz);
 
 /* The debugger is a process-wide singleton, like cfg_t intv itself (see
  * core/jzintv/intv_host.h) -- one machine, one debugger. Returns the same

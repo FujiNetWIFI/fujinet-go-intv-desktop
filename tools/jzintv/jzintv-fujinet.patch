@@ -764,7 +764,7 @@
   */
 --- a/src/fujinet/fn_sock.c	1969-12-31 18:00:00.000000000 -0600
 +++ b/src/fujinet/fn_sock.c	2026-08-20 07:31:59.000000000 -0500
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,352 @@
 +/*
 + * ============================================================================
 + *  Title:    Minimal non-blocking TCP client socket helper
@@ -781,6 +781,16 @@
 +#    define EINPROGRESS WSAEWOULDBLOCK
 +#  endif
 +#endif
++
++LOCAL fn_sock_trace_t fn_sock_trace = NULL;
++
++/* ======================================================================== */
++/*  FN_SOCK_SET_TRACE -- Installs the byte tap.  See fn_sock.h.             */
++/* ======================================================================== */
++void fn_sock_set_trace(fn_sock_trace_t cb)
++{
++    fn_sock_trace = cb;
++}
 +
 +/* ======================================================================== */
 +/*  FN_SOCK_LAST_ERR  -- Portable "would this call have blocked?" check.    */
@@ -1029,7 +1039,11 @@
 +#endif
 +
 +    if (n >= 0)
++    {
++        if (n > 0 && fn_sock_trace)
++            fn_sock_trace(1, buf, (size_t)n);
 +        return n;
++    }
 +
 +    if (fn_sock_would_block())
 +        return 0;
@@ -1061,7 +1075,11 @@
 +#endif
 +
 +    if (n > 0)
++    {
++        if (fn_sock_trace)
++            fn_sock_trace(0, buf, (size_t)n);
 +        return n;
++    }
 +
 +    if (n == 0)
 +    {
@@ -1101,7 +1119,7 @@
 +/* ======================================================================== */
 --- a/src/fujinet/fn_sock.h	1969-12-31 18:00:00.000000000 -0600
 +++ b/src/fujinet/fn_sock.h	2026-08-20 07:31:59.000000000 -0500
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,132 @@
 +/*
 + * ============================================================================
 + *  Title:    Minimal non-blocking TCP client socket helper
@@ -1206,6 +1224,17 @@
 +/*                       completed -- use fn_sock_connect_poll() for that.  */
 +/* ======================================================================== */
 +int fn_sock_connected(const fn_sock_t *const sock);
++
++/* ======================================================================== */
++/*  FN_SOCK_SET_TRACE -- Installs a tap on every byte this module moves:    */
++/*                       dir 1 for what fn_sock_send() wrote, dir 0 for     */
++/*                       what fn_sock_recv() read.  It runs on the caller's */
++/*                       thread, inside the send/recv call.  One process-   */
++/*                       wide tap; set it before the machine starts.  NULL  */
++/*                       removes it.                                        */
++/* ======================================================================== */
++typedef void (*fn_sock_trace_t)(int dir, const uint8_t *buf, size_t len);
++void fn_sock_set_trace(fn_sock_trace_t cb);
 +
 +#endif /* FN_SOCK_H_ */
 +/* ======================================================================== */

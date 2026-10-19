@@ -439,6 +439,14 @@ int intv_host_is_running(void)
     return running;
 }
 
+int intv_host_fujinet_link(void)
+{
+    pthread_mutex_lock(&s_lock);
+    const int up = s_running && intv.fujinet.state >= FUJINET_ST_IDLE;
+    pthread_mutex_unlock(&s_lock);
+    return up;
+}
+
 /* ---- direct pad injection --------------------------------------------- */
 
 /* Indexed by intv_pad_key; the value each key writes into pad_t.l[]/r[] on

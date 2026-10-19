@@ -5,6 +5,11 @@
  * text) -- the same content as the GNOME debugger window
  * (frontends/gnome/debugger/dbg_window.c), built from plain Qt6 Widgets.
  *
+ * A FujiNet tab, last, shows every FujiBus packet between the machine and
+ * FujiNet (intvdebug_fujinet_trace, always on) beside the mailbox's state;
+ * the timer also refreshes it twice a second while it shows, since it is
+ * the one view that changes while the machine runs.
+ *
  * Refreshing is a POLL (a QTimer watching intvdebug_stop_serial), not a
  * callback: intvdebug.h has no stop-callback mechanism at all (unlike the
  * MSX port's msxdebug_set_stop_callback) -- the engine stops the machine
@@ -44,6 +49,7 @@
 #include <QPointer>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QScrollBar>
 #include <QShortcut>
 #include <QTabWidget>
 #include <QTextBlock>
@@ -52,6 +58,7 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -62,6 +69,27 @@ constexpr int kDisasmLines = 32;
 constexpr int kMemWordsPerRow = 8;
 constexpr int kMemRows = 16;
 constexpr int kCardRowsPerPage = 8; /* 128 cards/page at CARDS_PER_ROW=16 */
+constexpr int kFujiTicks = 15;      /* the FujiNet tab, 500 ms at 33 ms */
+
+/* The tabs, in order; INTV_DEBUGGER_TAB picks one by number or by the start
+ * of its name (any case), for tests and captures. */
+const char *const kTabNames[] = {"CPU", "STIC", "Symbols", "FujiNet"};
+constexpr int kTabCount = int(sizeof(kTabNames) / sizeof(kTabNames[0]));
+
+int tabFromEnv()
+{
+    const char *tab = std::getenv("INTV_DEBUGGER_TAB");
+    if (!tab || !*tab)
+        return -1;
+    char *end;
+    const long n = std::strtol(tab, &end, 10);
+    if (end != tab && *end == '\0')
+        return n >= 0 && n < kTabCount ? int(n) : -1;
+    for (int i = 0; i < kTabCount; i++)
+        if (qstrnicmp(tab, kTabNames[i], uint(std::strlen(tab))) == 0)
+            return i;
+    return -1;
+}
 
 QPlainTextEdit *monoView()
 {
@@ -73,6 +101,26 @@ QPlainTextEdit *monoView()
     v->setFont(f);
     v->setLineWrapMode(QPlainTextEdit::NoWrap);
     return v;
+}
+
+/* Whether a view's reader is at its end (a log then follows new lines). */
+bool atEnd(QPlainTextEdit *v)
+{
+    return v->verticalScrollBar()->value() >= v->verticalScrollBar()->maximum() - 1;
+}
+
+/* Replaces a view's text where the reader left it (a refresh must not throw
+ * a scrolled view back to its top), or, following, at its end. */
+void setText(QPlainTextEdit *v, const QString &text, bool follow = false)
+{
+    if (v->toPlainText() == text) {
+        if (follow) v->verticalScrollBar()->setValue(v->verticalScrollBar()->maximum());
+        return;
+    }
+    const int top = v->verticalScrollBar()->value(), left = v->horizontalScrollBar()->value();
+    v->setPlainText(text);
+    v->verticalScrollBar()->setValue(follow ? v->verticalScrollBar()->maximum() : top);
+    v->horizontalScrollBar()->setValue(left);
 }
 
 QLabel *picLabel(int w, int h)
@@ -116,6 +164,8 @@ DebuggerWindow::DebuggerWindow(QWidget *parent, intvsession *session)
     setWindowTitle(QStringLiteral("Intellivision Debugger"));
     resize(1080, 780);
     buildUi();
+    if (tabFromEnv() >= 0)
+        m_tabs->setCurrentIndex(tabFromEnv());
 
     /* Engaging switches the CPU hook to the path that honours breakpoints
      * (see intvdebug.h). Pausing immediately is what a user opening a
@@ -130,6 +180,9 @@ DebuggerWindow::DebuggerWindow(QWidget *parent, intvsession *session)
             intvdebug_is_paused(m_dbg) != m_wasPaused) {
             m_seenSerial = serial;
             refreshAll();
+        } else if (fujiShowing() && ++m_fujiTicks >= kFujiTicks) {
+            /* the one view that moves while the machine runs */
+            refreshFujinet(false);
         }
     });
     m_tick->start(33);
@@ -207,6 +260,7 @@ void DebuggerWindow::buildUi()
                   [this] { intvdebug_step_out(m_dbg); });
 
     auto *tabs = new QTabWidget;
+    m_tabs = tabs;
     setCentralWidget(tabs);
 
     /* ---- CPU tab ---- */
@@ -260,7 +314,7 @@ void DebuggerWindow::buildUi()
     rightLayout->addWidget(memBox, 1);
 
     cpuLayout->addWidget(right);
-    tabs->addTab(cpu, QStringLiteral("CPU"));
+    tabs->addTab(cpu, QLatin1String(kTabNames[0]));
 
     /* ---- STIC tab ---- */
     auto *stic = new QWidget;
@@ -327,7 +381,7 @@ void DebuggerWindow::buildUi()
     auto *sticScroll = new QScrollArea;
     sticScroll->setWidgetResizable(true);
     sticScroll->setWidget(stic);
-    tabs->addTab(sticScroll, QStringLiteral("STIC"));
+    tabs->addTab(sticScroll, QLatin1String(kTabNames[1]));
 
     /* ---- Symbols tab ---- */
     auto *symTab = new QWidget;
@@ -357,7 +411,93 @@ void DebuggerWindow::buildUi()
             });
     symLayout->addWidget(m_symList, 1);
 
-    tabs->addTab(symTab, QStringLiteral("Symbols"));
+    tabs->addTab(symTab, QLatin1String(kTabNames[2]));
+
+    m_fujiPage = buildFujinet();
+    tabs->addTab(m_fujiPage, QLatin1String(kTabNames[3]));
+    connect(tabs, &QTabWidget::currentChanged, this, [this] {
+        if (fujiShowing())
+            refreshFujinet(false);
+    });
+}
+
+QWidget *DebuggerWindow::buildFujinet()
+{
+    auto *page = new QWidget;
+    auto *layout = new QHBoxLayout(page);
+
+    auto *logBox = new QGroupBox(QStringLiteral("FujiBus packets (SLIP-decoded)"));
+    auto *logLayout = new QVBoxLayout(logBox);
+    auto *row = new QHBoxLayout;
+    m_fujiNote = new QLabel;
+    m_fujiNote->setWordWrap(true);
+    auto *clear = new QPushButton(QStringLiteral("Clear"));
+    clear->setToolTip(QStringLiteral("Forget the packets so far"));
+    connect(clear, &QPushButton::clicked, this, [this] {
+        intvdebug_fujinet_trace_clear(m_dbg);
+        refreshFujinet(true);
+    });
+    row->addWidget(m_fujiNote, 1);
+    row->addWidget(clear);
+    logLayout->addLayout(row);
+    m_fujiText = monoView();
+    logLayout->addWidget(m_fujiText, 1);
+    logBox->setMinimumWidth(560);
+    layout->addWidget(logBox, 3);
+
+    auto *stateBox = new QGroupBox(QStringLiteral("FujiNet's mailbox"));
+    auto *stateLayout = new QVBoxLayout(stateBox);
+    m_fujiState = monoView();
+    stateLayout->addWidget(m_fujiState);
+    stateBox->setMinimumWidth(320);
+    layout->addWidget(stateBox, 2);
+    return page;
+}
+
+bool DebuggerWindow::fujiShowing() const
+{
+    return m_tabs->currentWidget() == m_fujiPage;
+}
+
+void DebuggerWindow::refreshFujinet(bool force)
+{
+    static intvdebug_fuji_packet p[INTVDEBUG_FUJI_TRACE_MAX];
+    static char state[2048];
+    const int n = intvdebug_fujinet_trace(m_dbg, p, INTVDEBUG_FUJI_TRACE_MAX);
+
+    m_fujiTicks = 0;
+    if (!m_session || !intvsession_fujinet_running(m_session))
+        m_fujiNote->setText(QStringLiteral("FujiNet is not running."));
+    else
+        m_fujiNote->setText(intvsession_fujinet_link(m_session)
+                                ? QStringLiteral("FujiNet cartridge, connected.")
+                                : QStringLiteral("FujiNet cartridge, not connected."));
+    intvdebug_fujinet_state(m_dbg, state, int(sizeof(state)));
+    setText(m_fujiState, QString::fromUtf8(state));
+
+    if (!force && n == m_fujiCount && (n == 0 || p[n - 1].serial == m_fujiLast))
+        return;
+    m_fujiCount = n;
+    m_fujiLast = n > 0 ? p[n - 1].serial : 0;
+    QString t;
+    for (int i = 0; i < n; ++i) {
+        char hex[sizeof(p[i].data) * 3 + 1];
+        int len = 0;
+        for (int k = 0; k < p[i].nbytes && k < int(sizeof(p[i].data)); k++)
+            len += std::snprintf(hex + len, sizeof(hex) - size_t(len), "%02X ",
+                                 p[i].data[k]);
+        hex[len] = '\0';
+        if (i)
+            t += QLatin1Char('\n');
+        t += QString::fromUtf8(p[i].text);
+        t += QStringLiteral("\n     ");
+        t += QLatin1String(hex);
+        if (p[i].nbytes > int(sizeof(p[i].data)))
+            t += QStringLiteral("…");
+    }
+    if (n == 0)
+        t = QStringLiteral("(no FujiBus packets since the trace was cleared)");
+    setText(m_fujiText, t, force || atEnd(m_fujiText));
 }
 
 void DebuggerWindow::goToAddr()
@@ -658,5 +798,7 @@ void DebuggerWindow::refreshAll()
      * not machine state, and is cheap to skip when nothing changed (see
      * refreshSymbols's own comment). */
     refreshSymbols();
+    if (fujiShowing())
+        refreshFujinet(false);
     m_wasPaused = paused;
 }

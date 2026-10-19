@@ -6,6 +6,12 @@
  * controls (a tab control, EDIT/STATIC/BUTTON children, and a small custom
  * window class for the RGBA pictures).
  *
+ * A FujiNet tab, last, shows every FujiBus packet between the machine and
+ * FujiNet (intvdebug_fujinet_trace, always on) beside the mailbox's state;
+ * the timer also refreshes it twice a second while it shows, since it is
+ * the one view that changes while the machine runs. Its text arrives as
+ * UTF-8 and is shown as ASCII, like everything else in this ANSI window.
+ *
  * Refreshing is a WM_TIMER poll (100ms), not a callback: intvdebug.h has
  * no stop-callback mechanism at all (unlike the CoCo/MSX ports' own
  * cocodebug/msxdebug, which fire one on the emulator thread and marshal it
@@ -59,6 +65,9 @@
 #define PAGE_CPU 0
 #define PAGE_STIC 1
 #define PAGE_SYMBOLS 2
+#define PAGE_FUJINET 3
+
+#define FUJI_TICKS 5 /* the FujiNet tab, every 500ms while it shows */
 
 enum {
     IDC_PAUSE = 1000, IDC_STEP, IDC_STEP_OVER, IDC_STEP_OUT, IDC_CLEAR_BP,
@@ -71,6 +80,7 @@ enum {
     IDC_CARDS, IDC_CARDS_PREV, IDC_CARDS_NEXT, IDC_PALETTE, IDC_STIC_STATE,
     IDC_SYM_FILTER, IDC_SYM_LIST, IDC_SYM_COUNT,
     IDC_REG0, IDC_REG_LAST = IDC_REG0 + 7,
+    IDC_FUJI_CLEAR, IDC_FUJI_TEXT, IDC_FUJI_STATE,
     IDC_LABEL_FIRST
 };
 
@@ -102,6 +112,12 @@ typedef struct {
     unsigned sym_seen_gen;
     char sym_filter_text[64];
 
+    HWND fuji_title, fuji_note, fuji_clear, fuji_text;
+    HWND fuji_state_title, fuji_state;
+    uint64_t fuji_last;
+    int fuji_count;
+    int fuji_ticks;
+
     pixel_view backtab_pv, mob_pv[INTVSTIC_MOB_COUNT], cards_pv, pal_pv;
     uint8_t backtab_bgrx[INTVSTIC_BACKTAB_W * INTVSTIC_BACKTAB_H * 4];
     uint8_t mob_bgrx[INTVSTIC_MOB_COUNT][16 * 16 * 4];
@@ -114,6 +130,7 @@ typedef struct {
     intvdebug *dbg;
     intvsymtab *symtab;
     HFONT mono;
+    int mono_h; /* a text line's height in mono, for the logs */
     int page;
     uint64_t seen_serial;
     int was_paused;
@@ -122,6 +139,30 @@ typedef struct {
 static debugger *g_dbg;
 static const char *const kRegNames[8] = {"R0", "R1", "R2", "R3",
                                          "R4", "R5", "R6(SP)", "R7(PC)"};
+
+/* The tabs, in PAGE_* order; INTV_DEBUGGER_TAB picks one by number or by the
+ * start of its name (any case), for tests and captures. */
+static const char *const k_tab_names[] = {"CPU", "STIC", "Symbols",
+                                          "FujiNet"};
+#define TAB_COUNT ((int)(sizeof(k_tab_names) / sizeof(k_tab_names[0])))
+
+static int tab_from_env(void)
+{
+    const char *tab = getenv("INTV_DEBUGGER_TAB");
+    char *end;
+    long n;
+    int i;
+
+    if (!tab || !*tab)
+        return -1;
+    n = strtol(tab, &end, 10);
+    if (end != tab && *end == '\0')
+        return n >= 0 && n < TAB_COUNT ? (int)n : -1;
+    for (i = 0; i < TAB_COUNT; i++)
+        if (_strnicmp(tab, k_tab_names[i], strlen(tab)) == 0)
+            return i;
+    return -1;
+}
 
 /* RGBA8888 (red first) -> BGRX (blue first), the byte order GDI's 32bpp
  * BI_RGB DIB format expects in memory. Alpha is dropped -- every
@@ -224,6 +265,7 @@ static LRESULT CALLBACK disasm_subclass(HWND hwnd, UINT msg, WPARAM wp,
  * both when a symbol row is clicked. */
 static void show_page(debugger *d, int page);
 static void refresh_mem(debugger *d);
+static void refresh_fujinet(debugger *d, int force);
 
 /* Symbols page list: a click jumps the memory view to the clicked line's
  * address, the first 4 hex characters of each line (refresh_symbols'
@@ -312,12 +354,10 @@ static void build_controls(debugger *d)
     d->tabs = child(d, WC_TABCONTROLA, "", WS_VISIBLE, IDC_TABS);
     memset(&item, 0, sizeof(item));
     item.mask = TCIF_TEXT;
-    item.pszText = (char *)"CPU";
-    SendMessageA(d->tabs, TCM_INSERTITEMA, 0, (LPARAM)&item);
-    item.pszText = (char *)"STIC";
-    SendMessageA(d->tabs, TCM_INSERTITEMA, 1, (LPARAM)&item);
-    item.pszText = (char *)"Symbols";
-    SendMessageA(d->tabs, TCM_INSERTITEMA, 2, (LPARAM)&item);
+    for (i = 0; i < TAB_COUNT; i++) {
+        item.pszText = (char *)k_tab_names[i];
+        SendMessageA(d->tabs, TCM_INSERTITEMA, i, (LPARAM)&item);
+    }
 
     d->pause_btn = child(d, "BUTTON", "Pause (F5)",
                         WS_VISIBLE | BS_PUSHBUTTON, IDC_PAUSE);
@@ -383,6 +423,17 @@ static void build_controls(debugger *d)
     d->sym_list = mono_view(d, IDC_SYM_LIST);
     g_sym_list_proc = (WNDPROC)SetWindowLongPtrA(d->sym_list, GWLP_WNDPROC,
                                                  (LONG_PTR)sym_list_subclass);
+
+    /* FujiNet page */
+    d->fuji_title = label(d, "FujiBus packets (SLIP-decoded)");
+    d->fuji_note = label(d, "");
+    d->fuji_clear = child(d, "BUTTON", "Clear", WS_VISIBLE | BS_PUSHBUTTON,
+                          IDC_FUJI_CLEAR);
+    d->fuji_text = mono_view(d, IDC_FUJI_TEXT);
+    SendMessageA(d->fuji_text, EM_SETLIMITTEXT, 0, 0); /* past 32K */
+    d->fuji_state_title = label(d, "FujiNet's mailbox");
+    d->fuji_state = mono_view(d, IDC_FUJI_STATE);
+    d->fuji_count = -1;
 }
 
 /* ---- layout ------------------------------------------------------------------
@@ -426,6 +477,15 @@ static void show_page(debugger *d, int page)
     ShowWindow(d->sym_filter, page == PAGE_SYMBOLS ? SW_SHOW : SW_HIDE);
     ShowWindow(d->sym_count, page == PAGE_SYMBOLS ? SW_SHOW : SW_HIDE);
     ShowWindow(d->sym_list, page == PAGE_SYMBOLS ? SW_SHOW : SW_HIDE);
+
+    ShowWindow(d->fuji_title, page == PAGE_FUJINET ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->fuji_note, page == PAGE_FUJINET ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->fuji_clear, page == PAGE_FUJINET ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->fuji_text, page == PAGE_FUJINET ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->fuji_state_title, page == PAGE_FUJINET ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->fuji_state, page == PAGE_FUJINET ? SW_SHOW : SW_HIDE);
+    if (page == PAGE_FUJINET)
+        refresh_fujinet(d, 0);
 }
 
 static void layout(debugger *d)
@@ -531,6 +591,25 @@ static void layout(debugger *d)
         sy += 28;
         MoveWindow(d->sym_list, page.left, sy, page.right - page.left - 8,
                   page.bottom - sy - 4, TRUE);
+    }
+
+    /* FujiNet page: the packets left (a note and Clear over them), the
+     * mailbox right */
+    {
+        int fy = page.top;
+        int rw = (page.right - page.left) / 3 > 320
+                     ? 320 : (page.right - page.left) / 3;
+        int lw = page.right - page.left - rw - 12;
+        int rx = page.left + lw + 12;
+        MoveWindow(d->fuji_title, page.left, fy, lw, 18, TRUE);
+        MoveWindow(d->fuji_state_title, rx, fy, rw - 8, 18, TRUE);
+        fy += 22;
+        MoveWindow(d->fuji_note, page.left, fy + 4, lw - 90, 18, TRUE);
+        MoveWindow(d->fuji_clear, page.left + lw - 80, fy, 80, 26, TRUE);
+        MoveWindow(d->fuji_state, rx, fy, rw - 8, page.bottom - fy - 4, TRUE);
+        fy += 30;
+        MoveWindow(d->fuji_text, page.left, fy, lw, page.bottom - fy - 4,
+                  TRUE);
     }
 }
 
@@ -750,6 +829,126 @@ static void refresh_symbols(debugger *d)
     SetWindowTextA(d->sym_count, countbuf);
 }
 
+/* ---- the FujiNet page ------------------------------------------------------- */
+
+/* The rows an EDIT view shows. */
+static int edit_rows(debugger *d, HWND h)
+{
+    RECT c;
+    GetClientRect(h, &c);
+    return d->mono_h > 0 && c.bottom > d->mono_h ? c.bottom / d->mono_h : 1;
+}
+
+/* A log follows its end while its reader is there. */
+static int edit_at_end(debugger *d, HWND h)
+{
+    const int first = (int)SendMessageA(h, EM_GETFIRSTVISIBLELINE, 0, 0);
+    const int count = (int)SendMessageA(h, EM_GETLINECOUNT, 0, 0);
+    return first + edit_rows(d, h) >= count;
+}
+
+static void edit_to_end(HWND h)
+{
+    SendMessageA(h, EM_LINESCROLL, 0, SendMessageA(h, EM_GETLINECOUNT, 0, 0));
+}
+
+static void edit_scroll_to(HWND h, int first)
+{
+    SendMessageA(h, EM_LINESCROLL, 0,
+                 first - (int)SendMessageA(h, EM_GETFIRSTVISIBLELINE, 0, 0));
+}
+
+/* Replaces a view's text where the reader left it (a refresh must not throw
+ * a scrolled view back to its top), or, following, at its end. */
+static void set_text_at(HWND h, const char *text, int follow)
+{
+    const int first = (int)SendMessageA(h, EM_GETFIRSTVISIBLELINE, 0, 0);
+    SendMessageA(h, WM_SETREDRAW, FALSE, 0);
+    SetWindowTextA(h, text);
+    if (follow)
+        edit_to_end(h);
+    else
+        edit_scroll_to(h, first);
+    SendMessageA(h, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(h, NULL, TRUE);
+}
+
+/* The core's UTF-8 as this window's ASCII ("->", "x", "..."), with the CR LF
+ * an EDIT wants. */
+static void ascii_view_text(const char *in, char *out, size_t cap)
+{
+    size_t o = 0;
+    while (*in && o + 4 < cap) {
+        const unsigned char c = (unsigned char)*in;
+        if (strncmp(in, "\xe2\x86\x92", 3) == 0) {
+            memcpy(out + o, "->", 2);
+            o += 2;
+            in += 3;
+        } else if (strncmp(in, "\xe2\x80\xa6", 3) == 0) {
+            memcpy(out + o, "...", 3);
+            o += 3;
+            in += 3;
+        } else if (strncmp(in, "\xc3\x97", 2) == 0) {
+            out[o++] = 'x';
+            in += 2;
+        } else if (c == '\n') {
+            out[o++] = '\r';
+            out[o++] = '\n';
+            in++;
+        } else {
+            out[o++] = c >= 0x20 && c < 0x7F ? (char)c : '?';
+            in++;
+        }
+    }
+    out[o] = '\0';
+}
+
+static void refresh_fujinet(debugger *d, int force)
+{
+    static intvdebug_fuji_packet p[INTVDEBUG_FUJI_TRACE_MAX];
+    static char t[INTVDEBUG_FUJI_TRACE_MAX * 320 + 128];
+    static char a[INTVDEBUG_FUJI_TRACE_MAX * 330 + 128];
+    char state[2048], state_a[2600], cur[2600];
+    size_t len = 0;
+    int n = intvdebug_fujinet_trace(d->dbg, p, INTVDEBUG_FUJI_TRACE_MAX), i;
+    int follow;
+
+    d->fuji_ticks = 0;
+    if (!d->session || !intvsession_fujinet_running(d->session))
+        SetWindowTextA(d->fuji_note, "FujiNet is not running.");
+    else
+        SetWindowTextA(d->fuji_note, intvsession_fujinet_link(d->session)
+                                         ? "FujiNet cartridge, connected."
+                                         : "FujiNet cartridge, not connected.");
+    intvdebug_fujinet_state(d->dbg, state, (int)sizeof(state));
+    ascii_view_text(state, state_a, sizeof(state_a));
+    GetWindowTextA(d->fuji_state, cur, sizeof(cur));
+    if (strcmp(cur, state_a) != 0) /* unchanged keeps a selection */
+        set_text_at(d->fuji_state, state_a, 0);
+
+    if (!force && n == d->fuji_count &&
+        (n == 0 || p[n - 1].serial == d->fuji_last))
+        return;
+    follow = force || d->fuji_count < 0 || edit_at_end(d, d->fuji_text);
+    d->fuji_count = n;
+    d->fuji_last = n > 0 ? p[n - 1].serial : 0;
+    t[0] = '\0';
+    for (i = 0; i < n && len < sizeof(t) - 320; i++) {
+        int k;
+        len += (size_t)snprintf(t + len, sizeof(t) - len, "%s%s\n     ",
+                                i ? "\n" : "", p[i].text);
+        for (k = 0; k < p[i].nbytes && k < (int)sizeof(p[i].data); k++)
+            len += (size_t)snprintf(t + len, sizeof(t) - len, "%02X ",
+                                    p[i].data[k]);
+        if (p[i].nbytes > (int)sizeof(p[i].data))
+            len += (size_t)snprintf(t + len, sizeof(t) - len, "...");
+    }
+    if (n == 0)
+        snprintf(t, sizeof(t), "(no FujiBus packets since the trace was cleared)");
+    ascii_view_text(t, a, sizeof(a));
+    set_text_at(d->fuji_text, a, follow);
+}
+
 static void refresh_all(debugger *d)
 {
     int paused = intvdebug_is_paused(d->dbg);
@@ -772,6 +971,8 @@ static void refresh_all(debugger *d)
      * not machine state, and is cheap to skip when nothing changed (see
      * refresh_symbols's own comment). */
     refresh_symbols(d);
+    if (d->page == PAGE_FUJINET)
+        refresh_fujinet(d, 0);
     d->was_paused = paused;
 }
 
@@ -798,6 +999,10 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 intvdebug_is_paused(d->dbg) != d->was_paused) {
                 d->seen_serial = serial;
                 refresh_all(d);
+            } else if (d->page == PAGE_FUJINET &&
+                       ++d->fuji_ticks >= FUJI_TICKS) {
+                /* the one view that moves while the machine runs */
+                refresh_fujinet(d, 0);
             }
         }
         return 0;
@@ -891,6 +1096,10 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             return 0;
         }
+        case IDC_FUJI_CLEAR:
+            intvdebug_fujinet_trace_clear(d->dbg);
+            refresh_fujinet(d, 1);
+            return 0;
         case IDC_CLEAR_SYMS:
             intvsymtab_clear_user(d->symtab);
             d->seen_serial = 0;
@@ -1007,6 +1216,7 @@ void intv_debugger_show(HWND parent, intvsession *session)
                           ANSI_CHARSET, OUT_DEFAULT_PRECIS,
                           CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
                           FIXED_PITCH | FF_MODERN, "Consolas");
+    d->mono_h = 15;
 
     d->hwnd = CreateWindowExA(0, "IntvDebuggerWindow",
                               "Intellivision Debugger", WS_OVERLAPPEDWINDOW,
@@ -1015,9 +1225,24 @@ void intv_debugger_show(HWND parent, intvsession *session)
     SetWindowLongPtrA(d->hwnd, GWLP_USERDATA, (LONG_PTR)d);
     g_dbg = d;
 
+    {
+        HDC dc = GetDC(d->hwnd);
+        HGDIOBJ prev = SelectObject(dc, d->mono);
+        TEXTMETRICA tm;
+        if (GetTextMetricsA(dc, &tm))
+            d->mono_h = tm.tmHeight;
+        SelectObject(dc, prev);
+        ReleaseDC(d->hwnd, dc);
+    }
+
     build_controls(d);
-    show_page(d, PAGE_CPU);
     layout(d);
+    {
+        int tab = tab_from_env();
+        if (tab >= 0)
+            SendMessageA(d->tabs, TCM_SETCURSEL, (WPARAM)tab, 0);
+        show_page(d, tab >= 0 ? tab : PAGE_CPU);
+    }
 
     /* Engaging switches the CPU hook to the path that honours breakpoints
      * (see intvdebug.h). Pausing immediately is what a user opening a

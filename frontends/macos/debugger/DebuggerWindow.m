@@ -6,6 +6,11 @@
  * from plain AppKit views (an NSTabView, NSTextView/NSTextField/NSButton
  * children, and NSImageView for the STIC pictures).
  *
+ * A FujiNet tab, last, shows every FujiBus packet between the machine and
+ * FujiNet (intvdebug_fujinet_trace, always on) beside the mailbox's state;
+ * the timer also refreshes it twice a second while it shows, since it is
+ * the one view that changes while the machine runs.
+ *
  * Refreshing is a 0.1s NSTimer poll, not a callback: intvdebug.h has no
  * stop-callback mechanism at all (unlike the CoCo/MSX ports' own
  * cocodebug/msxdebug, which fire one on the emulator thread and marshal it
@@ -34,6 +39,11 @@
 
 #import "DebuggerWindow.h"
 
+#include <float.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
 #include "intvdebug.h"
 #include "intvstic.h"
 #include "symbols.h"
@@ -42,6 +52,7 @@
 #define MEM_ROWS 16
 #define MEM_WORDS_PER_ROW 8
 #define CARD_ROWS_PER_PAGE 8 /* 128 cards/page at INTVSTIC_CARDS_PER_ROW=16 */
+#define FUJI_TICKS 5 /* the FujiNet tab, every 0.5s while it shows */
 
 /* Same shared-scratch sizing lesson learned the hard way in the Windows
  * port (frontends/windows/debugger/dbg_window.c's own file comment): size
@@ -57,6 +68,26 @@
          : (STIC_SCRATCH_B > STIC_SCRATCH_C ? STIC_SCRATCH_B : STIC_SCRATCH_C))
 
 static DebuggerWindow *g_debugger;
+
+/* The tabs, in order; INTV_DEBUGGER_TAB picks one by number or by the start
+ * of its name (any case), for tests and captures. */
+static const char *const kTabNames[] = {"CPU", "STIC", "Symbols", "FujiNet"};
+#define TAB_COUNT ((int)(sizeof(kTabNames) / sizeof(kTabNames[0])))
+
+static int tabFromEnv(void)
+{
+    const char *tab = getenv("INTV_DEBUGGER_TAB");
+    if (!tab || !*tab)
+        return -1;
+    char *end;
+    const long n = strtol(tab, &end, 10);
+    if (end != tab && *end == '\0')
+        return n >= 0 && n < TAB_COUNT ? (int)n : -1;
+    for (int i = 0; i < TAB_COUNT; i++)
+        if (strncasecmp(tab, kTabNames[i], strlen(tab)) == 0)
+            return i;
+    return -1;
+}
 
 /* Disassembly text view: a click toggles the breakpoint on the clicked
  * line. The address sits right after the two flag columns (refreshDisasm's
@@ -114,7 +145,7 @@ static DebuggerWindow *g_debugger;
 }
 @end
 
-@interface DebuggerWindow () <NSWindowDelegate>
+@interface DebuggerWindow () <NSWindowDelegate, NSTabViewDelegate>
 - (instancetype)initWithSession:(intvsession *)session;
 @end
 
@@ -151,6 +182,15 @@ static DebuggerWindow *g_debugger;
     NSTextView *_sticState;
 
     uint8_t *_scratch; /* STIC_SCRATCH_BYTES, reused across all 4 renders */
+
+    NSTabView *_tabs;
+    NSTabViewItem *_fujiItem;
+    NSTextField *_fujiNote;
+    NSTextView *_fujiText;
+    NSTextView *_fujiState;
+    uint64_t _fujiLast;
+    int _fujiCount; /* seeded -1: the first refresh builds the log */
+    int _fujiTicks;
 
     NSTimer *_tick;
     uint64_t _seenSerial;
@@ -202,6 +242,7 @@ static NSImage *imageFromRGBA(const uint8_t *rgba, int w, int h, BOOL hasAlpha)
     _symtab = intvsymtab_shared();
     _symFilterText = @"";
     _scratch = calloc(1, STIC_SCRATCH_BYTES);
+    _fujiCount = -1;
     [self buildWindow];
 
     /* Engaging switches the CPU hook to the path that honours breakpoints
@@ -229,6 +270,10 @@ static NSImage *imageFromRGBA(const uint8_t *rgba, int w, int h, BOOL hasAlpha)
         _seenSerial = serial;
         _wasPaused = paused;
         [self refreshAll:paused];
+    } else if (_window.visible && [self fujiShowing] &&
+               ++_fujiTicks >= FUJI_TICKS) {
+        /* the one view that moves while the machine runs */
+        [self refreshFujinet:NO];
     }
 }
 
@@ -248,6 +293,49 @@ static NSTextView *monoView(NSScrollView **scrollOut)
     scroll.documentView = view;
     *scrollOut = scroll;
     return view;
+}
+
+/* A log: no wrapping, so each hex row stays one line. */
+static NSTextView *logView(NSScrollView **scrollOut)
+{
+    NSTextView *view = monoView(scrollOut);
+    (*scrollOut).hasHorizontalScroller = YES;
+    view.minSize = NSMakeSize(0, 0);
+    view.maxSize = NSMakeSize(FLT_MAX, FLT_MAX);
+    view.verticallyResizable = YES;
+    view.horizontallyResizable = YES;
+    view.textContainer.widthTracksTextView = NO;
+    view.textContainer.size = NSMakeSize(FLT_MAX, FLT_MAX);
+    view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    return view;
+}
+
+/* Whether a view's reader is at its end (a log then follows new lines). */
+static BOOL atEnd(NSTextView *view)
+{
+    NSScrollView *scroll = view.enclosingScrollView;
+    if (!scroll)
+        return YES;
+    return NSMaxY(scroll.contentView.documentVisibleRect) >=
+           NSHeight(view.frame) - 4;
+}
+
+/* Replaces a view's text where the reader left it (a refresh must not throw
+ * a scrolled view back to its top), or, following, at its end. */
+static void setText(NSTextView *view, NSString *text, BOOL follow)
+{
+    if (![view.string isEqualToString:text]) {
+        NSScrollView *scroll = view.enclosingScrollView;
+        const NSPoint at =
+            scroll ? scroll.contentView.bounds.origin : NSZeroPoint;
+        view.string = text;
+        if (scroll && !follow) {
+            [scroll.contentView scrollToPoint:at];
+            [scroll reflectScrolledClipView:scroll.contentView];
+        }
+    }
+    if (follow)
+        [view scrollRangeToVisible:NSMakeRange(view.string.length, 0)];
 }
 
 - (NSButton *)button:(NSString *)title action:(SEL)sel
@@ -470,6 +558,51 @@ static NSTextView *monoView(NSScrollView **scrollOut)
     return root;
 }
 
+- (NSView *)buildFujinetTab
+{
+    _fujiNote = [self label:@""];
+    [_fujiNote setContentHuggingPriority:1
+                          forOrientation:NSLayoutConstraintOrientationHorizontal];
+    NSButton *clear = [self button:@"Clear" action:@selector(fujiClear:)];
+    clear.toolTip = @"Forget the packets so far";
+    NSStackView *row = [NSStackView stackViewWithViews:@[ _fujiNote, clear ]];
+    row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    row.distribution = NSStackViewDistributionFill;
+
+    NSScrollView *logScroll;
+    _fujiText = logView(&logScroll);
+    [logScroll setContentHuggingPriority:NSLayoutPriorityDefaultLow
+                          forOrientation:NSLayoutConstraintOrientationVertical];
+    NSStackView *left = [NSStackView stackViewWithViews:@[
+        [self label:@"FujiBus packets (SLIP-decoded)"], row, logScroll
+    ]];
+    left.orientation = NSUserInterfaceLayoutOrientationVertical;
+    left.alignment = NSLayoutAttributeLeading;
+    left.spacing = 6;
+    [row.widthAnchor constraintEqualToAnchor:left.widthAnchor].active = YES;
+    [logScroll.widthAnchor constraintEqualToAnchor:left.widthAnchor].active =
+        YES;
+    [left.widthAnchor constraintGreaterThanOrEqualToConstant:560].active = YES;
+
+    NSScrollView *stateScroll;
+    _fujiState = monoView(&stateScroll);
+    [stateScroll setContentHuggingPriority:NSLayoutPriorityDefaultLow
+                            forOrientation:NSLayoutConstraintOrientationVertical];
+    [stateScroll.widthAnchor constraintEqualToConstant:320].active = YES;
+    NSStackView *right = [NSStackView stackViewWithViews:@[
+        [self label:@"FujiNet's mailbox"], stateScroll
+    ]];
+    right.orientation = NSUserInterfaceLayoutOrientationVertical;
+    right.alignment = NSLayoutAttributeLeading;
+    right.spacing = 6;
+
+    NSSplitView *split = [[NSSplitView alloc] init];
+    split.vertical = YES;
+    [split addArrangedSubview:left];
+    [split addArrangedSubview:right];
+    return split;
+}
+
 - (void)buildWindow
 {
     _window = [[NSWindow alloc]
@@ -515,19 +648,27 @@ static NSTextView *monoView(NSScrollView **scrollOut)
 
     NSTabView *tabs = [[NSTabView alloc] init];
     NSTabViewItem *cpuTab = [[NSTabViewItem alloc] initWithIdentifier:@"cpu"];
-    cpuTab.label = @"CPU";
+    cpuTab.label = @(kTabNames[0]);
     cpuTab.view = [self buildCpuTab];
     NSTabViewItem *sticTab =
         [[NSTabViewItem alloc] initWithIdentifier:@"stic"];
-    sticTab.label = @"STIC";
+    sticTab.label = @(kTabNames[1]);
     sticTab.view = [self buildSticTab];
     NSTabViewItem *symTab =
         [[NSTabViewItem alloc] initWithIdentifier:@"symbols"];
-    symTab.label = @"Symbols";
+    symTab.label = @(kTabNames[2]);
     symTab.view = [self buildSymbolsTab];
+    _fujiItem = [[NSTabViewItem alloc] initWithIdentifier:@"fujinet"];
+    _fujiItem.label = @(kTabNames[3]);
+    _fujiItem.view = [self buildFujinetTab];
     [tabs addTabViewItem:cpuTab];
     [tabs addTabViewItem:sticTab];
     [tabs addTabViewItem:symTab];
+    [tabs addTabViewItem:_fujiItem];
+    _tabs = tabs;
+    tabs.delegate = self;
+    if (tabFromEnv() >= 0)
+        [tabs selectTabViewItemAtIndex:tabFromEnv()];
 
     NSStackView *root = [NSStackView stackViewWithViews:@[ toolbar, tabs ]];
     root.orientation = NSUserInterfaceLayoutOrientationVertical;
@@ -691,6 +832,20 @@ static NSTextView *monoView(NSScrollView **scrollOut)
     [self refreshSymbols];
 }
 
+- (void)fujiClear:(id)sender
+{
+    (void)sender;
+    intvdebug_fujinet_trace_clear(_dbg);
+    [self refreshFujinet:YES];
+}
+
+- (void)tabView:(NSTabView *)tabView didSelectTabViewItem:(NSTabViewItem *)item
+{
+    (void)tabView;
+    if (item == _fujiItem)
+        [self refreshFujinet:NO];
+}
+
 /* windowShouldClose: fires whenever the window's close control (or Window >
  * Close) is used; keep the window alive but hidden, like GNOME/KDE/Windows
  * do, so F12 reopens it instantly with its state intact -- but disengage
@@ -726,6 +881,49 @@ static NSTextView *monoView(NSScrollView **scrollOut)
      * not machine state, and is cheap to skip when nothing changed (see
      * refreshSymbols's own comment). */
     [self refreshSymbols];
+    if ([self fujiShowing])
+        [self refreshFujinet:NO];
+}
+
+- (BOOL)fujiShowing
+{
+    return _tabs.selectedTabViewItem == _fujiItem;
+}
+
+- (void)refreshFujinet:(BOOL)force
+{
+    static intvdebug_fuji_packet p[INTVDEBUG_FUJI_TRACE_MAX];
+    static char state[2048];
+    int n = intvdebug_fujinet_trace(_dbg, p, INTVDEBUG_FUJI_TRACE_MAX);
+
+    _fujiTicks = 0;
+    if (!_session || !intvsession_fujinet_running(_session))
+        _fujiNote.stringValue = @"FujiNet is not running.";
+    else
+        _fujiNote.stringValue = intvsession_fujinet_link(_session)
+                                    ? @"FujiNet cartridge, connected."
+                                    : @"FujiNet cartridge, not connected.";
+    intvdebug_fujinet_state(_dbg, state, (int)sizeof(state));
+    setText(_fujiState, [NSString stringWithUTF8String:state] ?: @"", NO);
+
+    if (!force && n == _fujiCount &&
+        (n == 0 || p[n - 1].serial == _fujiLast))
+        return;
+    _fujiCount = n;
+    _fujiLast = n > 0 ? p[n - 1].serial : 0;
+    const BOOL follow = force || atEnd(_fujiText);
+    NSMutableString *text = [NSMutableString string];
+    for (int i = 0; i < n; i++) {
+        [text appendFormat:@"%@%@\n     ", i ? @"\n" : @"",
+                           [NSString stringWithUTF8String:p[i].text] ?: @""];
+        for (int k = 0; k < p[i].nbytes && k < (int)sizeof(p[i].data); k++)
+            [text appendFormat:@"%02X ", p[i].data[k]];
+        if (p[i].nbytes > (int)sizeof(p[i].data))
+            [text appendString:@"…"];
+    }
+    if (n == 0)
+        [text appendString:@"(no FujiBus packets since the trace was cleared)"];
+    setText(_fujiText, text, follow);
 }
 
 /* Only rebuilds the list when the table's generation or the filter text has

@@ -3,7 +3,8 @@
  * by cmake/FujiNetRuntime.cmake -DWITH_FUJINET=ON) alongside the emulator
  * and confirms actual FujiBus traffic crossed the wire: the embedded
  * config ROM queries FujiNet (GET WIFI STATUS / READ HOST SLOTS) within a
- * couple of seconds of boot, without any cartridge or user input.
+ * couple of seconds of boot, without any cartridge or user input. The
+ * debugger's FujiNet trace must have seen it too, both ways.
  *
  * Needs libfujinet.so available (FUJINET_LIB env var, or beside the test
  * binary, or in tools/fujinet/work/out -- see paths_provision_fujinet) and
@@ -15,6 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "intvdebug.h"
 #include "intvsession.h"
 #include "test_tmpdir.h"
 
@@ -72,6 +74,23 @@ int main(void)
         usleep(10000);
     }
 
+    /* The trace is always on, so it saw that round trip: at least one
+     * request and one reply. */
+    static intvdebug_fuji_packet trace[INTVDEBUG_FUJI_TRACE_MAX];
+    int sent = 0, received = 0, n = 0;
+    for (int i = 0; i < 200 && saw_traffic && !(sent && received); i++) {
+        n = intvdebug_fujinet_trace(intvdebug_get(), trace,
+                                    INTVDEBUG_FUJI_TRACE_MAX);
+        for (int k = 0; k < n; k++) {
+            if (trace[k].to_host)
+                received = 1;
+            else
+                sent = 1;
+        }
+        if (!(sent && received))
+            usleep(10000);
+    }
+
     intvsession_stop(s);
     intvsession_free(s);
 
@@ -80,7 +99,14 @@ int main(void)
                         "3s\n---- last FujiNet log ----\n%s\n", log);
         return 1;
     }
+    if (!sent || !received) {
+        fprintf(stderr, "fujibus_smoke: the FujiNet trace has %d packets, "
+                        "requests %s, replies %s\n", n, sent ? "yes" : "no",
+                received ? "yes" : "no");
+        return 1;
+    }
 
-    printf("fujibus_smoke: OK (real BoIP connection + FujiBus traffic)\n");
+    printf("fujibus_smoke: OK (real BoIP connection + FujiBus traffic, "
+           "%d traced packets)\n", n);
     return 0;
 }

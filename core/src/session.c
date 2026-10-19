@@ -261,6 +261,12 @@ int intvsession_is_running(const intvsession *s)
     return intv_host_is_running();
 }
 
+int intvsession_fujinet_link(const intvsession *s)
+{
+    (void)s;
+    return intv_host_fujinet_link();
+}
+
 const char *intvsession_last_error(const intvsession *s)
 {
     return s->last_error;

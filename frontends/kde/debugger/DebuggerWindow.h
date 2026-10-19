@@ -19,6 +19,7 @@ class QListWidget;
 class QListWidgetItem;
 class QPlainTextEdit;
 class QPushButton;
+class QTabWidget;
 class QTimer;
 
 class DebuggerWindow : public QMainWindow {
@@ -44,6 +45,9 @@ private:
     void goToAddr();
     void breakAtAddr();
     void refreshSymbols();
+    QWidget *buildFujinet();
+    void refreshFujinet(bool force);
+    bool fujiShowing() const;
 
     intvsession *m_session;
     intvdebug *m_dbg;
@@ -73,6 +77,14 @@ private:
     QPlainTextEdit *m_sticState;
     int m_cardFirst = 0;
     int m_cardTotal = 0;
+
+    QTabWidget *m_tabs;
+    QWidget *m_fujiPage;
+    QLabel *m_fujiNote;
+    QPlainTextEdit *m_fujiText, *m_fujiState;
+    uint64_t m_fujiLast = 0;
+    int m_fujiCount = -1;
+    int m_fujiTicks = 0;
 
     QTimer *m_tick;
     uint64_t m_seenSerial = 0;

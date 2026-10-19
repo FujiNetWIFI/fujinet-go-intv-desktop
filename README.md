@@ -43,14 +43,14 @@ cmake -B build -DFRONTEND=none -DWITH_INTV_ROMS=OFF
 cmake -B build -DFRONTEND=gnome   # or kde, macos, windows
 ```
 
-`ctest` runs 21 suites covering the headless jzIntv core, ROM embedding, the
+`ctest` runs 22 suites covering the headless jzIntv core, ROM embedding, the
 frame/audio publish contract, pad and keyboard input mapping (including the
 ECS keyboard/second controller pair and the ECS/Intellivoice/PAL machine
 options), the Windows/evdev/macOS key-code tables, the keypad disc's 16-way
 pointer geometry, the public session API, the peripheral bus' address decode
 teardown (which the FujiNet cart hot-swap depends on), the debugger's symbol
-table and STIC views, and (when `WITH_INTV_ROMS=OFF`) that no Mattel firmware
-bytes ended up in the shipped binary.
+table, STIC views and FujiBus packet decoder, and (when `WITH_INTV_ROMS=OFF`)
+that no Mattel firmware bytes ended up in the shipped binary.
 
 The ECS keyboard has three of those to itself, because its shifted layer is
 reached by synthesising SHIFT rather than by a key of its own: `ecs_key`
@@ -71,6 +71,8 @@ Set `INTV_OPEN_DEBUGGER=1`, `INTV_OPEN_KEYPAD=1` and/or (Windows only)
 to have it open those windows on startup. The Windows one exists because
 that frontend is only ever exercised by cross-building and running under
 Wine, where there is no way to drive a menu.
+`INTV_DEBUGGER_TAB` picks the debugger's tab when it opens: a number from 0,
+or the start of a tab's name (`cpu`, `stic`, `symbols`, `fujinet`).
 
 ## Project layout
 

@@ -82,7 +82,8 @@ int main(void)
           (regs.pc >= 0x1000 && regs.pc <= 0x1FFF) ||
           (regs.pc >= 0x5000 && regs.pc <= 0x6FFF) ||
           (regs.pc >= 0x8000 && regs.pc <= 0x9BFF) ||
-          (regs.pc >= 0xD000 && regs.pc <= 0xDFFF));
+          (regs.pc >= 0xD000 && regs.pc <= 0xDFFF) ||
+          (regs.pc >= 0xF000 && regs.pc <= 0xF7FF));
 
     /* ---- disassembly at PC produces at least one real instruction ---- */
     intvdebug_dasm_line lines[4];

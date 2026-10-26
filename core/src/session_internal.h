@@ -80,6 +80,11 @@ int paths_init(struct intvsession *s, const char *config_dir,
  * runtime is available (not fatal to the session -- see fujinet_start). */
 int paths_provision_fujinet(struct intvsession *s);
 
+/* paths.c file helpers, shared with roms.c and media.c. */
+int mkdir_p(const char *path);
+int is_file(const char *path);
+int copy_file(const char *src, const char *dst);
+
 void session_set_error(struct intvsession *s, const char *fmt, ...);
 
 /* ---- fujinet_runtime.c ---------------------------------------------- */

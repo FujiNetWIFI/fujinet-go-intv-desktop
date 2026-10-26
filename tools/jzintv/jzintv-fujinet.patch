@@ -5901,3 +5901,50 @@
  #endif
  
  #ifdef USE_SYS_IOCTL
+@@ -120,17 +120,39 @@
+ #  endif
+ void plat_delay_no_sdl(unsigned msec)
+ {
+-    HANDLE timer; 
+-    LARGE_INTEGER ft; 
++    /* One high-resolution waitable timer, created on first use (the
++     * emulator thread is the only sleeper) and reused: the old code made
++     * and closed an ordinary timer per call, which only has ~1 ms
++     * granularity (and only that with timeBeginPeriod(1)). Falls back to an
++     * ordinary timer where high resolution timers are not available. */
++    static HANDLE timer = NULL;
++    LARGE_INTEGER ft;
++
++    if (!timer)
++    {
++#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
++#  define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
++#endif
++        timer = CreateWaitableTimerExW(NULL, NULL,
++                                       CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                       TIMER_ALL_ACCESS);
++        if (!timer)
++            timer = CreateWaitableTimerW(NULL, TRUE, NULL);
++        if (!timer)
++        {
++            Sleep(msec);
++            return;
++        }
++    }
+ 
+     /* Windows wants 100ns intervals */
+     /* Also, -ve to specify _relative_ time */
+-    ft.QuadPart = -(10000ll*msec); 
++    ft.QuadPart = -(10000ll*msec);
+ 
+-    timer = CreateWaitableTimer(NULL, TRUE, NULL); 
+-    SetWaitableTimer(timer, &ft, 0, NULL, NULL, 0); 
+-    WaitForSingleObject(timer, INFINITE); 
+-    CloseHandle(timer); 
++    if (SetWaitableTimer(timer, &ft, 0, NULL, NULL, 0))
++        WaitForSingleObject(timer, INFINITE);
++    else
++        Sleep(msec);
+ }
+ #endif
+ 

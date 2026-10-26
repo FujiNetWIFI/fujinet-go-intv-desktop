@@ -34,7 +34,10 @@ int main(int argc, const char *argv[])
         }
         intvsession_start_opts opts;
         intvsession_default_opts(session, &opts);
-        if (intvsession_start(session, &opts) != 0)
+        /* Without the Executive/Graphics ROMs the app shows its No BIOS page
+         * and starts the machine after an import (AppDelegate). */
+        if (intvsession_has_system_roms(session) &&
+            intvsession_start(session, &opts) != 0)
             fprintf(stderr, "session start: %s\n",
                     intvsession_last_error(session));
 

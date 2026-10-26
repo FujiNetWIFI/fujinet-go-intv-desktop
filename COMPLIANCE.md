@@ -29,9 +29,13 @@ not have redistribution rights to them.
   **A binary built this way must not be redistributed.**
 - `-DWITH_INTV_ROMS=OFF` (what every artifact this repository publishes is
   built with) embeds none of the three images. The app reads them from the
-  user's own ROM directory at run time, provisioned through the "Import
-  System ROMs..." path once a milestone implementing it lands; without an
-  imported `ecs.bin`, the ECS option in Settings is disabled.
+  user's own ROM directory at run time, provisioned through Machine > Import
+  BIOS... (a file, a zip such as MAME's `intv` set, or a folder: each dump is
+  recognised by size and CRC32, whatever it is called, and written as
+  `exec.bin`, `grom.bin` or `ecs.bin`; MAME's three 8K ECS pieces are joined).
+  Until the Executive and Graphics ROMs are imported the app shows a "No
+  Intellivision BIOS" page and does not start; without an imported `ecs.bin`,
+  the ECS option in Settings is disabled.
   `core/tests/no_embedded_roms.py` is registered as a ctest against every
   built frontend executable (plus `boot_smoke`, once it exists) and fails the
   build if a distinctive slice of any of the three images is found in the

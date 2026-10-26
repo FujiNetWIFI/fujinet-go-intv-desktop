@@ -370,7 +370,23 @@ static void SetHighlighted(NSButton *btn, BOOL on)
 {
     if (!btn)
         return;
-    btn.bezelColor = on ? [NSColor controlAccentColor] : nil;
+    NSString *t = btn.title;
+    if (on) {
+        /* INTVSESSION_ACCENT_RGB 0x1E4912, white text */
+        btn.bezelColor = [NSColor colorWithSRGBRed:0x1E / 255.0
+                                             green:0x49 / 255.0
+                                              blue:0x12 / 255.0
+                                             alpha:1.0];
+        btn.attributedTitle = [[NSAttributedString alloc]
+            initWithString:t
+                attributes:@{
+                    NSFontAttributeName : btn.font ?: [NSFont systemFontOfSize:NSFont.systemFontSize],
+                    NSForegroundColorAttributeName : NSColor.whiteColor
+                }];
+    } else {
+        btn.bezelColor = nil;
+        btn.title = t; /* drops the attributed title */
+    }
 }
 
 static void MapSetStatus(NSString *text)

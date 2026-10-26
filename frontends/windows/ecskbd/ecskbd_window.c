@@ -30,6 +30,7 @@
 
 #include "ecskbd_window.h"
 
+#include "../accent_button.h"
 #include "key_forward.h"
 
 #include <stdlib.h>
@@ -225,6 +226,16 @@ static LRESULT CALLBACK ecskbd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp,
             }
         }
         return 0;
+    case WM_NOTIFY: {
+        /* Ctrl/Shift wear the accent colour while latched. */
+        const NMHDR *nh = (const NMHDR *)lp;
+        if (nh->code == NM_CUSTOMDRAW &&
+            (nh->idFrom == IDC_ECSKBD_CTRL || nh->idFrom == IDC_ECSKBD_SHIFT))
+            return intv_accent_customdraw(
+                (const NMCUSTOMDRAW *)lp,
+                SendMessageA(nh->hwndFrom, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        break;
+    }
     case WM_CLOSE:
         release_all();
         ShowWindow(hwnd, SW_HIDE);

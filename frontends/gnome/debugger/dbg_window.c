@@ -74,6 +74,7 @@ typedef struct {
 
     GtkNotebook *notebook;
     GtkWidget *fuji_page;
+    GtkNotebook *tabs;
     GtkLabel *fuji_note;
     GtkTextView *fuji_text, *fuji_state;
     uint64_t fuji_last;
@@ -138,7 +139,10 @@ static void on_log_resized(GtkAdjustment *adj, gpointer view)
 static void make_log(GtkTextView *view)
 {
     g_object_set_data(G_OBJECT(view), "follow", GINT_TO_POINTER(1));
-    g_signal_connect(vadj(view), "changed", G_CALLBACK(on_log_resized), view);
+    /* _object: the handler goes when the view does, so a scroll adjustment
+     * that changes while the window is torn down never calls into it. */
+    g_signal_connect_object(vadj(view), "changed",
+                            G_CALLBACK(on_log_resized), view, 0);
 }
 
 /* Before new text: follow if the reader is at the end (or never looked). */
@@ -597,16 +601,26 @@ static void on_cards_page(GtkButton *btn, gpointer user_data)
         refresh_stic(w);
 }
 
+static void weak_free(gpointer p)
+{
+    g_weak_ref_clear(p);
+    g_free(p);
+}
+
 static void load_symbols_done(GObject *source, GAsyncResult *result,
                               gpointer user_data)
 {
-    DbgWin *w = user_data;
+    GWeakRef *ref = user_data;
+    g_autoptr(GObject) wobj = g_weak_ref_get(ref);
+    DbgWin *w = wobj ? g_object_get_data(wobj, "dbgwin") : NULL;
     g_autoptr(GFile) file =
         gtk_file_dialog_open_finish(GTK_FILE_DIALOG(source), result, NULL);
     g_autofree char *path = NULL;
     int n;
 
-    if (!file)
+    weak_free(ref);
+    /* The debugger may have been closed while the picker was up. */
+    if (!w || !file)
         return;
     path = g_file_get_path(file);
     if (!path)
@@ -651,7 +665,11 @@ static void on_load_symbols(GtkButton *button, gpointer user_data)
         g_autoptr(GFile) folder = g_file_new_for_path(last_dir);
         gtk_file_dialog_set_initial_folder(dialog, folder);
     }
-    gtk_file_dialog_open(dialog, w->win, NULL, load_symbols_done, w);
+    {
+        GWeakRef *ref = g_new0(GWeakRef, 1);
+        g_weak_ref_init(ref, w->win);
+        gtk_file_dialog_open(dialog, w->win, NULL, load_symbols_done, ref);
+    }
     g_object_unref(filters);
     g_object_unref(dialog);
 }
@@ -672,14 +690,15 @@ static void on_fuji_clear(GtkButton *b, gpointer u)
     refresh_fujinet(w, TRUE);
 }
 
-static void on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num,
-                           gpointer user_data)
+static gboolean on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num,
+                               gpointer user_data)
 {
     DbgWin *w = user_data;
     (void)nb;
     (void)num;
     if (page == w->fuji_page)
         refresh_fujinet(w, FALSE);
+    return FALSE;
 }
 
 static gboolean on_key(GtkEventControllerKey *c, guint keyval, guint keycode,
@@ -706,10 +725,22 @@ static gboolean on_key(GtkEventControllerKey *c, guint keyval, guint keycode,
     }
 }
 
-static void on_closed(GtkWindow *window, gpointer user_data)
+/* The window's memory outlives its widgets: freed once the window is gone,
+ * when no child can still signal into it. */
+static void dbgwin_free(gpointer data, GObject *where)
+{
+    (void)where;
+    g_free(data);
+}
+
+static gboolean on_closed(GtkWindow *window, gpointer user_data)
 {
     DbgWin *w = user_data;
     (void)window;
+
+    /* Teardown re-selects notebook pages; nothing may call back into w. */
+    if (w->tabs)
+        g_signal_handlers_disconnect_by_data(w->tabs, w);
 
     if (w->tick_id) {
         gtk_widget_remove_tick_callback(GTK_WIDGET(w->win), w->tick_id);
@@ -721,7 +752,7 @@ static void on_closed(GtkWindow *window, gpointer user_data)
     /* w->symtab is intvsymtab_shared() -- process-wide, not owned by this
      * window -- so it is deliberately NOT destroyed here; see this file's
      * header comment. */
-    g_free(w);
+    return FALSE; /* go on and close */
 }
 
 /* ---- construction ----------------------------------------------------------- */
@@ -848,6 +879,8 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     w->mem_view_addr = 0x0000;
 
     w->win = GTK_WINDOW(adw_window_new());
+    g_object_set_data(G_OBJECT(w->win), "dbgwin", w);
+    g_object_weak_ref(G_OBJECT(w->win), dbgwin_free, w);
     singleton = w->win;
     g_object_add_weak_pointer(G_OBJECT(w->win), (gpointer *)&singleton);
     gtk_window_set_title(w->win, "Intellivision Debugger");
@@ -1063,6 +1096,7 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     w->fuji_page = build_fujinet(w);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), w->fuji_page,
                              gtk_label_new(k_tab_names[3]));
+    w->tabs = GTK_NOTEBOOK(notebook);
     g_signal_connect(notebook, "switch-page", G_CALLBACK(on_switch_page), w);
     if (tab_from_env() >= 0)
         gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), tab_from_env());

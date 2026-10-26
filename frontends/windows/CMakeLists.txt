@@ -1,4 +1,4 @@
-# Windows frontend: native Win32 (GDI) over the shared session core. Built
+# Windows frontend: native Win32 (Direct3D 11 picture, GDI fallback) over the shared session core. Built
 # only on Windows hosts (or cross-compiled with cmake/toolchains/
 # mingw-w64.cmake for a Wine smoke test -- see that file's own header).
 # WIN32_EXECUTABLE => a WinMain entry point, no console window.
@@ -16,6 +16,9 @@ configure_file(app.manifest.in "${CMAKE_CURRENT_BINARY_DIR}/app.manifest" @ONLY)
 
 add_executable(fujinet-go-intv-windows WIN32
   main.c
+  display.c
+  import.c
+  roms.c
   key_translate.c
   debugger/dbg_window.c
   keypad/keypad_window.c
@@ -33,7 +36,10 @@ add_executable(fujinet-go-intv-windows WIN32
 # resolution frontends/gnome/CMakeLists.txt settled on.
 target_link_libraries(fujinet-go-intv-windows PRIVATE
   intv_session jzintv_core stdc++
-  gdi32 user32 comdlg32 shell32 comctl32
+  # d3d11: the picture (display.c; d3dcompiler_47 and avrt are loaded, not
+  # linked). dwmapi: DwmFlush, the GDI fallback's frame clock. ole32: the
+  # folder browser's COM.
+  d3d11 dwmapi gdi32 user32 comdlg32 shell32 ole32 comctl32
   winmm  # timeBeginPeriod, for frame pacing -- see main.c's WinMain
 )
 target_include_directories(fujinet-go-intv-windows PRIVATE

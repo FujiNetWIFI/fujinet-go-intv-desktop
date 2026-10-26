@@ -27,6 +27,9 @@
 extern "C" {
 #endif
 
+/* The dark green of the icon: the highlight for toggle buttons (white text). */
+#define INTVSESSION_ACCENT_RGB 0x1E4912
+
 /* Fixed geometry -- unlike the CoCo's, the Intellivision's STIC output does
  * not vary at runtime. See core/jzintv/intv_frame.h. */
 #define INTVSESSION_FB_WIDTH  160
@@ -812,10 +815,45 @@ const char *intvsession_roms_path(const intvsession *s);
 const char *intvsession_config_path(const intvsession *s);
 const char *intvsession_data_path(const intvsession *s);
 
-/* 1 when the ROM directory holds exec.bin and grom.bin -- a frontend that
- * gets 0 here should prompt for "Import System ROMs..." rather than start a
- * session that would fail to boot. See COMPLIANCE.md. */
+/* 1 when the ROM directory holds exec.bin and grom.bin (the right sizes) -- a
+ * frontend that gets 0 here should show its "No Intellivision BIOS" page and
+ * prompt for Import BIOS... rather than start a session that would fail to
+ * boot. See COMPLIANCE.md. */
 int intvsession_has_system_roms(const intvsession *s);
+
+/* ---- system ROMs ("BIOS") -------------------------------------------------
+ * One row of the ROMs list. An item is available when its file is in the ROM
+ * directory at the right size. */
+typedef struct {
+    const char *name;
+    const char *group;           /* "System ROMs" or "Entertainment ..." */
+} intv_rom_item;
+
+int intvsession_rom_item_count(void);
+const intv_rom_item *intvsession_rom_item(int i);
+int intvsession_rom_item_available(const intvsession *s, int i);
+
+/* Import system ROMs from path: a file, a zip (MAME's intv set works) or a
+ * folder (searched to a depth of 8). Each known dump is recognised by size and
+ * CRC32, whatever the file is called, and written as exec.bin, grom.bin or
+ * ecs.bin in the ROM directory; MAME's three 8K ECS pieces are joined. A
+ * session that was already running must be stopped and started again for new
+ * ROMs to take effect. Writes a one-line result into msg ("Now available:
+ * ...", "Imported N file(s); ...", or that nothing was found). Returns 0 if
+ * any ROM was written, -1 if not. A build with WITH_INTV_ROMS=ON has already
+ * materialised its own copies; an imported dump replaces the same-named file. */
+int intvsession_rom_import(intvsession *s, const char *path, char *msg, int msgsz);
+
+/* ---- FujiNet's SD host ----------------------------------------------------
+ * The SD folder CONFIG browses (valid for the session's lifetime). */
+const char *intvsession_sd_path(const intvsession *s);
+
+/* Copy a cartridge image (.rom .bin .int .itv, with its .cfg sibling if
+ * there is one) or a zip of them onto the SD host, creating the folder if
+ * need be. dest_out gets the (first) destination path. Returns 0 on success;
+ * -1 with the reason in intvsession_last_error. */
+int intvsession_import_cart_to_sd(intvsession *s, const char *src_path,
+                                  char *dest_out, int dest_sz);
 
 #ifdef __cplusplus
 }

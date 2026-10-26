@@ -7,6 +7,12 @@
 #include "intv_host.h"
 
 #include <pthread.h>
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -140,9 +146,28 @@ void intv_host_set_thread_hook(void (*hook)(void))
     s_thread_hook = hook;
 }
 
+#ifdef _WIN32
+/* Join the MMCSS "Games" class so the pacing sleeps wake on time under load.
+ * avrt.dll is loaded at run time: no new link dependency. */
+static void join_mmcss_games(void)
+{
+    typedef HANDLE (WINAPI *av_fn)(LPCWSTR, LPDWORD);
+    HMODULE avrt = LoadLibraryW(L"avrt.dll");
+    av_fn av = avrt ? (av_fn)(void (*)(void))
+                      GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW")
+                    : NULL;
+    DWORD index = 0;
+    if (!av || !av(L"Games", &index))
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+}
+#endif
+
 static void *thread_main(void *arg)
 {
     (void)arg;
+#ifdef _WIN32
+    join_mmcss_games();
+#endif
     if (s_thread_hook)
         s_thread_hook();
     jzintv_entry_point(s_argc, s_argv);

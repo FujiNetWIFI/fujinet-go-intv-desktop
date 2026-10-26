@@ -19,6 +19,7 @@
 
 #import "AppDelegate.h"
 
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <WebKit/WebKit.h>
 
 #import "DisplayView.h"
@@ -27,6 +28,7 @@
 #import "keypad/KeypadWindow.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 @interface AppDelegate () <NSWindowDelegate, WKUIDelegate>
 @end
@@ -42,6 +44,9 @@
     NSWindow *_settingsWindow;
     BOOL _sessionDirty;
     NSTimer *_sysactTimer;
+    NSView *_noRoms;
+    NSMutableArray<NSTextField *> *_romStatus;
+    NSPopUpButton *_ecsPop;
 }
 
 /* Settings keys shared with the GNOME/KDE/Windows frontends (all four read/
@@ -78,6 +83,8 @@ static NSArray<NSString *> *restartSettingKeys(void)
 {
     intvsession_start_opts opts;
     intvsession_stop(_session);
+    if (!intvsession_has_system_roms(_session))
+        return; /* the No BIOS page is showing; an import starts it */
     intvsession_default_opts(_session, &opts);
     if (intvsession_start(_session, &opts) != 0) {
         NSAlert *alert = [[NSAlert alloc] init];
@@ -86,6 +93,219 @@ static NSArray<NSString *> *restartSettingKeys(void)
             [NSString stringWithUTF8String:intvsession_last_error(_session)];
         [alert runModal];
     }
+}
+
+/* ---- BIOS import ---------------------------------------------------------- */
+
+/* In place of the picture until the Executive and Graphics ROMs are there. */
+- (NSView *)buildNoRoms:(NSRect)frame
+{
+    NSImageView *icon =
+        [NSImageView imageViewWithImage:[NSApp applicationIconImage]];
+    [icon.widthAnchor constraintEqualToConstant:96].active = YES;
+    [icon.heightAnchor constraintEqualToConstant:96].active = YES;
+    NSTextField *title = [NSTextField labelWithString:@"No Intellivision BIOS"];
+    title.font = [NSFont boldSystemFontOfSize:22];
+    NSTextField *desc = [NSTextField
+        wrappingLabelWithString:
+            @"The Intellivision Executive and Graphics ROMs are not part of "
+            @"the app. Import the ones you have \u2014 exec.bin and grom.bin, "
+            @"a zip such as MAME\u2019s intv set, or a folder \u2014 and the "
+            @"Intellivision starts."];
+    desc.alignment = NSTextAlignmentCenter;
+    desc.textColor = NSColor.secondaryLabelColor;
+    desc.preferredMaxLayoutWidth = 460;
+    [desc.widthAnchor constraintEqualToConstant:460].active = YES;
+    NSButton *files = [NSButton buttonWithTitle:@"Import BIOS\u2026"
+                                         target:self
+                                         action:@selector(importBios:)];
+    files.bezelColor = NSColor.controlAccentColor;
+    files.keyEquivalent = @"\r";
+    NSButton *folder = [NSButton buttonWithTitle:@"Import a Folder\u2026"
+                                          target:self
+                                          action:@selector(importBiosFromFolder:)];
+    NSStackView *buttons =
+        [NSStackView stackViewWithViews:@[ files, folder ]];
+    buttons.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    buttons.spacing = 12;
+    NSStackView *column =
+        [NSStackView stackViewWithViews:@[ icon, title, desc, buttons ]];
+    column.orientation = NSUserInterfaceLayoutOrientationVertical;
+    column.alignment = NSLayoutAttributeCenterX;
+    column.spacing = 14;
+    column.translatesAutoresizingMaskIntoConstraints = NO;
+
+    NSView *page = [[NSView alloc] initWithFrame:frame];
+    page.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [page addSubview:column];
+    [column.centerXAnchor constraintEqualToAnchor:page.centerXAnchor].active =
+        YES;
+    [column.centerYAnchor constraintEqualToAnchor:page.centerYAnchor].active =
+        YES;
+    return page;
+}
+
+/* The picture while the machine can run, else the No-BIOS page. */
+- (void)showPage
+{
+    BOOL ok = intvsession_is_running(_session) ||
+              intvsession_has_system_roms(_session);
+    _display.hidden = !ok;
+    _noRoms.hidden = ok;
+    if (ok)
+        [_window makeFirstResponder:_display];
+}
+
+- (void)refreshRomRows
+{
+    for (NSUInteger i = 0; i < _romStatus.count; i++)
+        _romStatus[i].stringValue =
+            intvsession_rom_item_available(_session, (int)i) ? @"Imported"
+                                                             : @"Not imported";
+    if (_ecsPop) {
+        BOOL have = intvsession_has_ecs_rom(_session) != 0;
+        _ecsPop.enabled = have;
+        _ecsPop.toolTip =
+            have ? @"Entertainment Computer System \u2014 second controller "
+                   @"pair, ECS keyboard, extra sound"
+                 : @"Unavailable: ecs.bin not found in the ROM directory";
+    }
+}
+
+/* (Re)starts the machine once its ROMs are there. A running session has to be
+ * stopped and started again for new ROMs to take effect. */
+- (void)startMachine
+{
+    if (intvsession_has_system_roms(_session))
+        [self restartSession];
+    [self showPage];
+}
+
+/* Each chosen path through the import, then one alert says what came of it. */
+- (void)importBiosURLs:(NSArray<NSURL *> *)urls
+{
+    NSMutableArray<NSString *> *log = [NSMutableArray array];
+    int imported = 0;
+    for (NSURL *u in urls) {
+        char msg[1024];
+        msg[0] = '\0';
+        if (intvsession_rom_import(_session, u.fileSystemRepresentation, msg,
+                                   (int)sizeof msg) == 0)
+            imported++;
+        if (msg[0])
+            [log addObject:[NSString stringWithFormat:@"%@: %s",
+                                                      u.lastPathComponent, msg]];
+    }
+    if (imported)
+        [self startMachine];
+    [self refreshRomRows];
+    if (log.count) {
+        NSAlert *a = [[NSAlert alloc] init];
+        a.messageText = imported ? @"BIOS Imported" : @"Nothing Imported";
+        a.informativeText = [log componentsJoinedByString:@"\n"];
+        [a runModal];
+    }
+}
+
+- (void)importBiosChoosingFolder:(BOOL)folder
+{
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.message = folder
+                        ? @"Import BIOS from a Folder (MAME\u2019s intv set works)"
+                        : @"Import BIOS: ROM images, zips or folders";
+    panel.canChooseDirectories = YES;
+    panel.canChooseFiles = !folder;
+    panel.allowsMultipleSelection = !folder;
+    if (!folder) {
+        NSMutableArray<UTType *> *types = [NSMutableArray array];
+        for (NSString *e in @[ @"zip", @"rom", @"bin" ]) {
+            UTType *t = [UTType typeWithFilenameExtension:e];
+            if (t)
+                [types addObject:t];
+        }
+        [types addObject:UTTypeData];
+        panel.allowedContentTypes = types;
+    }
+    if ([panel runModal] != NSModalResponseOK || panel.URLs.count == 0)
+        return;
+    [self importBiosURLs:panel.URLs];
+}
+
+- (void)importBios:(id)sender
+{
+    (void)sender;
+    [self importBiosChoosingFolder:NO];
+}
+
+- (void)importBiosFromFolder:(id)sender
+{
+    (void)sender;
+    [self importBiosChoosingFolder:YES];
+}
+
+/* ---- SD host ------------------------------------------------------------- */
+
+- (void)importCartToSd:(id)sender
+{
+    (void)sender;
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.message = @"Import a cartridge to the SD host";
+    panel.allowsMultipleSelection = YES;
+    NSMutableArray<UTType *> *types = [NSMutableArray array];
+    for (NSString *e in @[ @"rom", @"bin", @"int", @"itv", @"cfg", @"zip" ]) {
+        UTType *t = [UTType typeWithFilenameExtension:e];
+        if (t)
+            [types addObject:t];
+    }
+    [types addObject:UTTypeData];
+    panel.allowedContentTypes = types;
+    if ([panel runModal] != NSModalResponseOK || panel.URLs.count == 0)
+        return;
+
+    NSUInteger ok = 0;
+    NSString *firstName = nil;
+    for (NSURL *u in panel.URLs) {
+        char dest[1024];
+        dest[0] = '\0';
+        if (intvsession_import_cart_to_sd(_session, u.fileSystemRepresentation,
+                                          dest, (int)sizeof dest) != 0) {
+            NSAlert *a = [[NSAlert alloc] init];
+            a.messageText = @"Import failed";
+            a.informativeText = [NSString
+                stringWithUTF8String:intvsession_last_error(_session)];
+            [a runModal];
+            continue;
+        }
+        if (!ok)
+            firstName = u.lastPathComponent;
+        ok++;
+    }
+    if (!ok)
+        return;
+    NSAlert *a = [[NSAlert alloc] init];
+    a.messageText = ok == 1 ? @"Cartridge Imported" : @"Cartridges Imported";
+    a.informativeText =
+        ok == 1 ? [NSString stringWithFormat:
+                                @"%@ is on the SD host. Boot it from CONFIG.",
+                                firstName]
+                : [NSString stringWithFormat:@"%lu files are on the SD host. "
+                                             @"Boot them from CONFIG.",
+                                             (unsigned long)ok];
+    [a runModal];
+}
+
+- (void)openSdFolder:(id)sender
+{
+    (void)sender;
+    const char *p = intvsession_sd_path(_session);
+    if (!p || !*p)
+        return;
+    [[NSFileManager defaultManager]
+              createDirectoryAtPath:@(p)
+        withIntermediateDirectories:YES
+                         attributes:nil
+                              error:nil];
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:@(p)]];
 }
 
 /* ---- actions ------------------------------------------------------------ */
@@ -304,6 +524,7 @@ static NSArray<NSString *> *restartSettingKeys(void)
 
     BOOL haveEcsRom = intvsession_has_ecs_rom(_session);
     NSPopUpButton *ecsPop = [self hwModePopUpForKey:"ecs"];
+    _ecsPop = ecsPop;
     ecsPop.enabled = haveEcsRom;
     ecsPop.toolTip =
         haveEcsRom
@@ -339,7 +560,44 @@ static NSArray<NSString *> *restartSettingKeys(void)
         @[ [NSTextField labelWithString:@"Video Standard"], videoPop ],
         @[ [NSTextField labelWithString:@"ECS Keyboard"], ecsKeyboard ],
     ];
-    NSGridView *grid = [NSGridView gridViewWithViews:rows];
+    /* ROMs: one row per item under its group, refreshed after an import. */
+    NSMutableArray<NSArray<NSView *> *> *all = [rows mutableCopy];
+    NSTextField *romsHead = [NSTextField labelWithString:@"ROMs"];
+    romsHead.font = [NSFont boldSystemFontOfSize:NSFont.systemFontSize];
+    [all addObject:@[ romsHead, [NSTextField labelWithString:@""] ]];
+    _romStatus = [NSMutableArray array];
+    const char *group = "";
+    for (int i = 0; i < intvsession_rom_item_count(); i++) {
+        const intv_rom_item *it = intvsession_rom_item(i);
+        if (strcmp(group, it->group) != 0) {
+            group = it->group;
+            NSTextField *g = [NSTextField
+                labelWithString:[NSString stringWithUTF8String:group]];
+            g.textColor = NSColor.secondaryLabelColor;
+            [all addObject:@[ g, [NSTextField labelWithString:@""] ]];
+        }
+        NSTextField *st = [NSTextField labelWithString:@""];
+        [_romStatus addObject:st];
+        [all addObject:@[
+            [NSTextField
+                labelWithString:[NSString stringWithUTF8String:it->name]],
+            st
+        ]];
+    }
+    NSButton *impFiles = [NSButton buttonWithTitle:@"Import\u2026"
+                                            target:self
+                                            action:@selector(importBios:)];
+    NSButton *impFolder = [NSButton buttonWithTitle:@"Import a Folder\u2026"
+                                             target:self
+                                             action:@selector(importBiosFromFolder:)];
+    NSStackView *impRow =
+        [NSStackView stackViewWithViews:@[ impFiles, impFolder ]];
+    impRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    impRow.spacing = 8;
+    [all addObject:@[ [NSTextField labelWithString:@""], impRow ]];
+    [self refreshRomRows];
+
+    NSGridView *grid = [NSGridView gridViewWithViews:all];
     grid.rowSpacing = 8;
     grid.columnSpacing = 12;
     [grid columnAtIndex:0].xPlacement = NSGridCellPlacementTrailing;
@@ -358,14 +616,27 @@ static NSArray<NSString *> *restartSettingKeys(void)
     note.lineBreakMode = NSLineBreakByWordWrapping;
     note.maximumNumberOfLines = 0;
 
-    NSStackView *root = [NSStackView stackViewWithViews:@[ grid, note ]];
+    NSTextField *kept = [NSTextField
+        labelWithString:[NSString stringWithFormat:@"Kept in %s.",
+                                                   intvsession_roms_path(_session)]];
+    kept.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    kept.textColor = NSColor.secondaryLabelColor;
+    kept.preferredMaxLayoutWidth = 360;
+    kept.lineBreakMode = NSLineBreakByWordWrapping;
+    kept.maximumNumberOfLines = 0;
+    kept.selectable = YES;
+
+    NSStackView *root =
+        [NSStackView stackViewWithViews:@[ grid, kept, note ]];
     root.orientation = NSUserInterfaceLayoutOrientationVertical;
     root.alignment = NSLayoutAttributeLeading;
     root.spacing = 12;
     root.edgeInsets = NSEdgeInsetsMake(16, 16, 16, 16);
 
+    [root layoutSubtreeIfNeeded];
+    NSSize fit = root.fittingSize;
     _settingsWindow = [[NSWindow alloc]
-        initWithContentRect:NSMakeRect(0, 0, 420, 320)
+        initWithContentRect:NSMakeRect(0, 0, MAX(fit.width, 420), fit.height)
                   styleMask:NSWindowStyleMaskTitled |
                             NSWindowStyleMaskClosable |
                             NSWindowStyleMaskMiniaturizable
@@ -477,6 +748,24 @@ static NSArray<NSString *> *restartSettingKeys(void)
     fujiItem.submenu = fuji;
     [menubar addItem:fujiItem];
 
+    NSMenuItem *machineItem = [[NSMenuItem alloc] init];
+    NSMenu *machineMenu = [[NSMenu alloc] initWithTitle:@"Machine"];
+    [machineMenu addItem:[self item:@"Import BIOS\u2026"
+                             action:@selector(importBios:)
+                                key:@""]];
+    [machineMenu addItem:[self item:@"Import BIOS from a Folder\u2026"
+                             action:@selector(importBiosFromFolder:)
+                                key:@""]];
+    [machineMenu addItem:[NSMenuItem separatorItem]];
+    [machineMenu addItem:[self item:@"Import Cartridge to SD\u2026"
+                             action:@selector(importCartToSd:)
+                                key:@""]];
+    [machineMenu addItem:[self item:@"Open SD Folder"
+                             action:@selector(openSdFolder:)
+                                key:@""]];
+    machineItem.submenu = machineMenu;
+    [menubar addItem:machineItem];
+
     /* View: Keypad, Fullscreen, Debugger -- matching the GNOME/KDE/Windows
      * frontends' own View menu exactly (no Machine/Display/CPU groups). */
     NSMenuItem *viewItem = [[NSMenuItem alloc] init];
@@ -565,11 +854,14 @@ static NSArray<NSString *> *restartSettingKeys(void)
     _display.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     _display.frame = ((NSView *)_window.contentView).bounds;
     [_window.contentView addSubview:_display];
+    _noRoms = [self buildNoRoms:((NSView *)_window.contentView).bounds];
+    [_window.contentView addSubview:_noRoms];
 
     [_window center];
     [_window makeKeyAndOrderFront:nil];
     [_window makeFirstResponder:_display];
     [_display start];
+    [self showPage];
 
     /* ~100ms: fast enough that a gamepad press feels immediate, cheap
      * enough to run for the app's whole lifetime. See -drainSysactions's

@@ -11,6 +11,7 @@
 #include "window.h"
 
 static intvsession *g_session;
+static GtkWindow *g_main_window; /* weak: cleared when the window goes */
 
 /* The installed icons are named after the desktop-entry id. Running straight
  * out of the build tree there is nothing installed to look up, so point the
@@ -39,7 +40,8 @@ static void on_activate(AdwApplication *app, gpointer user_data)
     GtkWindow *win;
     (void)user_data;
 
-    win = gtk_application_get_active_window(GTK_APPLICATION(app));
+    intv_css_install();
+    win = g_main_window;
     if (win) {
         gtk_window_present(win);
         return;
@@ -54,13 +56,17 @@ static void on_activate(AdwApplication *app, gpointer user_data)
         }
         intvsession_start_opts opts;
         intvsession_default_opts(g_session, &opts);
-        if (intvsession_start(g_session, &opts) != 0)
+        /* Without ROMs the window opens on its No-BIOS page instead. */
+        if (intvsession_has_system_roms(g_session) &&
+            intvsession_start(g_session, &opts) != 0)
             g_printerr("session start: %s\n",
                        intvsession_last_error(g_session));
     }
 
     win = GTK_WINDOW(intv_window_new(app, g_session));
     gtk_window_set_icon_name(win, intv_icon_name());
+    g_main_window = win;
+    g_object_add_weak_pointer(G_OBJECT(win), (gpointer *)&g_main_window);
     gtk_window_present(win);
 }
 

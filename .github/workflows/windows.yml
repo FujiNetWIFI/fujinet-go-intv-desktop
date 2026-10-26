@@ -63,6 +63,7 @@ jobs:
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-python
             mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-zlib
 
       # MSYS2's UCRT64 repo packages its own current SDL3, not the exact
       # release this project is pinned to for its actual shipped builds

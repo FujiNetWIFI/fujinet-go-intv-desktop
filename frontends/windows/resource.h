@@ -15,6 +15,11 @@
 #define IDM_ECS_KEYBOARD   209
 #define IDM_RESET_CONFIG   210
 #define IDM_RESET_GAME     211
+#define IDM_IMPORT_BIOS     212
+#define IDM_IMPORT_BIOS_DIR 213
+#define IDM_IMPORT_SD       214
+#define IDM_OPEN_SD         215
+#define IDM_ROMS            216
 
 /* Settings window child control ids. */
 #define IDC_SET_ECS          301
@@ -23,5 +28,15 @@
 #define IDC_SET_ECS_KEYBOARD 304
 #define IDC_SET_PAD_LIST     305
 #define IDC_SET_PAD_SIDE     306
+#define IDC_SET_ROMS         307
+
+/* The No-BIOS page's buttons. */
+#define IDC_BIOS_FILES       401
+#define IDC_BIOS_FOLDER      402
+
+/* The System ROMs window. */
+#define IDC_ROMS_FILES       411
+#define IDC_ROMS_FOLDER      412
+#define IDC_ROMS_CLOSE       413
 
 #endif

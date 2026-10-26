@@ -988,7 +988,9 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_NOTIFY: {
         NMHDR *nm = (NMHDR *)lp;
-        if (d && nm->hwndFrom == d->tabs && nm->code == TCN_SELCHANGE)
+        if (!d)         /* a notification during teardown */
+            return 0;
+        if (nm->hwndFrom == d->tabs && nm->code == TCN_SELCHANGE)
             show_page(d, (int)SendMessageA(d->tabs, TCM_GETCURSEL, 0, 0));
         return 0;
     }
@@ -1143,6 +1145,10 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
              * see this file's header comment. */
             DeleteObject(d->mono);
             g_dbg = NULL;
+            /* Clear the back-pointer before freeing: DestroyWindow goes on
+             * to send WM_NCDESTROY/WM_NOTIFY from the children being torn
+             * down, and dbg_wnd_proc reads GWLP_USERDATA for each of them. */
+            SetWindowLongPtrA(hwnd, GWLP_USERDATA, 0);
             free(d);
         }
         return 0;

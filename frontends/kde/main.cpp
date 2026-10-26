@@ -28,6 +28,12 @@ int main(int argc, char *argv[])
         QIcon(QStringLiteral(INTV_ICON_FILE))));
 #endif
 
+    /* Checked toggles (ECS Ctrl/Shift, the keypad's Map) in the icon's dark
+     * green; ":checked" only, so unchecked buttons keep the platform look. */
+    app.setStyleSheet(QStringLiteral(
+        "QPushButton:checked { background-color: #1E4912; color: white; }"
+        "QPushButton:checked:hover { background-color: #2C6B1A; }"));
+
     intvsession *session = intvsession_new(nullptr);
     if (!session) {
         fprintf(stderr, "fatal: could not create the session\n");
@@ -35,7 +41,10 @@ int main(int argc, char *argv[])
     }
     intvsession_start_opts opts;
     intvsession_default_opts(session, &opts);
-    if (intvsession_start(session, &opts) != 0)
+    /* Without the BIOS the start would just fail; MainWindow shows the
+     * import page instead and starts the session after an import. */
+    if (intvsession_has_system_roms(session) &&
+        intvsession_start(session, &opts) != 0)
         fprintf(stderr, "session start: %s\n",
                 intvsession_last_error(session));
 

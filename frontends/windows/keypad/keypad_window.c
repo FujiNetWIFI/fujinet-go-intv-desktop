@@ -59,6 +59,7 @@
 
 #include "keypad_window.h"
 
+#include "../accent_button.h"
 #include "key_forward.h"
 
 #include <math.h>
@@ -134,13 +135,22 @@ static HWND g_sysact_buttons[INTVSESSION_SYSACT_COUNT];
  * rather than destroys itself). */
 static disc_state *g_discs[2];
 
+static int g_map_lit; /* the Map button is armed: drawn in the accent colour */
+
 /* BM_SETSTATE forces a BUTTON control's native "pressed" rendering without
- * changing any check state or simulating a click -- exactly the
- * programmatic highlight this needs, with no owner-draw plumbing. */
+ * changing any check state or simulating a click -- the programmatic
+ * highlight the target buttons need. The Map button itself is drawn in the
+ * accent colour instead (keypad_wnd_proc's NM_CUSTOMDRAW, see
+ * accent_button.h), so it is only repainted here. */
 static void set_highlighted(HWND btn, int on)
 {
     if (!btn)
         return;
+    if (btn == g_map_btn) {
+        g_map_lit = on ? 1 : 0;
+        InvalidateRect(btn, NULL, TRUE);
+        return;
+    }
     SendMessageA(btn, BM_SETSTATE, on ? TRUE : FALSE, 0);
 }
 
@@ -693,6 +703,12 @@ static LRESULT CALLBACK keypad_wnd_proc(HWND hwnd, UINT msg, WPARAM wp,
             }
         }
         return 0;
+    case WM_NOTIFY: {
+        const NMHDR *nh = (const NMHDR *)lp;
+        if (nh->code == NM_CUSTOMDRAW && nh->hwndFrom == g_map_btn)
+            return intv_accent_customdraw((const NMCUSTOMDRAW *)lp, g_map_lit);
+        break;
+    }
     case WM_TIMER:
         if (wp == IDT_GAMEPAD_POLL) {
             intvsession_pad_button button;

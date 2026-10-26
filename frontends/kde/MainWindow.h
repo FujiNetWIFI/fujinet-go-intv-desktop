@@ -11,6 +11,7 @@
 #include "intvsession.h"
 
 class DisplayWidget;
+class QStackedWidget;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -39,8 +40,19 @@ private:
      * window hides rather than closes but is hidden far more often than
      * shown, and a gamepad-bound sysaction has to keep working regardless. */
     void drainSysactions();
+    void importBios(bool folder);
+    void importCartToSd();
+    void openSdFolder();
+    QWidget *buildNoBiosPage();
+    /* The picture when the ROMs are there, else the No-BIOS page. */
+    void showPage();
+    /* (Re)starts the session once its ROMs exist (after an import). */
+    void startIfReady();
+    void screenshotAndQuit(const QString &path);
 
     intvsession *m_session;
     DisplayWidget *m_display;
+    QStackedWidget *m_stack;
+    QWidget *m_noBios;
     QTimer *m_sysactTimer;
 };

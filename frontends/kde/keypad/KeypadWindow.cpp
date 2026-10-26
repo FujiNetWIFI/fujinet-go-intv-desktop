@@ -272,14 +272,10 @@ void setHighlighted(QPushButton *btn, bool on)
 {
     if (!btn)
         return;
-    /* Qt has no CSS-class idiom as convenient as GTK's add_css_class for a
-     * one-off highlight, so this reaches for the palette directly --
-     * palette(highlight)/palette(highlighted-text) track whatever the
-     * user's light/dark theme already uses for a selected item, same as
-     * this button would look selected in a list view. */
+    /* The icon's dark green with white text (INTVSESSION_ACCENT_RGB), the
+     * same as every checked toggle button in the app. */
     btn->setStyleSheet(on ? QStringLiteral(
-                               "background-color: palette(highlight); "
-                               "color: palette(highlighted-text);")
+                               "background-color: #1E4912; color: white;")
                           : QString());
 }
 

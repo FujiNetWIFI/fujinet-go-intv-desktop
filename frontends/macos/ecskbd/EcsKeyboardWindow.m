@@ -59,10 +59,33 @@
 @end
 
 @implementation EcsModButton
+/* Latched = dark green (INTVSESSION_ACCENT_RGB 0x1E4912) with white text;
+ * released = the system default look. */
+- (void)applyLatchLook
+{
+    BOOL on = self.state == NSControlStateValueOn;
+    NSString *t = self.title;
+    if (on) {
+        self.bezelColor = [NSColor colorWithSRGBRed:0x1E / 255.0
+                                              green:0x49 / 255.0
+                                               blue:0x12 / 255.0
+                                              alpha:1.0];
+        self.attributedTitle = [[NSAttributedString alloc]
+            initWithString:t
+                attributes:@{
+                    NSFontAttributeName : [NSFont systemFontOfSize:NSFont.systemFontSize],
+                    NSForegroundColorAttributeName : NSColor.whiteColor
+                }];
+    } else {
+        self.bezelColor = nil;
+        self.title = t; /* drops the attributed title */
+    }
+}
 - (void)modToggled:(id)sender
 {
     (void)sender;
     intvsession_ecs_key_set(self.session, self.key, self.state == NSControlStateValueOn);
+    [self applyLatchLook];
 }
 @end
 

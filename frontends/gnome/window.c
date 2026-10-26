@@ -11,6 +11,7 @@
 
 #include "window.h"
 
+#include <glib/gstdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -26,7 +27,9 @@ struct _IntvWindow {
 
     intvsession *session;
     IntvDisplay *display;
+    GtkStack *stack;          /* the picture, or the No-BIOS page */
     AdwToastOverlay *toasts;
+    guint shot_id;            /* INTV_SCREENSHOT timer */
     /* GTK4's key-pressed signal carries no repeat flag (unlike KDE/macOS,
      * which drop repeats before this code ever sees them) -- tracked by
      * hand so holding a sysaction key (e.g. Backspace) fires Reset Game
@@ -44,13 +47,305 @@ void intv_window_toast(IntvWindow *self, const char *message)
     adw_toast_overlay_add_toast(self->toasts, adw_toast_new(message));
 }
 
+/* ---- the display CSS ------------------------------------------------------
+ * One display-wide provider, installed at startup so the keypad and ECS
+ * windows get it too: checked toggles and highlighted buttons in the icon's
+ * dark green (INTVSESSION_ACCENT_RGB) with white text, in light and dark. */
+
+void intv_css_install(void)
+{
+    static gboolean done;
+    GtkCssProvider *provider;
+    g_autofree char *css = NULL;
+    GdkDisplay *display = gdk_display_get_default();
+
+    if (done || !display)
+        return;
+    done = TRUE;
+    css = g_strdup_printf(
+        "button.intv-toggle:checked, button.intv-accent,\n"
+        "togglebutton.intv-toggle:checked {\n"
+        "  background: #%06X; background-image: none; color: #ffffff;\n"
+        "}\n"
+        "button.intv-toggle:checked:hover, button.intv-accent:hover {\n"
+        "  background: #2A6A19; background-image: none; color: #ffffff;\n"
+        "}\n",
+        (unsigned)INTVSESSION_ACCENT_RGB);
+    provider = gtk_css_provider_new();
+    gtk_css_provider_load_from_string(provider, css);
+    gtk_style_context_add_provider_for_display(
+        display, GTK_STYLE_PROVIDER(provider),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(provider);
+}
+
+void intv_window_message(IntvWindow *self, const char *heading,
+                         const char *body)
+{
+    AdwDialog *dlg = adw_alert_dialog_new(heading, body);
+    adw_alert_dialog_add_response(ADW_ALERT_DIALOG(dlg), "ok", "OK");
+    adw_dialog_present(dlg, GTK_WIDGET(self));
+}
+
+/* The picture while the machine runs or has ROMs to boot, else the No-BIOS
+ * page. */
+void intv_window_show_page(IntvWindow *self)
+{
+    gboolean ok = intvsession_is_running(self->session) ||
+                  intvsession_has_system_roms(self->session);
+    gtk_stack_set_visible_child_name(self->stack, ok ? "display" : "nobios");
+}
+
 void intv_window_restart_session(IntvWindow *self)
 {
     intvsession_start_opts opts;
     intvsession_stop(self->session);
-    intvsession_default_opts(self->session, &opts);
-    if (intvsession_start(self->session, &opts) != 0)
-        intv_window_toast(self, intvsession_last_error(self->session));
+    if (intvsession_has_system_roms(self->session)) {
+        intvsession_default_opts(self->session, &opts);
+        if (intvsession_start(self->session, &opts) != 0)
+            intv_window_toast(self, intvsession_last_error(self->session));
+    }
+    intv_window_show_page(self);
+}
+
+/* ---- file choosers -------------------------------------------------------- */
+
+GtkFileDialog *intv_file_dialog(const char *title, const char *filter_name,
+                                const char *const *exts)
+{
+    GtkFileDialog *dlg = gtk_file_dialog_new();
+    GListStore *filters = g_list_store_new(GTK_TYPE_FILE_FILTER);
+    GtkFileFilter *these = gtk_file_filter_new();
+    GtkFileFilter *all = gtk_file_filter_new();
+    int i;
+
+    gtk_file_filter_set_name(these, filter_name);
+    for (i = 0; exts && exts[i]; i++)
+        gtk_file_filter_add_suffix(these, exts[i]); /* any case */
+    gtk_file_filter_set_name(all, "All files");
+    gtk_file_filter_add_pattern(all, "*");
+    g_list_store_append(filters, these);
+    g_list_store_append(filters, all);
+    gtk_file_dialog_set_title(dlg, title);
+    gtk_file_dialog_set_filters(dlg, G_LIST_MODEL(filters));
+    g_object_unref(these);
+    g_object_unref(all);
+    g_object_unref(filters);
+    return dlg;
+}
+
+/* ---- the BIOS ------------------------------------------------------------- */
+
+static const char *const ROM_EXTS[] = {"zip", "rom", "bin", NULL};
+
+typedef struct {
+    IntvWindow *window;      /* strong ref */
+    gboolean folder;
+    void (*done)(gpointer);
+    gpointer done_data;      /* strong ref'd by the caller if it needs one */
+} BiosJob;
+
+/* Each chosen file (or the folder) through the import, then one message
+ * saying what came of it all; the machine (re)starts if it now can -- a
+ * running one is stopped and started again so a new ecs.bin is picked up. */
+static void on_bios_chosen(GObject *src, GAsyncResult *res, gpointer user_data)
+{
+    BiosJob *job = user_data;
+    IntvWindow *self = job->window;
+    g_autoptr(GListModel) files = NULL;
+    g_autoptr(GFile) dir = NULL;
+    GString *log = g_string_new(NULL);
+    int imported = 0;
+    guint i;
+
+    if (job->folder)
+        dir = gtk_file_dialog_select_folder_finish(GTK_FILE_DIALOG(src), res,
+                                                   NULL);
+    else
+        files = gtk_file_dialog_open_multiple_finish(GTK_FILE_DIALOG(src), res,
+                                                     NULL);
+    for (i = 0;; i++) {
+        g_autoptr(GFile) f = NULL;
+        g_autofree char *path = NULL;
+        char msg[1024];
+        if (job->folder) {
+            if (i > 0 || !dir)
+                break;
+            f = g_object_ref(dir);
+        } else {
+            if (!files || i >= g_list_model_get_n_items(files))
+                break;
+            f = g_list_model_get_item(files, i);
+        }
+        path = g_file_get_path(f);
+        if (!path)
+            continue;
+        msg[0] = '\0';
+        if (intvsession_rom_import(self->session, path, msg, sizeof msg) == 0)
+            imported++;
+        g_string_append_printf(log, "%s%s", log->len ? "\n" : "", msg);
+    }
+    if (log->len) {
+        intv_window_message(self, imported ? "BIOS Imported" : "Nothing Imported",
+                            log->str);
+        if (imported && intvsession_has_system_roms(self->session))
+            intv_window_restart_session(self);
+        else
+            intv_window_show_page(self);
+    }
+    g_string_free(log, TRUE);
+    if (job->done)
+        job->done(job->done_data);
+    g_object_unref(self);
+    g_free(job);
+}
+
+void intv_window_import_bios(IntvWindow *self, gboolean folder,
+                             void (*done)(gpointer), gpointer done_data)
+{
+    GtkFileDialog *dlg = intv_file_dialog(
+        folder ? "Import BIOS from a Folder" : "Import BIOS",
+        "BIOS images and ROM sets", ROM_EXTS);
+    BiosJob *job = g_new0(BiosJob, 1);
+
+    job->window = g_object_ref(self);
+    job->folder = folder;
+    job->done = done;
+    job->done_data = done_data;
+    if (folder)
+        gtk_file_dialog_select_folder(dlg, GTK_WINDOW(self), NULL,
+                                      on_bios_chosen, job);
+    else
+        gtk_file_dialog_open_multiple(dlg, GTK_WINDOW(self), NULL,
+                                      on_bios_chosen, job);
+    g_object_unref(dlg);
+}
+
+static void action_import_bios(GSimpleAction *action, GVariant *param,
+                               gpointer user_data)
+{
+    (void)action;
+    (void)param;
+    intv_window_import_bios(INTV_WINDOW(user_data), FALSE, NULL, NULL);
+}
+
+static void action_import_bios_folder(GSimpleAction *action, GVariant *param,
+                                      gpointer user_data)
+{
+    (void)action;
+    (void)param;
+    intv_window_import_bios(INTV_WINDOW(user_data), TRUE, NULL, NULL);
+}
+
+static void on_nobios_import(GtkButton *b, gpointer user_data)
+{
+    intv_window_import_bios(
+        INTV_WINDOW(user_data),
+        GPOINTER_TO_INT(g_object_get_data(G_OBJECT(b), "intv-folder")), NULL,
+        NULL);
+}
+
+/* In place of the picture until the machine has its ROMs. */
+static GtkWidget *nobios_page(IntvWindow *self)
+{
+    GtkWidget *page = adw_status_page_new();
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    GtkWidget *files = gtk_button_new_with_label("Import BIOS\xe2\x80\xa6");
+    GtkWidget *folder = gtk_button_new_with_label("Import a Folder\xe2\x80\xa6");
+
+    adw_status_page_set_icon_name(ADW_STATUS_PAGE(page), intv_icon_name());
+    adw_status_page_set_title(ADW_STATUS_PAGE(page), "No Intellivision BIOS");
+    adw_status_page_set_description(ADW_STATUS_PAGE(page),
+        "The Intellivision Executive and Graphics ROMs are not part of the "
+        "app. Import the ones you have \xe2\x80\x94 exec.bin and grom.bin, a "
+        "zip such as MAME's intv set, or a folder \xe2\x80\x94 and the "
+        "Intellivision starts.");
+    gtk_widget_add_css_class(files, "pill");
+    gtk_widget_add_css_class(files, "suggested-action");
+    gtk_widget_add_css_class(folder, "pill");
+    g_object_set_data(G_OBJECT(folder), "intv-folder", GINT_TO_POINTER(1));
+    g_signal_connect(files, "clicked", G_CALLBACK(on_nobios_import), self);
+    g_signal_connect(folder, "clicked", G_CALLBACK(on_nobios_import), self);
+    gtk_widget_set_halign(box, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(box), files);
+    gtk_box_append(GTK_BOX(box), folder);
+    adw_status_page_set_child(ADW_STATUS_PAGE(page), box);
+    return page;
+}
+
+/* ---- FujiNet's SD host ---------------------------------------------------- */
+
+static const char *const CART_EXTS[] = {"rom", "bin", "int", "itv", "cfg",
+                                        "zip", NULL};
+
+static void on_cart_chosen(GObject *src, GAsyncResult *res, gpointer user_data)
+{
+    IntvWindow *self = user_data;
+    g_autoptr(GListModel) files =
+        gtk_file_dialog_open_multiple_finish(GTK_FILE_DIALOG(src), res, NULL);
+    guint n = files ? g_list_model_get_n_items(files) : 0, i;
+    guint ok = 0;
+    g_autofree char *first = NULL;
+    g_autofree char *err = NULL;
+
+    for (i = 0; i < n; i++) {
+        g_autoptr(GFile) f = g_list_model_get_item(files, i);
+        g_autofree char *path = g_file_get_path(f);
+        char dest[1024];
+        if (!path)
+            continue;
+        if (intvsession_import_cart_to_sd(self->session, path, dest,
+                                          sizeof dest) == 0) {
+            if (!ok)
+                first = g_path_get_basename(dest);
+            ok++;
+        } else if (!err) {
+            err = g_strdup(intvsession_last_error(self->session));
+        }
+    }
+    if (err) {
+        intv_window_message(self, "Import failed", err);
+    } else if (ok == 1) {
+        g_autofree char *msg = g_strdup_printf(
+            "%s is on the SD host. Boot it from the CONFIG client.", first);
+        intv_window_toast(self, msg);
+    } else if (ok > 1) {
+        g_autofree char *msg = g_strdup_printf(
+            "%u files are on the SD host. Boot them from the CONFIG client.",
+            ok);
+        intv_window_toast(self, msg);
+    }
+    g_object_unref(self);
+}
+
+static void action_import_cart(GSimpleAction *action, GVariant *param,
+                               gpointer user_data)
+{
+    IntvWindow *self = INTV_WINDOW(user_data);
+    GtkFileDialog *dlg = intv_file_dialog(
+        "Import Cartridge to SD", "Cartridge images", CART_EXTS);
+    (void)action;
+    (void)param;
+    gtk_file_dialog_open_multiple(dlg, GTK_WINDOW(self), NULL, on_cart_chosen,
+                                  g_object_ref(self));
+    g_object_unref(dlg);
+}
+
+static void action_open_sd(GSimpleAction *action, GVariant *param,
+                           gpointer user_data)
+{
+    IntvWindow *self = INTV_WINDOW(user_data);
+    const char *path = intvsession_sd_path(self->session);
+    g_autoptr(GFile) dir = path ? g_file_new_for_path(path) : NULL;
+    GtkFileLauncher *launcher;
+    (void)action;
+    (void)param;
+    if (!dir)
+        return;
+    g_mkdir_with_parents(path, 0755);
+    launcher = gtk_file_launcher_new(dir);
+    gtk_file_launcher_launch(launcher, GTK_WINDOW(self), NULL, NULL, NULL);
+    g_object_unref(launcher);
 }
 
 /* ---- keyboard capture ---------------------------------------------------
@@ -308,11 +603,98 @@ static void action_about(GSimpleAction *action, GVariant *param,
         NULL);
 }
 
+/* Renders a widget the way GTK would draw it, with a renderer of its own
+ * rather than the window's (on Broadway or a headless CI there is no
+ * renderer that can read back), and saves it as a PNG. */
+static gboolean save_widget_png(GtkWidget *widget, const char *path)
+{
+    int w = gtk_widget_get_width(widget), h = gtk_widget_get_height(widget);
+    GdkPaintable *paintable;
+    GtkSnapshot *snapshot;
+    GskRenderNode *node;
+    GskRenderer *renderer;
+    GdkTexture *texture;
+    GError *err = NULL;
+    gboolean ok;
+
+    if (w <= 0 || h <= 0)
+        return FALSE;
+    paintable = gtk_widget_paintable_new(widget);
+    snapshot = gtk_snapshot_new();
+    gdk_paintable_snapshot(paintable, snapshot, w, h);
+    node = gtk_snapshot_free_to_node(snapshot);
+    g_object_unref(paintable);
+    if (!node)
+        return FALSE;
+
+    renderer = gsk_cairo_renderer_new();
+#if GTK_CHECK_VERSION(4, 14, 0)
+    ok = gsk_renderer_realize_for_display(renderer, gtk_widget_get_display(widget), &err);
+#else
+    ok = gsk_renderer_realize(renderer, NULL, &err);
+#endif
+    if (!ok) {
+        g_warning("screenshot: %s", err ? err->message : "no renderer");
+        g_clear_error(&err);
+        g_object_unref(renderer);
+        gsk_render_node_unref(node);
+        return FALSE;
+    }
+    texture = gsk_renderer_render_texture(renderer, node, &GRAPHENE_RECT_INIT(0, 0, w, h));
+    ok = gdk_texture_save_to_png(texture, path);
+    g_object_unref(texture);
+    gsk_renderer_unrealize(renderer);
+    g_object_unref(renderer);
+    gsk_render_node_unref(node);
+    return ok;
+}
+
+/* The main window to <file>.png and every other visible window of the app
+ * to <file>-<title>.png, then quit. */
+static gboolean screenshot_tick(gpointer user_data)
+{
+    IntvWindow *self = user_data;
+    const char *path = g_getenv("INTV_SCREENSHOT");
+    g_autofree char *stem = NULL;
+    GListModel *tops = gtk_window_get_toplevels();
+    guint i, n = g_list_model_get_n_items(tops);
+
+    self->shot_id = 0;
+    stem = g_str_has_suffix(path, ".png") ? g_strndup(path, strlen(path) - 4) : g_strdup(path);
+    for (i = 0; i < n; i++) {
+        GtkWidget *win = g_list_model_get_item(tops, i);
+        g_autofree char *file = NULL;
+        if (!gtk_widget_get_visible(win)) {
+            g_object_unref(win);
+            continue;
+        }
+        if (win == GTK_WIDGET(self)) {
+            file = g_strdup_printf("%s.png", stem);
+        } else {
+            const char *title = gtk_window_get_title(GTK_WINDOW(win));
+            g_autofree char *slug = g_ascii_strdown(title ? title : "window", -1);
+            g_strdelimit(slug, " /", '-');
+            file = g_strdup_printf("%s-%s.png", stem, slug);
+        }
+        if (save_widget_png(win, file))
+            g_print("screenshot: %s\n", file);
+        else
+            g_printerr("screenshot: could not save %s\n", file);
+        g_object_unref(win);
+    }
+    g_application_quit(g_application_get_default());
+    return G_SOURCE_REMOVE;
+}
+
 /* ---- construction ------------------------------------------------------- */
 
 static const GActionEntry win_actions[] = {
     {.name = "keypad", .activate = action_keypad},
     {.name = "ecs-keyboard", .activate = action_ecs_keyboard},
+    {.name = "import-bios", .activate = action_import_bios},
+    {.name = "import-bios-folder", .activate = action_import_bios_folder},
+    {.name = "import-cart", .activate = action_import_cart},
+    {.name = "open-sd", .activate = action_open_sd},
     {.name = "reset-game", .activate = action_reset_game},
     {.name = "reset-config", .activate = action_reset_config},
     {.name = "fujinet-config", .activate = action_fujinet_config},
@@ -328,6 +710,10 @@ static void intv_window_dispose(GObject *object)
     if (self->sysact_timer_id) {
         g_source_remove(self->sysact_timer_id);
         self->sysact_timer_id = 0;
+    }
+    if (self->shot_id) {
+        g_source_remove(self->shot_id);
+        self->shot_id = 0;
     }
     G_OBJECT_CLASS(intv_window_parent_class)->dispose(object);
 }
@@ -345,9 +731,18 @@ static void intv_window_init(IntvWindow *self)
 static GMenu *build_menu(void)
 {
     GMenu *menu = g_menu_new();
+    GMenu *machine = g_menu_new();
     GMenu *view = g_menu_new();
     GMenu *fujinet = g_menu_new();
     GMenu *tail = g_menu_new();
+
+    g_menu_append(machine, "Import BIOS\xe2\x80\xa6", "win.import-bios");
+    g_menu_append(machine, "Import BIOS from a Folder\xe2\x80\xa6",
+                  "win.import-bios-folder");
+    g_menu_append(machine, "Import Cartridge to SD\xe2\x80\xa6",
+                  "win.import-cart");
+    g_menu_append(machine, "Open SD Folder", "win.open-sd");
+    g_menu_append_section(menu, "Machine", G_MENU_MODEL(machine));
 
     g_menu_append(view, "Keypad (F9)", "win.keypad");
     g_menu_append(view, "ECS Keyboard (F10)", "win.ecs-keyboard");
@@ -364,6 +759,7 @@ static GMenu *build_menu(void)
     g_menu_append(tail, "About FujiNet Go Intv", "win.about");
     g_menu_append_section(menu, NULL, G_MENU_MODEL(tail));
 
+    g_object_unref(machine);
     g_object_unref(view);
     g_object_unref(fujinet);
     g_object_unref(tail);
@@ -427,7 +823,10 @@ GtkWidget *intv_window_new(AdwApplication *app, intvsession *session)
 
     self->display = INTV_DISPLAY(intv_display_new(session));
     self->toasts = ADW_TOAST_OVERLAY(adw_toast_overlay_new());
-    adw_toast_overlay_set_child(self->toasts, GTK_WIDGET(self->display));
+    self->stack = GTK_STACK(gtk_stack_new());
+    gtk_stack_add_named(self->stack, GTK_WIDGET(self->display), "display");
+    gtk_stack_add_named(self->stack, nobios_page(self), "nobios");
+    adw_toast_overlay_set_child(self->toasts, GTK_WIDGET(self->stack));
 
     view = ADW_TOOLBAR_VIEW(adw_toolbar_view_new());
     adw_toolbar_view_add_top_bar(view, GTK_WIDGET(header));
@@ -449,6 +848,7 @@ GtkWidget *intv_window_new(AdwApplication *app, intvsession *session)
 
     self->sysact_timer_id = g_timeout_add(100, sysact_drain_tick, self);
 
+    intv_window_show_page(self);
     gtk_widget_grab_focus(GTK_WIDGET(self->display));
 
     /* Developer affordance, matching the sibling repos: open the debugger
@@ -457,5 +857,20 @@ GtkWidget *intv_window_new(AdwApplication *app, intvsession *session)
         intv_debugger_show(GTK_WINDOW(self), session);
     if (getenv("INTV_OPEN_KEYPAD"))
         intv_keypad_window_toggle(GTK_WINDOW(self), session);
+    if (getenv("INTV_OPEN_ECS"))
+        intv_ecskbd_window_toggle(GTK_WINDOW(self), session);
+    if (getenv("INTV_OPEN_SETTINGS"))
+        intv_prefs_show(self, session);
+    /* INTV_SCREENSHOT=<file.png>: every open window, saved after
+     * INTV_SCREENSHOT_DELAY_MS (3 s), then quit. */
+    {
+        const char *env = g_getenv("INTV_SCREENSHOT");
+        if (env && *env) {
+            const char *delay = g_getenv("INTV_SCREENSHOT_DELAY_MS");
+            self->shot_id = g_timeout_add(
+                delay && *delay ? (guint)atoi(delay) : 3000, screenshot_tick,
+                self);
+        }
+    }
     return GTK_WIDGET(self);
 }

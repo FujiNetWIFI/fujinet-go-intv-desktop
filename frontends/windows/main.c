@@ -2,15 +2,16 @@
  * FujiNet Go Intv -- native Win32 frontend.
  *
  * Mirrors the GNOME/KDE frontends over the shared intvsession API: a
- * GDI-blitted display letterboxed to 4:3, full keyboard mapping, a menu
- * bar, and the FujiNet configuration (default browser) and console-log
- * windows, plus clickable keypad and ECS keyboard windows.
+ * Direct3D 11 display (display.c; GDI fallback) letterboxed to 4:3, full
+ * keyboard mapping, a menu bar, importing of the BIOS and of cartridges for
+ * the SD host, and the FujiNet configuration (default browser) and
+ * console-log windows, plus clickable keypad and ECS keyboard windows.
  *
- * Unlike the CoCo/MSX Windows frontends, there is no vsync-feeding present
- * thread here: intvsession has no notify_vsync to feed (jzIntv's own paced
- * thread already governs itself to NTSC/PAL speed independent of any
- * frontend -- see frontends/gnome/display.c's own comment on this), so a
- * plain WM_TIMER drives the repaint poll instead.
+ * There is no vsync-feeding present thread to drive: intvsession has no
+ * notify_vsync (jzIntv's own paced thread already governs itself to
+ * NTSC/PAL speed independent of any frontend -- see frontends/gnome/
+ * display.c's own comment on this), so display.c's render thread simply
+ * shows the newest frame at every refresh.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -25,12 +26,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <commctrl.h>
+
 #include "intvsession.h"
 #include "debugger/dbg_window.h"
+#include "display.h"
+#include "import.h"
 #include "key_forward.h"
 #include "ecskbd/ecskbd_window.h"
 #include "keypad/keypad_window.h"
 #include "resource.h"
+#include "roms.h"
+#include "win_common.h"
 
 static intvsession *g_session;
 static HWND g_hwnd;
@@ -38,197 +45,159 @@ static HMENU g_menu;
 static HWND g_log_window;
 static HWND g_log_edit;
 
-static uint32_t g_frame[INTVSESSION_FB_WIDTH * INTVSESSION_FB_HEIGHT];
-static uint64_t g_serial;
-static int g_have_frame;
+static HWND g_display;
+static HWND g_bios_files_btn, g_bios_folder_btn;
+static HFONT g_ui_font, g_title_font;
+static HICON g_big_icon;
+static int g_dpi = 96;
 
-/* Off-screen buffer the frame is composed into, blitted to the window in one
- * BitBlt -- see paint(). Sized to the client rect and rebuilt only when that
- * changes. */
-static HDC     g_back_dc;
-static HBITMAP g_back_bmp;
-static HBITMAP g_back_old;
-static int     g_back_w, g_back_h;
-static int     g_back_dirty;   /* the picture in it is stale (new frame, or
-                                * the buffer was just created/resized) */
-static RECT    g_pic;          /* where the picture sits in the back buffer */
+#define S(v) intv_scale((v), g_dpi)
 
 static int g_fullscreen;
 static WINDOWPLACEMENT g_prev_placement = {sizeof(g_prev_placement)};
 
-#define TIMER_REPAINT 1
 #define TIMER_SYSACT  3 /* 2 is LOG_TIMER_ID, on the separate log window */
 
-/* ---- display ---------------------------------------------------------------
- * INTVSESSION_FB_WIDTH x _HEIGHT is fixed (160x200, the STIC's own raw
- * pixel geometry), but 4:3 is the shape to letterbox into regardless --
- * the STIC's pixels are not square, and real Intellivision video (like
- * jzIntv's own default display) fills a standard NTSC 4:3 picture. Matches
- * the reasoning in frontends/gnome/display.c exactly. */
+static void start_machine(void);
+static void refresh_settings_ecs(void);
+static void show_roms(void);
 
-static RECT dest_rect(int cw, int ch)
+/* ---- the No-BIOS page ------------------------------------------------------
+ * The Executive and Graphics ROMs are Mattel's and are not part of the app.
+ * Until they are imported the display child is hidden and the main window
+ * shows this page instead: an icon, a title, a line of explanation and the
+ * two Import buttons. The picture itself is display.c (Direct3D 11, 4:3). */
+
+typedef struct {
+    RECT icon, title, desc, files, folder;
+} nobios_geom;
+
+static const char k_nobios_title[] = "No Intellivision BIOS";
+static const char k_nobios_text[] =
+    "The Intellivision Executive and Graphics ROMs are not part of the app. "
+    "Import the ones you have \xe2\x80\x94 exec.bin and grom.bin, a zip such as "
+    "MAME's intv set, or a folder \xe2\x80\x94 and the Intellivision starts.";
+
+static int text_height(HFONT font, const char *utf8, int width)
 {
-    const double aspect = 4.0 / 3.0;
-    double dw, dh;
+    wchar_t *w = intv_wide_dup(utf8);
+    HDC dc = GetDC(g_hwnd);
+    HGDIOBJ old = SelectObject(dc, font);
     RECT r;
-
-    if ((double)cw / ch > aspect) {
-        dh = ch;
-        dw = ch * aspect;
-    } else {
-        dw = cw;
-        dh = cw / aspect;
-    }
-    r.left = (LONG)((cw - dw) / 2);
-    r.top = (LONG)((ch - dh) / 2);
-    r.right = r.left + (LONG)dw;
-    r.bottom = r.top + (LONG)dh;
-    return r;
+    SetRect(&r, 0, 0, width, 0);
+    if (w)
+        DrawTextW(dc, w, -1, &r, DT_CALCRECT | DT_WORDBREAK | DT_CENTER | DT_NOPREFIX);
+    SelectObject(dc, old);
+    ReleaseDC(g_hwnd, dc);
+    free(w);
+    return r.bottom - r.top;
 }
 
-/* Describes g_frame to GDI. Constant for the life of the process --
- * INTVSESSION_FB_WIDTH/_HEIGHT are the STIC's fixed geometry -- so it is
- * built once rather than on the stack of every paint. */
-static const BITMAPINFO *frame_bmi(void)
+static int button_width(const char *text)
 {
-    static BITMAPINFO bmi;
-    if (bmi.bmiHeader.biSize == 0) {
-        bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
-        bmi.bmiHeader.biWidth = INTVSESSION_FB_WIDTH;
-        bmi.bmiHeader.biHeight = -INTVSESSION_FB_HEIGHT; /* top-down */
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-    }
-    return &bmi;
+    HDC dc = GetDC(g_hwnd);
+    HGDIOBJ old = SelectObject(dc, g_ui_font);
+    SIZE sz = { 0, 0 };
+    GetTextExtentPoint32A(dc, text, (int)strlen(text), &sz);
+    SelectObject(dc, old);
+    ReleaseDC(g_hwnd, dc);
+    return sz.cx + S(28) < S(80) ? S(80) : sz.cx + S(28);
 }
 
-static void free_backbuffer(void)
+static void nobios_layout(const RECT *area, nobios_geom *g)
 {
-    if (g_back_dc) {
-        SelectObject(g_back_dc, g_back_old);
-        DeleteDC(g_back_dc);
-        g_back_dc = NULL;
-        g_back_old = NULL;
-    }
-    if (g_back_bmp) {
-        DeleteObject(g_back_bmp);
-        g_back_bmp = NULL;
-    }
-    g_back_w = g_back_h = 0;
+    const int aw = area->right - area->left, ah = area->bottom - area->top;
+    const int width = aw - S(48) < S(560) ? aw - S(48) : S(560);
+    const int icon = S(64), title_h = text_height(g_title_font, k_nobios_title, width);
+    const int desc_h = text_height(g_ui_font, k_nobios_text, width);
+    const int bw1 = button_width("Import BIOS..."), bw2 = button_width("Import a Folder...");
+    const int row_w = bw1 + S(12) + bw2, bh = S(32);
+    const int total = icon + S(16) + title_h + S(10) + desc_h + S(24) + bh;
+    const int x0 = area->left + (aw - width) / 2, cx = area->left + aw / 2;
+    int y = area->top + (ah - total) / 2;
+
+    if (y < area->top + S(8))
+        y = area->top + S(8);
+    SetRect(&g->icon, cx - icon / 2, y, cx + icon / 2, y + icon);
+    y += icon + S(16);
+    SetRect(&g->title, x0, y, x0 + width, y + title_h);
+    y += title_h + S(10);
+    SetRect(&g->desc, x0, y, x0 + width, y + desc_h);
+    y += desc_h + S(24);
+    SetRect(&g->files, cx - row_w / 2, y, cx - row_w / 2 + bw1, y + bh);
+    SetRect(&g->folder, g->files.right + S(12), y, g->files.right + S(12) + bw2, y + bh);
 }
 
-/* Ensures the off-screen buffer matches the client size. Returns 0 if it
- * could not be created, in which case paint() falls back to drawing straight
- * to the window (correct, just flicker-prone -- better than a blank window). */
-static int ensure_backbuffer(HDC ref, int w, int h)
+static void paint_nobios(HDC dc, const RECT *area)
 {
-    if (w <= 0 || h <= 0)
-        return 0;
-    if (g_back_dc && g_back_w == w && g_back_h == h)
-        return 1;
+    nobios_geom g;
+    wchar_t *w;
 
-    free_backbuffer();
-    g_back_dc = CreateCompatibleDC(ref);
-    if (!g_back_dc)
-        return 0;
-    g_back_bmp = CreateCompatibleBitmap(ref, w, h);
-    if (!g_back_bmp) {
-        DeleteDC(g_back_dc);
-        g_back_dc = NULL;
-        return 0;
+    nobios_layout(area, &g);
+    FillRect(dc, area, GetSysColorBrush(COLOR_WINDOW));
+    SetBkMode(dc, TRANSPARENT);
+    if (g_big_icon)
+        DrawIconEx(dc, g.icon.left, g.icon.top, g_big_icon,
+                   g.icon.right - g.icon.left, g.icon.bottom - g.icon.top, 0,
+                   NULL, DI_NORMAL);
+    SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
+    SelectObject(dc, g_title_font);
+    if ((w = intv_wide_dup(k_nobios_title)) != NULL) {
+        DrawTextW(dc, w, -1, &g.title, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+        free(w);
     }
-    g_back_old = (HBITMAP)SelectObject(g_back_dc, g_back_bmp);
-    SetStretchBltMode(g_back_dc, COLORONCOLOR); /* once, not per paint */
-    g_back_w = w;
-    g_back_h = h;
-    g_back_dirty = 1; /* nothing has been drawn into it yet */
-    return 1;
+    SelectObject(dc, g_ui_font);
+    SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+    if ((w = intv_wide_dup(k_nobios_text)) != NULL) {
+        DrawTextW(dc, w, -1, &g.desc, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+        free(w);
+    }
 }
 
-/* Redraws the picture and its letterbox bars into the back buffer. Only
- * called when something actually changed -- a repaint caused by the window
- * being uncovered or moved reuses what is already there, which is the whole
- * point of keeping a back buffer rather than a bare double-buffer swap. */
-static void compose(int w, int h)
+/* The picture fills the client while there is a BIOS; else the page. */
+static void layout(void)
 {
-    RECT bar;
+    RECT c;
 
-    g_pic = dest_rect(w, h);
-
-    /* Only the bars, not the whole client area: the picture region is about
-     * to be overwritten anyway, and on a 4:3 window there are no bars at all.
-     * At most one pair is non-empty (dest_rect pillarboxes or letterboxes,
-     * never both), and FillRect ignores an empty rect. */
-    bar.left = 0; bar.top = 0; bar.right = w; bar.bottom = g_pic.top;
-    FillRect(g_back_dc, &bar, (HBRUSH)GetStockObject(BLACK_BRUSH));
-    bar.top = g_pic.bottom; bar.bottom = h;
-    FillRect(g_back_dc, &bar, (HBRUSH)GetStockObject(BLACK_BRUSH));
-    bar.top = 0; bar.bottom = h; bar.left = 0; bar.right = g_pic.left;
-    FillRect(g_back_dc, &bar, (HBRUSH)GetStockObject(BLACK_BRUSH));
-    bar.left = g_pic.right; bar.right = w;
-    FillRect(g_back_dc, &bar, (HBRUSH)GetStockObject(BLACK_BRUSH));
-
-    if (g_have_frame)
-        StretchDIBits(g_back_dc, g_pic.left, g_pic.top,
-                      g_pic.right - g_pic.left, g_pic.bottom - g_pic.top,
-                      0, 0, INTVSESSION_FB_WIDTH, INTVSESSION_FB_HEIGHT,
-                      g_frame, frame_bmi(), DIB_RGB_COLORS, SRCCOPY);
-    else
-        FillRect(g_back_dc, &g_pic, (HBRUSH)GetStockObject(BLACK_BRUSH));
-}
-
-/* WHY THE BACK BUFFER: this used to FillRect the whole client area black and
- * then StretchDIBits the picture over it, both straight onto the window DC --
- * i.e. straight into the surface DWM composites from. GDI batches, and DWM
- * samples that surface on its own vsync, independently of this thread. Sample
- * between the fill and the blit and the composited frame is entirely black:
- * rare per frame, near-certain over a few minutes of play, and reported as
- * "the screen occasionally goes black for a frame or two". Composing
- * off-screen and blitting once leaves no intermediate state for DWM to catch.
- *
- * It is also much less work. A repaint with no new frame (uncover, move,
- * another window dragged across) now costs one BitBlt instead of a fresh
- * 160x200 -> client-size software stretch. */
-static void paint(HWND hwnd)
-{
-    PAINTSTRUCT ps;
-    HDC hdc = BeginPaint(hwnd, &ps);
-    RECT client;
-    int w, h;
-
-    GetClientRect(hwnd, &client);
-    w = client.right;
-    h = client.bottom;
-
-    if (!ensure_backbuffer(hdc, w, h)) {
-        /* No back buffer to be had. Draw directly; flicker beats blank. */
-        FillRect(hdc, &client, (HBRUSH)GetStockObject(BLACK_BRUSH));
-        if (g_have_frame) {
-            RECT d = dest_rect(w, h);
-            SetStretchBltMode(hdc, COLORONCOLOR);
-            StretchDIBits(hdc, d.left, d.top, d.right - d.left,
-                          d.bottom - d.top, 0, 0, INTVSESSION_FB_WIDTH,
-                          INTVSESSION_FB_HEIGHT, g_frame, frame_bmi(),
-                          DIB_RGB_COLORS, SRCCOPY);
-        }
-        EndPaint(hwnd, &ps);
+    if (!g_hwnd)
         return;
+    GetClientRect(g_hwnd, &c);
+    if (g_display)
+        MoveWindow(g_display, 0, 0, c.right, c.bottom, TRUE);
+    if (g_bios_files_btn && !intvsession_has_system_roms(g_session)) {
+        nobios_geom g;
+        nobios_layout(&c, &g);
+        MoveWindow(g_bios_files_btn, g.files.left, g.files.top,
+                   g.files.right - g.files.left, g.files.bottom - g.files.top, TRUE);
+        MoveWindow(g_bios_folder_btn, g.folder.left, g.folder.top,
+                   g.folder.right - g.folder.left, g.folder.bottom - g.folder.top, TRUE);
     }
+    InvalidateRect(g_hwnd, NULL, FALSE);
+}
 
-    if (g_back_dirty) {
-        compose(w, h);
-        g_back_dirty = 0;
+static void show_page(void)
+{
+    const int bios = intvsession_has_system_roms(g_session);
+
+    if (g_display)
+        ShowWindow(g_display, bios ? SW_SHOW : SW_HIDE);
+    if (g_bios_files_btn) {
+        ShowWindow(g_bios_files_btn, bios ? SW_HIDE : SW_SHOW);
+        ShowWindow(g_bios_folder_btn, bios ? SW_HIDE : SW_SHOW);
     }
+    layout();
+}
 
-    /* Only the invalid region -- BeginPaint has already clipped to it, but
-     * blitting just those pixels keeps a partial repaint cheap. */
-    BitBlt(hdc, ps.rcPaint.left, ps.rcPaint.top,
-           ps.rcPaint.right - ps.rcPaint.left,
-           ps.rcPaint.bottom - ps.rcPaint.top,
-           g_back_dc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
-
-    EndPaint(hwnd, &ps);
+static void make_fonts(void)
+{
+    if (g_ui_font) DeleteObject(g_ui_font);
+    if (g_title_font) DeleteObject(g_title_font);
+    g_ui_font = intv_make_font(g_dpi, 0, FW_NORMAL, NULL);
+    g_title_font = intv_make_font(g_dpi, 22, FW_BOLD, NULL);
+    if (g_bios_files_btn)
+        SendMessageW(g_bios_files_btn, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+    if (g_bios_folder_btn)
+        SendMessageW(g_bios_folder_btn, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
 }
 
 /* The VK -> keysym translation and the reserved-hotkey table live in
@@ -459,10 +428,35 @@ static void restart_session(void)
 {
     intvsession_start_opts opts;
     intvsession_stop(g_session);
+    show_page();
+    if (!intvsession_has_system_roms(g_session))
+        return; /* nothing to boot: the No-BIOS page is up */
     intvsession_default_opts(g_session, &opts);
     if (intvsession_start(g_session, &opts) != 0)
         MessageBoxA(g_hwnd, intvsession_last_error(g_session),
                     "FujiNet Go Intv", MB_ICONWARNING);
+}
+
+/* After a BIOS import: the picture replaces the page, and the machine is
+ * started -- or stopped and started again, so a session that was running
+ * (with whatever ROMs it had) boots with the new ones. */
+static void start_machine(void)
+{
+    show_page();
+    if (intvsession_has_system_roms(g_session))
+        restart_session();
+}
+
+static void roms_imported(void)
+{
+    start_machine();
+    refresh_settings_ecs();
+}
+
+static void show_roms(void)
+{
+    static const intv_roms_hooks hooks = { roms_imported };
+    intv_roms_show(g_hwnd, g_session, &hooks);
 }
 
 static void reset_to_config(void)
@@ -510,7 +504,18 @@ static void drain_sysactions(void)
  */
 
 static HWND g_settings_window;
+static HWND g_settings_ecs_combo, g_settings_ecs_note;
 static int g_settings_dirty;
+
+/* The ECS option follows ecs.bin: enabled only once it has been imported. */
+static void refresh_settings_ecs(void)
+{
+    const int have = intvsession_has_ecs_rom(g_session);
+    if (!g_settings_window)
+        return;
+    EnableWindow(g_settings_ecs_combo, have);
+    ShowWindow(g_settings_ecs_note, have ? SW_HIDE : SW_SHOW);
+}
 
 static void fill_combo(HWND combo, const char *(*name_fn)(int), int cur)
 {
@@ -652,6 +657,9 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp,
                 }
             }
             return 0;
+        case IDC_SET_ROMS:
+            show_roms();
+            return 0;
         case IDC_SET_ECS_KEYBOARD: {
             int on = SendMessageA(GetDlgItem(hwnd, IDC_SET_ECS_KEYBOARD),
                                   BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -689,6 +697,7 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp,
     case WM_DESTROY:
         KillTimer(hwnd, IDT_SETTINGS_PADS);
         g_settings_window = NULL;
+        g_settings_ecs_combo = g_settings_ecs_note = NULL;
         if (g_settings_dirty) {
             g_settings_dirty = 0;
             restart_session();
@@ -740,13 +749,15 @@ static void show_settings(HINSTANCE inst)
               intvsession_get_int(g_session, "ecs", INTVSESSION_HW_AUTO));
     SendMessageA(combo, WM_SETFONT, (WPARAM)font, TRUE);
     y += 28;
-    if (!have_ecs_rom) {
-        CreateWindowExA(0, "STATIC",
-                        "ecs.bin not found in the ROM directory",
-                        WS_CHILD | WS_VISIBLE, 140, y, 240, 18,
-                        g_settings_window, NULL, inst, NULL);
-        y += 20;
-    }
+    /* Always laid out, shown only while ecs.bin is missing: importing it
+     * (System ROMs) refreshes both this and the combo above. */
+    g_settings_ecs_note = CreateWindowExA(
+        0, "STATIC", "ecs.bin not found in the ROM directory",
+        WS_CHILD | (have_ecs_rom ? 0 : WS_VISIBLE), 140, y, 300, 18,
+        g_settings_window, NULL, inst, NULL);
+    SendMessageA(g_settings_ecs_note, WM_SETFONT, (WPARAM)font, TRUE);
+    g_settings_ecs_combo = combo;
+    y += 20;
 
     CreateWindowExA(0, "STATIC", "Intellivoice:", WS_CHILD | WS_VISIBLE, 16,
                     y, 120, 20, g_settings_window, NULL, inst, NULL);
@@ -824,6 +835,13 @@ static void show_settings(HINSTANCE inst)
                         (intvsession_pad_side)side));
     SendMessageA(combo, WM_SETFONT, (WPARAM)font, TRUE);
 
+    y += 36;
+    check = CreateWindowExA(0, "BUTTON", "System ROMs...",
+                            WS_CHILD | WS_VISIBLE | WS_TABSTOP, 16, y, 160, 28,
+                            g_settings_window, (HMENU)(INT_PTR)IDC_SET_ROMS,
+                            inst, NULL);
+    SendMessageA(check, WM_SETFONT, (WPARAM)font, TRUE);
+
     fill_pad_list(g_settings_window, -1);
     SetTimer(g_settings_window, IDT_SETTINGS_PADS, 1000, NULL);
 
@@ -832,15 +850,13 @@ static void show_settings(HINSTANCE inst)
 
 /* ---- fullscreen ---------------------------------------------------------------- */
 
-/* SWP_FRAMECHANGED rebuilds the window frame, and the client area is
- * undefined until something paints it -- with the repaint timer up to 8 ms
- * away, that gap is visible as a black flash on the way into fullscreen and
- * again on the way out. Repaint synchronously instead of waiting for the
- * tick. */
+/* SWP_FRAMECHANGED rebuilds the window frame and the client size changes
+ * with it: resize the picture to the new client at once (the render thread
+ * follows WM_SIZE on the display child) rather than waiting for a message
+ * that may have been coalesced. */
 static void fullscreen_repaint(HWND hwnd)
 {
-    g_back_dirty = 1; /* the client size changed, so the letterbox did too */
-    InvalidateRect(hwnd, NULL, FALSE);
+    layout();
     UpdateWindow(hwnd);
 }
 
@@ -881,10 +897,20 @@ static void toggle_fullscreen(HWND hwnd)
 static HMENU build_menu(void)
 {
     HMENU bar = CreateMenu();
+    HMENU machine = CreatePopupMenu();
     HMENU fujinet = CreatePopupMenu();
     HMENU view = CreatePopupMenu();
     HMENU settings = CreatePopupMenu();
     HMENU help = CreatePopupMenu();
+
+    AppendMenuA(machine, MF_STRING, IDM_IMPORT_BIOS, "Import &BIOS...");
+    AppendMenuA(machine, MF_STRING, IDM_IMPORT_BIOS_DIR,
+                "Import BIOS from a &Folder...");
+    AppendMenuA(machine, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(machine, MF_STRING, IDM_IMPORT_SD,
+                "&Import Cartridge to SD...");
+    AppendMenuA(machine, MF_STRING, IDM_OPEN_SD, "Open &SD Folder");
+    AppendMenuA(bar, MF_POPUP, (UINT_PTR)machine, "&Machine");
 
     AppendMenuA(fujinet, MF_STRING, IDM_RESET_GAME, "Reset Game\tBackspace");
     AppendMenuA(fujinet, MF_STRING, IDM_RESET_CONFIG, "Reset to CONFIG\tCtrl+R");
@@ -899,6 +925,7 @@ static HMENU build_menu(void)
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)view, "&View");
 
     AppendMenuA(settings, MF_STRING, IDM_SETTINGS, "Settings...");
+    AppendMenuA(settings, MF_STRING, IDM_ROMS, "System ROMs...");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)settings, "&Settings");
 
     AppendMenuA(help, MF_STRING, IDM_ABOUT, "About FujiNet Go Intv");
@@ -911,45 +938,42 @@ static HMENU build_menu(void)
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
-    case WM_PAINT:
-        paint(hwnd);
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        if (!intvsession_has_system_roms(g_session)) {
+            RECT c;
+            GetClientRect(hwnd, &c);
+            paint_nobios(hdc, &c);
+        }
+        EndPaint(hwnd, &ps);
         return 0;
+    }
     case WM_ERASEBKGND:
-        return 1; /* paint() covers every pixel; never erase underneath it */
+        return 1; /* the picture or the page covers the client */
     case WM_SIZE:
-        /* The letterbox geometry moved, so the back buffer's contents are
-         * stale as well as the wrong size (ensure_backbuffer would set
-         * g_back_dirty itself on a resize, but not for a restore to the same
-         * size after a minimize). */
-        g_back_dirty = 1;
-        InvalidateRect(hwnd, NULL, FALSE);
+        layout();
         return 0;
     case WM_DPICHANGED:
         /* PerMonitorV2 is declared in app.manifest.in, which obliges the app
          * to take the suggested rect when the window moves to a monitor at a
-         * different scale. Unhandled, the window kept its old size while
-         * Windows rebuilt the redirection surface underneath it -- a
-         * reliable way to get a black or garbled frame mid-drag. */
+         * different scale. */
         {
             const RECT *sug = (const RECT *)lp;
+            g_dpi = HIWORD(wp);
+            make_fonts();
+            if (g_big_icon)
+                DestroyIcon(g_big_icon);
+            g_big_icon = (HICON)LoadImageA(GetModuleHandleA(NULL),
+                                           MAKEINTRESOURCEA(IDI_APPICON),
+                                           IMAGE_ICON, S(64), S(64), 0);
             SetWindowPos(hwnd, NULL, sug->left, sug->top,
                         sug->right - sug->left, sug->bottom - sug->top,
                         SWP_NOZORDER | SWP_NOACTIVATE);
-            g_back_dirty = 1;
-            InvalidateRect(hwnd, NULL, FALSE);
+            layout();
         }
         return 0;
     case WM_TIMER:
-        if (wp == TIMER_REPAINT) {
-            if (intvsession_copy_frame(g_session, g_frame, &g_serial)) {
-                g_have_frame = 1;
-                g_back_dirty = 1;
-                /* Only the picture: the bars are unchanged, and repainting
-                 * them every frame is work the compositor has to carry. */
-                InvalidateRect(hwnd, g_back_dc ? &g_pic : NULL, FALSE);
-            }
-            return 0;
-        }
         if (wp == TIMER_SYSACT) {
             drain_sysactions();
             return 0;
@@ -987,21 +1011,51 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDM_SETTINGS:
             show_settings((HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE));
             break;
-        case IDM_ABOUT:
-            MessageBoxA(hwnd,
-                        "FujiNet Go Intv\n"
-                        "Self-contained Mattel Intellivision with built-in "
-                        "FujiNet.\n"
-                        "Copyright (C) 2026 Thomas Cherryhomes\n"
-                        "GPL-3.0-or-later",
-                        "About FujiNet Go Intv", MB_ICONINFORMATION);
+        case IDM_ABOUT: {
+            char text[512];
+            MSGBOXPARAMSA mb;
+            snprintf(text, sizeof(text),
+                     "FujiNet Go Intv\n"
+                     "Self-contained Mattel Intellivision with built-in "
+                     "FujiNet.\n"
+                     "Copyright (C) 2026 Thomas Cherryhomes\n"
+                     "GPL-3.0-or-later\n\nDisplay: %s",
+                     intv_display_renderer());
+            memset(&mb, 0, sizeof(mb));
+            mb.cbSize = sizeof(mb);
+            mb.hwndOwner = hwnd;
+            mb.hInstance = (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE);
+            mb.lpszText = text;
+            mb.lpszCaption = "About FujiNet Go Intv";
+            mb.dwStyle = MB_OK | MB_USERICON;
+            mb.lpszIcon = MAKEINTRESOURCEA(IDI_APPICON);
+            MessageBoxIndirectA(&mb);
             break;
-        case IDM_EXIT: DestroyWindow(hwnd); break;
+        }
+        case IDM_IMPORT_BIOS:
+        case IDC_BIOS_FILES:
+            if (intv_import_bios(hwnd, g_session, 0, 0) > 0)
+                start_machine();
+            break;
+        case IDM_IMPORT_BIOS_DIR:
+        case IDC_BIOS_FOLDER:
+            if (intv_import_bios(hwnd, g_session, 1, 0) > 0)
+                start_machine();
+            break;
+        case IDM_IMPORT_SD: intv_import_carts(hwnd, g_session); break;
+        case IDM_OPEN_SD:   intv_open_sd_folder(hwnd, g_session); break;
+        case IDM_ROMS:      show_roms(); break;
+        case IDM_EXIT: PostMessage(hwnd, WM_CLOSE, 0, 0); break;
         default: break;
         }
         return 0;
+    case WM_CLOSE:
+        /* The render thread may be inside Present, which can send this
+         * window's thread a message: stop it before the window goes. */
+        intv_display_destroy();
+        DestroyWindow(hwnd);
+        return 0;
     case WM_DESTROY:
-        free_backbuffer();
         PostQuitMessage(0);
         return 0;
     }
@@ -1016,6 +1070,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     (void)cmd;
 
     SetProcessDPIAware();
+    InitCommonControls();
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED); /* the folder browser */
 
     g_session = intvsession_new(NULL);
     if (!g_session) {
@@ -1023,7 +1079,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
                     MB_ICONERROR);
         return 1;
     }
-    {
+    /* Without the Executive and Graphics ROMs there is nothing to boot: the
+     * session starts once they are imported (start_machine). */
+    if (intvsession_has_system_roms(g_session)) {
         intvsession_start_opts opts;
         intvsession_default_opts(g_session, &opts);
         if (intvsession_start(g_session, &opts) != 0)
@@ -1037,10 +1095,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     wc.lpfnWndProc = wnd_proc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    /* NULL, not BLACK_BRUSH: paint() covers every pixel of the client area
-     * from its back buffer, so the only thing a class brush can still do is
-     * flash black in the gap Windows erases on its own (a resize exposing new
-     * area, SWP_FRAMECHANGED, a monitor change) before WM_PAINT lands. */
+    /* NULL: the picture (a child window) or the No-BIOS page covers the
+     * client; a class brush could only flash in the gap Windows erases on its
+     * own before they repaint. */
     wc.hbrBackground = NULL;
     wc.lpszClassName = "IntvMainWindow";
     wc.hIcon = LoadIconA(inst, MAKEINTRESOURCEA(IDI_APPICON));
@@ -1049,24 +1106,37 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 
     g_menu = build_menu();
     g_hwnd = CreateWindowExA(0, "IntvMainWindow", "FujiNet Go Intv",
-                             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                             800, 650, NULL, g_menu, inst, NULL);
+                             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                             CW_USEDEFAULT, CW_USEDEFAULT, 800, 650, NULL,
+                             g_menu, inst, NULL);
     if (!g_hwnd)
         return 1;
+    g_dpi = intv_window_dpi(g_hwnd);
+    g_big_icon = (HICON)LoadImageA(inst, MAKEINTRESOURCEA(IDI_APPICON),
+                                   IMAGE_ICON, S(64), S(64), 0);
+    g_bios_files_btn = CreateWindowExA(
+        0, "BUTTON", "Import BIOS...", WS_CHILD | BS_DEFPUSHBUTTON, 0, 0, 10,
+        10, g_hwnd, (HMENU)(INT_PTR)IDC_BIOS_FILES, inst, NULL);
+    g_bios_folder_btn = CreateWindowExA(
+        0, "BUTTON", "Import a Folder...", WS_CHILD | BS_PUSHBUTTON, 0, 0, 10,
+        10, g_hwnd, (HMENU)(INT_PTR)IDC_BIOS_FOLDER, inst, NULL);
+    make_fonts();
+    {
+        /* a 4:3 client, at this monitor's DPI */
+        SIZE outer = intv_outer_size(g_hwnd, S(768), S(576), TRUE);
+        SetWindowPos(g_hwnd, NULL, 0, 0, outer.cx, outer.cy,
+                     SWP_NOZORDER | SWP_NOMOVE | SWP_NOACTIVATE);
+    }
+    g_display = intv_display_create(g_hwnd, g_session);
+    show_page();
     ShowWindow(g_hwnd, show);
 
-    /* Windows' default timer granularity is ~15.6 ms, so a 16 ms repaint
-     * timer beat against the emulator's own 60 Hz publish rate and dropped or
-     * doubled frames on an irregular cycle. It also clamped every sub-frame
-     * sleep jzIntv's rate control asks for (its plat_delay uses a plain
-     * CreateWaitableTimer), so the emulator itself ran in ~15.6 ms steps and
-     * declared dropped frames. One call fixes both, and since Windows 10 2004
-     * it affects only this process. Paired with a poll at half a frame, so a
-     * published frame is never waiting more than ~8 ms -- copy_frame is a
-     * mutex and a serial compare when nothing changed, so the extra ticks are
-     * close to free. */
+    /* Windows' default timer granularity is ~15.6 ms, which clamped every
+     * sub-frame sleep jzIntv's rate control asks for (its plat_delay uses a
+     * plain CreateWaitableTimer), so the emulator itself ran in ~15.6 ms
+     * steps and declared dropped frames. One call fixes it, and since
+     * Windows 10 2004 it affects only this process. */
     timeBeginPeriod(1);
-    SetTimer(g_hwnd, TIMER_REPAINT, 8, NULL);
     SetTimer(g_hwnd, TIMER_SYSACT, 100, NULL);
 
     /* Developer affordances, matching the GNOME frontend's own
@@ -1081,6 +1151,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
      * is no way to drive a menu. */
     if (getenv("INTV_OPEN_SETTINGS"))
         show_settings(inst);
+    if (getenv("INTV_OPEN_ROMS"))
+        show_roms();
 
     while (GetMessageA(&msg, NULL, 0, 0) > 0) {
         if (intv_debugger_pretranslate(&msg))
@@ -1093,7 +1165,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
         DispatchMessageA(&msg);
     }
 
-    KillTimer(g_hwnd, TIMER_REPAINT);
     KillTimer(g_hwnd, TIMER_SYSACT);
     timeEndPeriod(1);
     intvsession_free(g_session);

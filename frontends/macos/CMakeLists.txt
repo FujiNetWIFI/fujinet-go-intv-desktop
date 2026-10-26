@@ -48,6 +48,7 @@ target_link_libraries(fujinet-go-intv-macos PRIVATE
   intv_session
   jzintv_core
   c++
+  z
   "-framework Cocoa"
   "-framework CoreVideo"
   "-framework QuartzCore"

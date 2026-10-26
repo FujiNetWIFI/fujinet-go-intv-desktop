@@ -56,7 +56,7 @@ static int make_dir(const char *path)
 #endif
 }
 
-static int mkdir_p(const char *path)
+int mkdir_p(const char *path)
 {
     char buf[INTV_PATH_MAX];
     char *p;
@@ -74,7 +74,7 @@ static int mkdir_p(const char *path)
     return 0;
 }
 
-static int is_file(const char *path)
+int is_file(const char *path)
 {
     struct stat st;
     return path && *path && stat(path, &st) == 0 && S_ISREG(st.st_mode);
@@ -86,7 +86,7 @@ static int is_dir(const char *path)
     return path && *path && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-static int copy_file(const char *src, const char *dst)
+int copy_file(const char *src, const char *dst)
 {
     FILE *in, *out;
     char buf[65536];
@@ -338,14 +338,6 @@ int paths_provision_fujinet(struct intvsession *s)
     mkdir_p(s->fujinet_sd);
     mkdir_p(s->fujinet_data);
     return 0;
-}
-
-int intvsession_has_system_roms(const intvsession *s)
-{
-    char exec_path[INTV_PATH_MAX], grom_path[INTV_PATH_MAX];
-    snprintf(exec_path, sizeof(exec_path), "%s/exec.bin", s->roms_dir);
-    snprintf(grom_path, sizeof(grom_path), "%s/grom.bin", s->roms_dir);
-    return is_file(exec_path) && is_file(grom_path);
 }
 
 const char *intvsession_roms_path(const intvsession *s)

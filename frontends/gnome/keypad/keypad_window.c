@@ -111,9 +111,9 @@ static void map_highlight(gboolean on)
         GtkWidget *w = g_key_buttons[g_map_target.side][g_map_target.key];
         if (w) {
             if (on)
-                gtk_widget_add_css_class(w, "suggested-action");
+                gtk_widget_add_css_class(w, "intv-accent");
             else
-                gtk_widget_remove_css_class(w, "suggested-action");
+                gtk_widget_remove_css_class(w, "intv-accent");
         }
     } else if (g_map_target.kind == INTVSESSION_MAP_DISC) {
         DiscState *d = g_discs[g_map_target.side];
@@ -125,24 +125,23 @@ static void map_highlight(gboolean on)
         GtkWidget *w = g_sysact_buttons[g_map_target.sysact];
         if (w) {
             if (on)
-                gtk_widget_add_css_class(w, "suggested-action");
+                gtk_widget_add_css_class(w, "intv-accent");
             else
-                gtk_widget_remove_css_class(w, "suggested-action");
+                gtk_widget_remove_css_class(w, "intv-accent");
         }
     }
 }
 
-/* "suggested-action" is libadwaita's own accent style class (used elsewhere
- * for e.g. dialog default buttons) -- reused here rather than defining a
- * custom CSS provider just for this one highlight. */
+/* "intv-accent" is the display-wide CSS class from window.c
+ * (intv_css_install): the icon's dark green with white text. */
 static void set_highlighted(GtkWidget *w, gboolean on)
 {
     if (!w)
         return;
     if (on)
-        gtk_widget_add_css_class(w, "suggested-action");
+        gtk_widget_add_css_class(w, "intv-accent");
     else
-        gtk_widget_remove_css_class(w, "suggested-action");
+        gtk_widget_remove_css_class(w, "intv-accent");
 }
 
 static void map_set_status(const char *text)

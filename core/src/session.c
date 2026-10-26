@@ -187,11 +187,6 @@ const char *intvsession_video_name(int idx)
     return video_names[idx];
 }
 
-int intvsession_has_ecs_rom(const intvsession *s)
-{
-    return intv_host_has_ecs_rom(s->roms_dir);
-}
-
 int intvsession_start(intvsession *s, const intvsession_start_opts *opts)
 {
     intvsession_start_opts defaults;

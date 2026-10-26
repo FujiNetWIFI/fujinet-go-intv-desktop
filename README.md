@@ -99,6 +99,10 @@ or the start of a tab's name (`cpu`, `stic`, `symbols`, `fujinet`).
   the ECS's own shifted layer is nothing like a PC's (`%` lives on
   SHIFT+left-arrow over there, `/` on SHIFT+7). ECS is only selectable once
   an `ecs.bin` has been embedded or imported -- see `COMPLIANCE.md`.
+- **Machine > Import BIOS...** imports the Mattel ROMs from files, a zip (MAME's
+  `intv` set works) or a folder; **Import Cartridge to SD...** and **Open SD
+  Folder** put `.rom`/`.bin`/`.int`/`.itv` images (and their `.cfg`) where
+  CONFIG finds them.
 - `tools/jzintv/` -- the jzIntv source patch, staging/patch scripts, and the
   Mattel EXEC/GROM/ECS images used for `WITH_INTV_ROMS=ON` builds.
 - `tools/icons/` -- icon rendering (`make-icons.py`) from `data/icons/src/`

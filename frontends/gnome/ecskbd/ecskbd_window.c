@@ -100,6 +100,7 @@ static GtkWidget *make_mod_key(const char *label, intvsession *session,
 
     m->session = session;
     m->key = key;
+    gtk_widget_add_css_class(btn, "intv-toggle");
     g_object_set_data_full(G_OBJECT(btn), "mod-binding", m, g_free);
     g_signal_connect(btn, "toggled", G_CALLBACK(mod_toggled), m);
     gtk_widget_set_size_request(btn, 64, 40);

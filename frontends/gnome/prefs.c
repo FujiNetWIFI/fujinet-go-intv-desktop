@@ -26,12 +26,18 @@
 
 #include "prefs.h"
 
+#include <string.h>
+
 #include "window.h"
+
+#define MAX_ROM_ROWS 8
 
 typedef struct {
     IntvWindow *window;
     intvsession *session;
     gboolean session_dirty;
+    GtkWidget *ecs_row;
+    GtkWidget *rom_rows[MAX_ROM_ROWS];
 } PrefsState;
 
 typedef struct {
@@ -142,6 +148,105 @@ static GtkWidget *switch_row(PrefsState *state, const char *title,
     return row;
 }
 
+/* ---- the ROMs page --------------------------------------------------------- */
+
+static void ecs_row_update(PrefsState *st)
+{
+    gboolean have = intvsession_has_ecs_rom(st->session);
+    if (!st->ecs_row)
+        return;
+    adw_action_row_set_subtitle(
+        ADW_ACTION_ROW(st->ecs_row),
+        have ? "Entertainment Computer System -- second controller pair, "
+               "ECS keyboard, extra sound"
+             : "Unavailable: ecs.bin not found in the ROM directory");
+    gtk_widget_set_sensitive(st->ecs_row, have);
+}
+
+static void refresh_rows(PrefsState *st)
+{
+    int r;
+    for (r = 0; r < intvsession_rom_item_count() && r < MAX_ROM_ROWS; r++)
+        if (st->rom_rows[r])
+            adw_action_row_set_subtitle(
+                ADW_ACTION_ROW(st->rom_rows[r]),
+                intvsession_rom_item_available(st->session, r)
+                    ? "Imported" : "Not imported");
+    ecs_row_update(st);
+}
+
+/* The dialog owns the state, so it is still there when an import started
+ * from it finishes after it was closed. */
+static void import_done(gpointer dialog)
+{
+    PrefsState *st = g_object_get_data(G_OBJECT(dialog), "intv-prefs");
+    if (st)
+        refresh_rows(st);
+    g_object_unref(dialog);
+}
+
+static void on_rom_import(GtkButton *b, gpointer user_data)
+{
+    GObject *dialog = user_data;
+    PrefsState *st = g_object_get_data(dialog, "intv-prefs");
+    gboolean folder =
+        GPOINTER_TO_INT(g_object_get_data(G_OBJECT(b), "intv-folder"));
+    intv_window_import_bios(st->window, folder, import_done,
+                            g_object_ref(dialog));
+}
+
+static AdwPreferencesPage *build_roms_page(PrefsState *st, GObject *dialog)
+{
+    AdwPreferencesPage *page = ADW_PREFERENCES_PAGE(adw_preferences_page_new());
+    AdwPreferencesGroup *group = NULL;
+    const char *last = NULL;
+    char desc[1200];
+    int r;
+
+    adw_preferences_page_set_title(page, "ROMs");
+    adw_preferences_page_set_name(page, "ROMs");
+    adw_preferences_page_set_icon_name(page, "media-flash-symbolic");
+    for (r = 0; r < intvsession_rom_item_count() && r < MAX_ROM_ROWS; r++) {
+        const intv_rom_item *item = intvsession_rom_item(r);
+        GtkWidget *row;
+        if (!last || strcmp(last, item->group) != 0) {
+            group = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
+            adw_preferences_group_set_title(group, item->group);
+            if (!last) {
+                GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+                GtkWidget *files = gtk_button_new_with_label("Import\xe2\x80\xa6");
+                GtkWidget *dir =
+                    gtk_button_new_with_label("Import a Folder\xe2\x80\xa6");
+                g_snprintf(desc, sizeof desc,
+                    "The Intellivision's system ROMs are not part of the "
+                    "app. Import them from files, a zip or a folder (MAME's "
+                    "intv set works); they are recognised by their "
+                    "checksums. Kept in %s.",
+                    intvsession_roms_path(st->session));
+                adw_preferences_group_set_description(group, desc);
+                g_object_set_data(G_OBJECT(dir), "intv-folder",
+                                  GINT_TO_POINTER(1));
+                g_signal_connect(files, "clicked", G_CALLBACK(on_rom_import),
+                                 dialog);
+                g_signal_connect(dir, "clicked", G_CALLBACK(on_rom_import),
+                                 dialog);
+                gtk_widget_set_valign(files, GTK_ALIGN_CENTER);
+                gtk_widget_set_valign(dir, GTK_ALIGN_CENTER);
+                gtk_box_append(GTK_BOX(box), files);
+                gtk_box_append(GTK_BOX(box), dir);
+                adw_preferences_group_set_header_suffix(group, box);
+            }
+            adw_preferences_page_add(page, group);
+            last = item->group;
+        }
+        row = adw_action_row_new();
+        adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), item->name);
+        adw_preferences_group_add(group, row);
+        st->rom_rows[r] = row;
+    }
+    return page;
+}
+
 static void prefs_closed(GtkWidget *dialog, gpointer user_data)
 {
     PrefsState *state = user_data;
@@ -151,7 +256,6 @@ static void prefs_closed(GtkWidget *dialog, gpointer user_data)
         intv_window_toast(state->window,
                           "Machine options applied (session restarted)");
     }
-    g_free(state);
 }
 
 void intv_prefs_show(IntvWindow *parent, intvsession *session)
@@ -169,6 +273,9 @@ void intv_prefs_show(IntvWindow *parent, intvsession *session)
     state->session = session;
 
     adw_dialog_set_title(ADW_DIALOG(dialog), "Preferences");
+    adw_preferences_page_set_title(page, "Machine");
+    adw_preferences_page_set_name(page, "Machine");
+    adw_preferences_page_set_icon_name(page, "preferences-system-symbolic");
 
     adw_preferences_group_set_title(machine, "Machine");
     adw_preferences_group_set_description(
@@ -185,6 +292,7 @@ void intv_prefs_show(IntvWindow *parent, intvsession *session)
             "ecs", INTVSESSION_HW_AUTO, hw_mode_table(), APPLY_ON_CLOSE);
         gtk_widget_set_sensitive(ecs_row, have_ecs_rom);
         adw_preferences_group_add(machine, ecs_row);
+        state->ecs_row = ecs_row;
     }
     adw_preferences_group_add(
         machine,
@@ -210,6 +318,12 @@ void intv_prefs_show(IntvWindow *parent, intvsession *session)
     adw_preferences_page_add(page, machine);
     adw_preferences_page_add(page, input);
     adw_preferences_dialog_add(dialog, page);
+    g_object_set_data_full(G_OBJECT(dialog), "intv-prefs", state, g_free);
+    adw_preferences_dialog_add(dialog, build_roms_page(state, G_OBJECT(dialog)));
+    refresh_rows(state);
+    /* Developer affordance for screenshots: INTV_PREFS_PAGE=roms. */
+    if (g_strcmp0(g_getenv("INTV_PREFS_PAGE"), "roms") == 0)
+        adw_preferences_dialog_set_visible_page_name(dialog, "ROMs");
 
     g_signal_connect(dialog, "closed", G_CALLBACK(prefs_closed), state);
     adw_dialog_present(ADW_DIALOG(dialog), GTK_WIDGET(parent));

@@ -27,12 +27,47 @@
     <category>Emulator</category>
   </categories>
   <url type="homepage">https://fujinet.online/</url>
+  <url type="vcs-browser">https://github.com/FujiNetWIFI/fujinet-go-intv-desktop</url>
   <url type="bugtracker">https://github.com/FujiNetWIFI/fujinet-go-intv-desktop/issues</url>
   <developer id="online.fujinet">
     <name>Thomas Cherryhomes</name>
   </developer>
   <content_rating type="oars-1.1"/>
+  <screenshots>
+    <screenshot type="default">
+      <caption>The FujiNet CONFIG client browsing network hosts from the console</caption>
+      <image>https://raw.githubusercontent.com/FujiNetWIFI/fujinet-go-intv-desktop/main/data/screenshots/1_running_config.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The built-in debugger: CPU, STIC, symbols and the FujiNet link</caption>
+      <image>https://raw.githubusercontent.com/FujiNetWIFI/fujinet-go-intv-desktop/main/data/screenshots/2_debugger.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Preferences, with the ROMs page</caption>
+      <image>https://raw.githubusercontent.com/FujiNetWIFI/fujinet-go-intv-desktop/main/data/screenshots/3_preferences.png</image>
+    </screenshot>
+  </screenshots>
   <releases>
+    <release version="0.11.0" date="2026-10-26">
+      <description>
+        <p>
+          Import BIOS: the Executive and Graphics ROMs (and the ECS ROM) are
+          imported from files, a zip such as MAME's intv set, or a folder,
+          from the Machine menu or the ROMs page in Preferences; a No
+          Intellivision BIOS page says so instead of a black picture.
+        </p>
+        <p>
+          Import Cartridge to SD copies a .rom, .bin, .int or .itv image (with
+          its .cfg) or a zip of them onto FujiNet's SD host, and Open SD
+          Folder shows it.
+        </p>
+        <p>
+          Windows draws with Direct3D 11, paces on a high-resolution timer and
+          shows the FujiNet console log. Toggle buttons are dark green with
+          white text. Closing the debugger no longer crashes the GNOME build.
+        </p>
+      </description>
+    </release>
     <release version="0.10.0" date="2026-10-19">
       <description>
         <p>

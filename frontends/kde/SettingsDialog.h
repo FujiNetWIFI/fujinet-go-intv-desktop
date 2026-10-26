@@ -8,9 +8,13 @@
 
 #include <QDialog>
 
+#include <vector>
+
 #include "intvsession.h"
 
+class QCheckBox;
 class QComboBox;
+class QLabel;
 
 class SettingsDialog : public QDialog {
     Q_OBJECT
@@ -22,10 +26,20 @@ public:
      * to take effect. */
     bool sessionDirty() const { return m_sessionDirty; }
 
+signals:
+    /* A ROM import ran (successful or not): the caller may now be able to
+     * start the session. */
+    void romsImported();
+
 private:
+    void refreshRoms();
+    void importRoms(bool folder);
     QComboBox *addHwModeRow(class QFormLayout *form, const QString &label,
                             const char *key);
 
     intvsession *m_session;
+    QComboBox *m_ecsCombo = nullptr;
+    QCheckBox *m_ecsKeyboard = nullptr;
+    std::vector<QLabel *> m_romRows;
     bool m_sessionDirty = false;
 };

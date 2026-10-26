@@ -278,10 +278,29 @@ add_library(intv_session STATIC
   src/gamepad_sdl.c
   src/audio_sdl.c
   src/fujinet_runtime.c
+  src/roms.c
+  src/media.c
+  src/zipread.c
 )
 set_target_properties(intv_session PROPERTIES C_STANDARD 11)
 target_include_directories(intv_session PRIVATE src)
-target_link_libraries(intv_session PUBLIC jzintv_core PRIVATE SDL3::SDL3)
+# zlib inflates the deflated entries of a BIOS or cartridge zip (MAME's intv
+# set). jzIntv carries its own deflate-only copy under Z_PREFIX, so the two do
+# not clash. Windows takes zlib's static archive so the release workflow's DLL
+# import table stays short.
+if(WIN32)
+  set(ZLIB_USE_STATIC_LIBS ON)
+endif()
+find_package(ZLIB REQUIRED)
+target_link_libraries(intv_session PUBLIC jzintv_core PRIVATE SDL3::SDL3 ZLIB::ZLIB)
+if(WIN32)
+  # jzintv_core carries its own deflate-only zlib (src/zlib/zutil.c) and the
+  # static zlib that zipread.c inflates with defines z_errmsg too: the same
+  # message strings, so the first one wins. Shared zlib (Linux, macOS) never
+  # sees the clash. PUBLIC so every test and frontend that links intv_session
+  # gets it.
+  target_link_options(intv_session PUBLIC -Wl,--allow-multiple-definition)
+endif()
 target_compile_options(intv_session PRIVATE -Wall -Wextra -Wno-unused-parameter
                        -Wno-format-truncation)
 # fujinet_runtime.c dlopen's libfujinet at run time -- no link-time
@@ -326,6 +345,10 @@ target_include_directories(ecs_key_test PRIVATE src)
 # the intv global stays reachable): intvsession_ecs_key_event is the first
 # ECS entry point with session state behind it. Needs no ROMs, so unlike
 # ecs_key_test it runs in the WITH_INTV_ROMS=OFF config too.
+add_executable(rom_import_test tests/rom_import_test.c)
+target_link_libraries(rom_import_test intv_session ZLIB::ZLIB)
+target_include_directories(rom_import_test PRIVATE src)
+
 add_executable(ecs_key_event_test tests/ecs_key_event_test.c)
 target_link_libraries(ecs_key_event_test intv_session)
 target_include_directories(ecs_key_event_test PRIVATE src)
@@ -422,6 +445,7 @@ add_test(NAME stic COMMAND stic_test)
 add_test(NAME symtab COMMAND symtab_test)
 add_test(NAME fujitrace COMMAND fujitrace_test)
 add_test(NAME periph COMMAND periph_test)
+add_test(NAME rom_import COMMAND rom_import_test)
 set_tests_properties(fujibus_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
                      RUN_SERIAL ON)
 set_tests_properties(debug stic PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)

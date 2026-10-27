@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=FujiNet Go Intv
+Name=FujiNet Go Intv (KDE)
 GenericName=Intellivision with FujiNet
 Comment=Self-contained Mattel Intellivision with built-in FujiNet
 Exec=fujinet-go-intv-kde

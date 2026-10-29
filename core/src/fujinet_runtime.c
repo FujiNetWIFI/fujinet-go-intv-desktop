@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if defined(_WIN32)
@@ -196,6 +197,93 @@ int fujinet_copy_log(struct intvsession *s, char *dst, int max)
     fn = g_copy_log;
     pthread_mutex_unlock(&g_mtx);
     return fn ? fn(dst, max) : 0;
+}
+
+/* A host name: letters, digits, '-', '_' and dots, no empty label. All-digit
+ * text must be a dotted IPv4 address (the resolver reads "1.2" as one too). */
+static int host_valid(const char *host)
+{
+    const size_t len = strlen(host);
+    int numeric = 1;
+    size_t pos;
+
+    if (len == 0 || len > 63 || host[0] == '.' || host[0] == '-' || host[len - 1] == '.')
+        return 0;
+    for (pos = 0; pos < len; pos++) {
+        const char chr = host[pos];
+        const int digit = chr >= '0' && chr <= '9';
+        if (!digit && chr != '.')
+            numeric = 0;
+        if (!digit && chr != '.' && chr != '-' && chr != '_' && !(chr >= 'a' && chr <= 'z') &&
+            !(chr >= 'A' && chr <= 'Z'))
+            return 0;
+        if (chr == '.' && host[pos + 1] == '.')
+            return 0;
+    }
+    if (numeric) {
+        int oct[4], used = 0, idx;
+        if (sscanf(host, "%d.%d.%d.%d%n", &oct[0], &oct[1], &oct[2], &oct[3], &used) != 4 ||
+            host[used])
+            return 0;
+        for (idx = 0; idx < 4; idx++)
+            if (oct[idx] < 0 || oct[idx] > 255)
+                return 0;
+    }
+    return 1;
+}
+
+int intvsession_parse_hostport(const char *text, char *host, int hostsz, int *port)
+{
+    char buf[80];
+    const char *name = "127.0.0.1";
+    long num = 65503;
+    size_t len;
+
+    if (!text)
+        text = "";
+    while (*text == ' ' || *text == '\t')
+        text++;
+    len = strlen(text);
+    while (len && (text[len - 1] == ' ' || text[len - 1] == '\t' || text[len - 1] == '\n' ||
+                   text[len - 1] == '\r'))
+        len--;
+    if (len >= sizeof buf)
+        return -1;
+    memcpy(buf, text, len);
+    buf[len] = '\0';
+
+    if (len) {
+        char *colon = strrchr(buf, ':');
+        const char *digits = buf;
+        char *end;
+        if (colon) {
+            *colon = '\0';
+            name = buf;
+            digits = colon + 1;
+            if (!host_valid(name))
+                return -1;
+        }
+        if (!*digits)
+            return -1;
+        num = strtol(digits, &end, 10);
+        if (*end || num < 1 || num > 65535)
+            return -1;
+    }
+    if ((int)strlen(name) >= hostsz)
+        return -1;
+    memcpy(host, name, strlen(name) + 1);
+    *port = (int)num;
+    return 0;
+}
+
+int intvsession_fujinet_external(const intvsession *s)
+{
+    return s->fujinet_external;
+}
+
+const char *intvsession_boip_endpoint(const intvsession *s)
+{
+    return s->boip_endpoint[0] ? s->boip_endpoint : "127.0.0.1:65503";
 }
 
 int intvsession_fujinet_running(const intvsession *s)

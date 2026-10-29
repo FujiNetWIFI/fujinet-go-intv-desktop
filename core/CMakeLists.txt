@@ -401,6 +401,15 @@ target_include_directories(gamepad_test PRIVATE src)
 add_executable(fujibus_smoke tests/fujibus_smoke.c)
 target_link_libraries(fujibus_smoke intv_session)
 
+# The external-FujiNet address field (pure), and "Use external FujiNet"
+# through a session: no runtime of its own, and jzIntv dials a stand-in
+# listener on a spare port.
+add_executable(hostport_test tests/hostport_test.c)
+target_link_libraries(hostport_test intv_session)
+
+add_executable(external_test tests/external_test.c)
+target_link_libraries(external_test intv_session)
+
 add_executable(debug_test tests/debug_test.c)
 target_link_libraries(debug_test jzintv_core)
 target_include_directories(debug_test PRIVATE src)
@@ -440,6 +449,9 @@ add_test(NAME audio_ring COMMAND audio_ring_test)
 add_test(NAME gamepad COMMAND gamepad_test)
 add_test(NAME disc COMMAND disc_test)
 add_test(NAME fujibus_smoke COMMAND fujibus_smoke)
+add_test(NAME hostport COMMAND hostport_test)
+add_test(NAME external COMMAND external_test)
+set_tests_properties(external PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 add_test(NAME debug COMMAND debug_test)
 add_test(NAME stic COMMAND stic_test)
 add_test(NAME symtab COMMAND symtab_test)

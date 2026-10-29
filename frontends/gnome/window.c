@@ -531,6 +531,10 @@ static void action_fujinet_config(GSimpleAction *action, GVariant *param,
     GtkUriLauncher *launcher;
     (void)action;
     (void)param;
+    if (intvsession_fujinet_external(self->session)) {
+        intv_window_toast(self, "FujiNet is external: use its own web UI");
+        return;
+    }
     /* No embedded WebKitGTK view yet -- open the system browser. */
     launcher =
         gtk_uri_launcher_new(intvsession_fujinet_webui_url(self->session));
@@ -548,6 +552,10 @@ static void action_fujinet_log(GSimpleAction *action, GVariant *param,
     (void)action;
     (void)param;
 
+    if (intvsession_fujinet_external(self->session)) {
+        intv_window_toast(self, "FujiNet is external: see its own console");
+        return;
+    }
     intvsession_fujinet_copy_log(self->session, buf, sizeof(buf));
 
     dialog = gtk_window_new();

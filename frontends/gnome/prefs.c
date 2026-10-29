@@ -125,18 +125,54 @@ static void switch_toggled(GObject *row, GParamSpec *pspec, gpointer user_data)
     if (intvsession_get_int(b->state->session, b->key, b->def) == (on ? 1 : 0))
         return;
     intvsession_set_int(b->state->session, b->key, on ? 1 : 0);
-    if (!on)
+    if (b->apply == APPLY_ON_CLOSE)
+        b->state->session_dirty = TRUE;
+    else if (!on)
         /* Leaving ECS keyboard mode -- release anything still held so a key
          * down at the moment of the switch doesn't stay stuck in the
          * emulated matrix (see intvsession_ecs_keys_clear's own comment). */
         intvsession_ecs_keys_clear(b->state->session);
 }
 
+#define EXTERNAL_PLACEHOLDER "127.0.0.1:65503"
+
+/* The address field: valid text (or none, meaning 127.0.0.1:65503) is saved
+ * and marks the session for a restart; anything else is flagged and not
+ * saved. */
+static void addr_changed(GtkEditable *entry, gpointer user_data)
+{
+    PrefsState *state = user_data;
+    const char *text = gtk_editable_get_text(entry);
+    char host[64];
+    int port;
+
+    if (intvsession_parse_hostport(text, host, sizeof(host), &port) != 0) {
+        gtk_widget_add_css_class(GTK_WIDGET(entry), "error");
+        return;
+    }
+    gtk_widget_remove_css_class(GTK_WIDGET(entry), "error");
+    if (g_strcmp0(intvsession_get_str(state->session, "fujinet_external_addr",
+                                      ""), text) == 0)
+        return;
+    intvsession_set_str(state->session, "fujinet_external_addr", text);
+    state->session_dirty = TRUE;
+}
+
+static void external_toggled(GObject *row, GParamSpec *pspec,
+                             gpointer user_data)
+{
+    gtk_widget_set_sensitive(
+        GTK_WIDGET(user_data),
+        adw_switch_row_get_active(ADW_SWITCH_ROW(row)));
+    (void)pspec;
+}
+
 static GtkWidget *switch_row(PrefsState *state, const char *title,
-                             const char *subtitle, const char *key, int def)
+                             const char *subtitle, const char *key, int def,
+                             int apply)
 {
     GtkWidget *row = adw_switch_row_new();
-    RowBinding *b = binding_new(state, key, def, APPLY_LIVE);
+    RowBinding *b = binding_new(state, key, def, apply);
 
     adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), title);
     if (subtitle)
@@ -268,6 +304,8 @@ void intv_prefs_show(IntvWindow *parent, intvsession *session)
         ADW_PREFERENCES_GROUP(adw_preferences_group_new());
     AdwPreferencesGroup *input =
         ADW_PREFERENCES_GROUP(adw_preferences_group_new());
+    AdwPreferencesGroup *fujinet =
+        ADW_PREFERENCES_GROUP(adw_preferences_group_new());
 
     state->window = parent;
     state->session = session;
@@ -313,10 +351,35 @@ void intv_prefs_show(IntvWindow *parent, intvsession *session)
                   "immediately). Warning: the FujiNet CONFIG ROM has no ECS "
                   "keyboard support yet, so while this is on its menus can "
                   "only be driven by a gamepad or the keypad window (F9)",
-                  "keyboard_mode", 0));
+                  "keyboard_mode", 0, APPLY_LIVE));
+
+    adw_preferences_group_set_title(fujinet, "FujiNet");
+    adw_preferences_group_set_description(
+        fujinet, "Applied by restarting the session when this dialog closes.");
+    {
+        GtkWidget *external = switch_row(
+            state, "Use external FujiNet",
+            "Skip the built-in FujiNet and dial another instance. Start that "
+            "instance listening on this address (its [BOIP] port).",
+            "fujinet_external", 0, APPLY_ON_CLOSE);
+        GtkWidget *addr = adw_entry_row_new();
+        adw_preferences_row_set_title(ADW_PREFERENCES_ROW(addr),
+                                      "Address:port, e.g. " EXTERNAL_PLACEHOLDER);
+        gtk_editable_set_text(
+            GTK_EDITABLE(addr),
+            intvsession_get_str(session, "fujinet_external_addr", ""));
+        g_signal_connect(addr, "changed", G_CALLBACK(addr_changed), state);
+        gtk_widget_set_sensitive(
+            addr, adw_switch_row_get_active(ADW_SWITCH_ROW(external)));
+        g_signal_connect(external, "notify::active",
+                         G_CALLBACK(external_toggled), addr);
+        adw_preferences_group_add(fujinet, external);
+        adw_preferences_group_add(fujinet, addr);
+    }
 
     adw_preferences_page_add(page, machine);
     adw_preferences_page_add(page, input);
+    adw_preferences_page_add(page, fujinet);
     adw_preferences_dialog_add(dialog, page);
     g_object_set_data_full(G_OBJECT(dialog), "intv-prefs", state, g_free);
     adw_preferences_dialog_add(dialog, build_roms_page(state, G_OBJECT(dialog)));

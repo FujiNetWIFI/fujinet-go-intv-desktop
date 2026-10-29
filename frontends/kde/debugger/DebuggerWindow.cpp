@@ -466,12 +466,15 @@ void DebuggerWindow::refreshFujinet(bool force)
     const int n = intvdebug_fujinet_trace(m_dbg, p, INTVDEBUG_FUJI_TRACE_MAX);
 
     m_fujiTicks = 0;
-    if (!m_session || !intvsession_fujinet_running(m_session))
+    if (!m_session || (!intvsession_fujinet_running(m_session) && !intvsession_fujinet_external(m_session)))
         m_fujiNote->setText(QStringLiteral("FujiNet is not running."));
     else
-        m_fujiNote->setText(intvsession_fujinet_link(m_session)
-                                ? QStringLiteral("FujiNet cartridge, connected.")
-                                : QStringLiteral("FujiNet cartridge, not connected."));
+        m_fujiNote->setText(QStringLiteral("%1 FujiNet at %2, cartridge %3.")
+                                .arg(intvsession_fujinet_external(m_session) ? QStringLiteral("External")
+                                                                             : QStringLiteral("Built-in"))
+                                .arg(QString::fromUtf8(intvsession_boip_endpoint(m_session)))
+                                .arg(intvsession_fujinet_link(m_session) ? QStringLiteral("connected")
+                                                                         : QStringLiteral("not connected")));
     intvdebug_fujinet_state(m_dbg, state, int(sizeof(state)));
     setText(m_fujiState, QString::fromUtf8(state));
 

@@ -74,6 +74,8 @@ void intvsession_default_opts(intvsession *s, intvsession_start_opts *opts)
     opts->ivoice = intvsession_get_int(s, "ivoice", INTVSESSION_HW_AUTO);
     opts->video = intvsession_get_int(s, "video_standard",
                                       INTVSESSION_VIDEO_NTSC);
+    opts->external_fujinet = intvsession_get_int(s, "fujinet_external", 0);
+    opts->fujinet_addr = intvsession_get_str(s, "fujinet_external_addr", NULL);
     opts->cart_path = intvsession_get_str(s, "cart", NULL);
     if (opts->cart_path && !opts->cart_path[0])
         opts->cart_path = NULL;
@@ -214,14 +216,37 @@ int intvsession_start(intvsession *s, const intvsession_start_opts *opts)
      * be up, and its listener actually accepting, before the emulator
      * thread starts. Best-effort: WITH_FUJINET=OFF or a load failure is not
      * a session-start failure, the machine still boots the embedded config
-     * ROM either way (see intv_host.h). */
-    if (fujinet_start(s) == 0)
+     * ROM either way (see intv_host.h). An external FujiNet is somebody
+     * else's listener: nothing starts here, jzIntv just dials it. */
+    s->fujinet_external = 0;
+    snprintf(s->boip_host, sizeof(s->boip_host), "127.0.0.1");
+    s->fujinet_port = INTVSESSION_BOIP_PORT;
+    snprintf(s->webui_url, sizeof(s->webui_url), "http://127.0.0.1:%d/",
+             INTVSESSION_WEBUI_PORT);
+    if (opts->external_fujinet) {
+        if (intvsession_parse_hostport(opts->fujinet_addr, s->boip_host,
+                                       (int)sizeof(s->boip_host),
+                                       &s->fujinet_port) != 0) {
+            session_set_error(s, "\"%s\" is not an address:port for the "
+                              "external FujiNet (example: 127.0.0.1:%d)",
+                              opts->fujinet_addr ? opts->fujinet_addr : "",
+                              INTVSESSION_BOIP_PORT);
+            snprintf(s->boip_host, sizeof(s->boip_host), "127.0.0.1");
+            s->fujinet_port = INTVSESSION_BOIP_PORT;
+            return -1;
+        }
+        s->fujinet_external = 1;
+        s->webui_url[0] = '\0';
+    } else if (fujinet_start(s) == 0) {
         fujinet_wait_for_boip(s, 3000);
+    }
+    snprintf(s->boip_endpoint, sizeof(s->boip_endpoint), "%s:%d",
+             s->boip_host, s->fujinet_port);
 
     intv_host_opts host_opts = {
         .rom_dir = s->roms_dir,
         .state_dir = s->data_dir,
-        .fujinet_host = "127.0.0.1",
+        .fujinet_host = s->boip_host,
         .fujinet_port = s->fujinet_port,
         .ecs = hw_to_intv(opts->ecs),
         .ivoice = hw_to_intv(opts->ivoice),
@@ -248,6 +273,7 @@ void intvsession_stop(intvsession *s)
     audio_stop(s);
     intv_host_stop();
     fujinet_stop(s);
+    s->fujinet_external = 0;
 }
 
 int intvsession_is_running(const intvsession *s)

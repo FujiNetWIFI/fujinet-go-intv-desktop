@@ -42,6 +42,7 @@
     NSTextView *_logView;
     NSTimer *_logTimer;
     NSWindow *_settingsWindow;
+    NSTextField *_externalField;
     BOOL _sessionDirty;
     NSTimer *_sysactTimer;
     NSView *_noRoms;
@@ -55,6 +56,7 @@
  *   "ecs"/"ivoice"    INTVSESSION_HW_* (default AUTO)     -- restart to apply
  *   "video_standard"  INTVSESSION_VIDEO_* (default NTSC)  -- restart to apply
  *   "keyboard_mode"   0 = hand controllers, 1 = ECS keyboard -- applies live
+ *   "fujinet_external"/"fujinet_external_addr"  dial another FujiNet -- restart
  * The restart-class key set, mirroring the CoCo/ADAM macOS ports' own
  * sessionSettingKeys()/machineSettingKeys() helpers. */
 static NSArray<NSString *> *restartSettingKeys(void)
@@ -62,7 +64,8 @@ static NSArray<NSString *> *restartSettingKeys(void)
     static NSArray<NSString *> *keys;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-      keys = @[ @"ecs", @"ivoice", @"video_standard" ];
+      keys = @[ @"ecs", @"ivoice", @"video_standard", @"fujinet_external",
+                @"fujinet_external_addr" ];
     });
     return keys;
 }
@@ -369,6 +372,14 @@ static NSArray<NSString *> *restartSettingKeys(void)
 - (void)showFujiNetConfig:(id)sender
 {
     (void)sender;
+    if (intvsession_fujinet_external(_session)) {
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"FujiNet is external";
+        alert.informativeText = @"Use the web UI of the FujiNet instance "
+                                @"this app dials.";
+        [alert runModal];
+        return;
+    }
     if (_configWindow) {
         [_configWindow makeKeyAndOrderFront:nil];
         return;
@@ -420,6 +431,14 @@ static NSArray<NSString *> *restartSettingKeys(void)
 - (void)showFujiNetLog:(id)sender
 {
     (void)sender;
+    if (intvsession_fujinet_external(_session)) {
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"FujiNet is external";
+        alert.informativeText = @"Its console output is in the process "
+                                @"that is running it.";
+        [alert runModal];
+        return;
+    }
     if (_logWindow) {
         [_logWindow makeKeyAndOrderFront:nil];
         return;
@@ -505,6 +524,8 @@ static NSArray<NSString *> *restartSettingKeys(void)
 
     intvsession_set_int(_session, key.UTF8String, value);
 
+    if ([key isEqualToString:@"fujinet_external"])
+        _externalField.enabled = value != 0;
     if ([restartSettingKeys() containsObject:key]) {
         _sessionDirty = YES;
     } else if ([key isEqualToString:@"keyboard_mode"] && value == 0) {
@@ -512,6 +533,26 @@ static NSArray<NSString *> *restartSettingKeys(void)
          * intvsession_ecs_keys_clear's own comment. */
         intvsession_ecs_keys_clear(_session);
     }
+}
+
+/* The external-FujiNet address field: valid text (or none, meaning
+ * 127.0.0.1:65503) is saved; anything else is shown in red and not saved. */
+- (void)externalAddrChanged:(id)sender
+{
+    NSTextField *field = sender;
+    NSString *text = [field.stringValue
+        stringByTrimmingCharactersInSet:NSCharacterSet
+                                            .whitespaceAndNewlineCharacterSet];
+    char host[64];
+    int port;
+    if (intvsession_parse_hostport(text.UTF8String, host, sizeof host,
+                                   &port) != 0) {
+        field.textColor = NSColor.systemRedColor;
+        return;
+    }
+    field.textColor = NSColor.controlTextColor;
+    intvsession_set_str(_session, "fujinet_external_addr", text.UTF8String);
+    _sessionDirty = YES;
 }
 
 - (void)showSettings:(id)sender
@@ -553,12 +594,32 @@ static NSArray<NSString *> *restartSettingKeys(void)
                             : NSControlStateValueOff;
     ecsKeyboard.identifier = @"keyboard_mode";
 
+    NSButton *externalBox =
+        [NSButton checkboxWithTitle:@""
+                             target:self
+                             action:@selector(settingChanged:)];
+    externalBox.state = intvsession_get_int(_session, "fujinet_external", 0)
+                            ? NSControlStateValueOn
+                            : NSControlStateValueOff;
+    externalBox.identifier = @"fujinet_external";
+    _externalField = [NSTextField textFieldWithString:@(
+        intvsession_get_str(_session, "fujinet_external_addr", ""))];
+    _externalField.placeholderString = @"127.0.0.1:65503";
+    _externalField.preferredMaxLayoutWidth = 240;
+    _externalField.enabled =
+        intvsession_get_int(_session, "fujinet_external", 0) != 0;
+    _externalField.target = self;
+    _externalField.action = @selector(externalAddrChanged:);
+    [_externalField.cell setSendsActionOnEndEditing:YES];
+
     NSArray<NSArray<NSView *> *> *rows = @[
         @[ [NSTextField labelWithString:@"ECS"], ecsPop ],
         @[ [NSTextField labelWithString:@"Intellivoice"],
            [self hwModePopUpForKey:"ivoice"] ],
         @[ [NSTextField labelWithString:@"Video Standard"], videoPop ],
         @[ [NSTextField labelWithString:@"ECS Keyboard"], ecsKeyboard ],
+        @[ [NSTextField labelWithString:@"Use external FujiNet"], externalBox ],
+        @[ [NSTextField labelWithString:@"Address:port"], _externalField ],
     ];
     /* ROMs: one row per item under its group, refreshed after an import. */
     NSMutableArray<NSArray<NSView *> *> *all = [rows mutableCopy];
@@ -605,7 +666,9 @@ static NSArray<NSString *> *restartSettingKeys(void)
     NSTextField *note = [NSTextField
         labelWithString:@"ECS/Intellivoice/Video Standard apply when this "
                         @"window is closed (the session restarts). ECS "
-                        @"Keyboard applies immediately.\n\nWarning: the "
+                        @"Keyboard applies immediately. An external FujiNet "
+                        @"is dialled at the address above: start it "
+                        @"listening there (its [BOIP] port).\n\nWarning: the "
                         @"FujiNet CONFIG ROM has no ECS keyboard support "
                         @"yet, so while ECS Keyboard is on its menus can "
                         @"only be driven by a gamepad or the keypad "
@@ -655,6 +718,8 @@ static NSArray<NSString *> *restartSettingKeys(void)
  * frontends' own "apply on close" idiom). */
 - (void)windowWillClose:(NSNotification *)note
 {
+    if (note.object == _settingsWindow)
+        [_settingsWindow makeFirstResponder:nil]; /* commit a field edit */
     if (note.object != _settingsWindow || !_sessionDirty)
         return;
     _sessionDirty = NO;

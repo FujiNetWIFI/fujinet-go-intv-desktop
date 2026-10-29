@@ -346,10 +346,24 @@ void MainWindow::buildMenus()
     fujinet->addAction(QStringLiteral("&Reset to CONFIG"),
                        QKeySequence(Qt::CTRL | Qt::Key_R), this,
                        &MainWindow::resetToConfig);
-    fujinet->addAction(QStringLiteral("&Configuration…"), this,
-                       [this] { fujinet_config_show(this, m_session); });
-    fujinet->addAction(QStringLiteral("Console &Log…"), this,
-                       [this] { fujinet_log_show(this, m_session); });
+    fujinet->addAction(QStringLiteral("&Configuration…"), this, [this] {
+        if (intvsession_fujinet_external(m_session)) {
+            statusBar()->showMessage(
+                QStringLiteral("FujiNet is external: use its own web UI"),
+                5000);
+            return;
+        }
+        fujinet_config_show(this, m_session);
+    });
+    fujinet->addAction(QStringLiteral("Console &Log…"), this, [this] {
+        if (intvsession_fujinet_external(m_session)) {
+            statusBar()->showMessage(
+                QStringLiteral("FujiNet is external: see its own console"),
+                5000);
+            return;
+        }
+        fujinet_log_show(this, m_session);
+    });
 
     QMenu *settings = menuBar()->addMenu(QStringLiteral("&Settings"));
     settings->addAction(QStringLiteral("&Settings…"), this,

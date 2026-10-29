@@ -33,6 +33,9 @@ struct intvsession {
     int settings_dirty;
 
     int fujinet_port;
+    int fujinet_external;      /* dialling a FujiNet that isn't ours */
+    char boip_host[64];        /* where jzIntv dials */
+    char boip_endpoint[80];    /* "host:port" for display */
     char last_error[256];
 
     /* ---- FujiNet runtime (fujinet_runtime.c) --------------------------

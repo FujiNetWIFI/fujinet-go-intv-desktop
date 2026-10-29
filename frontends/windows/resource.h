@@ -29,6 +29,8 @@
 #define IDC_SET_PAD_LIST     305
 #define IDC_SET_PAD_SIDE     306
 #define IDC_SET_ROMS         307
+#define IDC_SET_EXTERNAL     308
+#define IDC_SET_EXT_ADDR     309
 
 /* The No-BIOS page's buttons. */
 #define IDC_BIOS_FILES       401

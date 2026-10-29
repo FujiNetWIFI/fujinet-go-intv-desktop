@@ -88,13 +88,17 @@ enum {
 };
 
 /* Read by intvsession_start; filled from the settings store (keys "ecs",
- * "ivoice", "video_standard") by intvsession_default_opts so every frontend
+ * "ivoice", "video_standard", "fujinet_external", "fujinet_external_addr") by intvsession_default_opts so every frontend
  * builds the same options the same way -- see that function's own comment
  * for the exact keys and defaults. */
 typedef struct {
     int ecs;    /* INTVSESSION_HW_* */
     int ivoice; /* INTVSESSION_HW_* */
     int video;  /* INTVSESSION_VIDEO_* */
+    int external_fujinet;  /* 1: don't start the built-in FujiNet; jzIntv
+                            * dials the one at fujinet_addr instead */
+    const char *fujinet_addr; /* "host:port" or "port" (external only);
+                               * NULL/"" -> 127.0.0.1:65503 */
     const char *cart_path; /* NULL/"" -> boot the embedded FujiNet config
                             * ROM (unchanged default). Otherwise a path to a
                             * cartridge image, passed through to
@@ -776,7 +780,19 @@ int  intvsession_sysaction_take(intvsession *s, intvsession_sysaction *out);
  * load) -- the machine still boots the embedded config ROM either way,
  * jzIntv's own --fujinet peripheral simply keeps retrying the connection
  * non-blockingly (see core/jzintv/intv_host.h's own comment on that). */
+/* Parses the "Use external FujiNet" address field: "host:port" (host a name
+ * or an IPv4 literal) or a bare "port". Empty text means the default,
+ * 127.0.0.1:65503. Returns 0 and fills host/port, or -1 when the text is not
+ * an address:port (nothing is written then). */
+int         intvsession_parse_hostport(const char *text, char *host,
+                                       int hostsz, int *port);
 int         intvsession_fujinet_running(const intvsession *s);
+/* 1 when the session was started to dial another FujiNet instead of
+ * running its own. */
+int         intvsession_fujinet_external(const intvsession *s);
+/* "host:port" jzIntv dials (the running session's, or the default
+ * 127.0.0.1:65503 before the first start). */
+const char *intvsession_boip_endpoint(const intvsession *s);
 /* Whether the emulator's FujiNet mailbox is connected to FujiNet over BoIP
  * (it keeps retrying while not). */
 int         intvsession_fujinet_link(const intvsession *s);

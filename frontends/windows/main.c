@@ -344,6 +344,12 @@ void intv_forward_ecs_key(WPARAM vk, LPARAM lp, int down)
 
 static void show_fujinet_config(void)
 {
+    if (intvsession_fujinet_external(g_session)) {
+        MessageBoxA(g_hwnd, "FujiNet is external: use the web UI of the "
+                    "instance this app dials.", "FujiNet Go Intv",
+                    MB_ICONINFORMATION);
+        return;
+    }
     ShellExecuteA(NULL, "open", intvsession_fujinet_webui_url(g_session), NULL,
                  NULL, SW_SHOWNORMAL);
 }
@@ -376,6 +382,12 @@ static LRESULT CALLBACK log_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 static void show_fujinet_log(HINSTANCE inst)
 {
+    if (intvsession_fujinet_external(g_session)) {
+        MessageBoxA(g_hwnd, "FujiNet is external: its console output is in "
+                    "the process that is running it.", "FujiNet Go Intv",
+                    MB_ICONINFORMATION);
+        return;
+    }
     static int registered;
     if (g_log_window) {
         SetForegroundWindow(g_log_window);
@@ -503,6 +515,10 @@ static void drain_sysactions(void)
  *   "keyboard_mode"   0 = hand controllers, 1 = ECS keyboard -- applies live
  */
 
+#ifndef EM_SETCUEBANNER
+#define EM_SETCUEBANNER 0x1501
+#endif
+
 static HWND g_settings_window;
 static HWND g_settings_ecs_combo, g_settings_ecs_note;
 static int g_settings_dirty;
@@ -523,6 +539,20 @@ static void fill_combo(HWND combo, const char *(*name_fn)(int), int cur)
     for (i = 0; name_fn(i); i++)
         SendMessageA(combo, CB_ADDSTRING, 0, (LPARAM)name_fn(i));
     SendMessageA(combo, CB_SETCURSEL, (WPARAM)cur, 0);
+}
+
+/* The external-FujiNet address, trimmed; returns 1 when it parses (empty
+ * means the default). */
+static int settings_external_addr(HWND hwnd, char *addr, size_t addrsz)
+{
+    char host[64], *start = addr, *end;
+    int port;
+    GetDlgItemTextA(hwnd, IDC_SET_EXT_ADDR, addr, (int)addrsz);
+    while (*start == ' ' || *start == '\t') start++;
+    memmove(addr, start, strlen(start) + 1);
+    end = addr + strlen(addr);
+    while (end > addr && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+    return intvsession_parse_hostport(addr, host, sizeof(host), &port) == 0;
 }
 
 static void settings_hw_combo_changed(int ctrl_id, const char *key)
@@ -660,6 +690,31 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp,
         case IDC_SET_ROMS:
             show_roms();
             return 0;
+        case IDC_SET_EXTERNAL: {
+            int wanted = SendDlgItemMessageA(hwnd, IDC_SET_EXTERNAL,
+                                             BM_GETCHECK, 0, 0) == BST_CHECKED;
+            EnableWindow(GetDlgItem(hwnd, IDC_SET_EXT_ADDR), wanted);
+            if (intvsession_get_int(g_session, "fujinet_external", 0) !=
+                (wanted ? 1 : 0)) {
+                intvsession_set_int(g_session, "fujinet_external", wanted ? 1 : 0);
+                g_settings_dirty = 1;
+            }
+            return 0;
+        }
+        case IDC_SET_EXT_ADDR:
+            /* Valid text is saved; anything else is not. */
+            if (HIWORD(wp) == EN_CHANGE) {
+                char addr[96];
+                if (settings_external_addr(hwnd, addr, sizeof(addr)) &&
+                    strcmp(intvsession_get_str(g_session,
+                                               "fujinet_external_addr", ""),
+                           addr) != 0) {
+                    intvsession_set_str(g_session, "fujinet_external_addr",
+                                        addr);
+                    g_settings_dirty = 1;
+                }
+            }
+            return 0;
         case IDC_SET_ECS_KEYBOARD: {
             int on = SendMessageA(GetDlgItem(hwnd, IDC_SET_ECS_KEYBOARD),
                                   BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -691,9 +746,20 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp,
             return 0;
         }
         break;
-    case WM_CLOSE:
+    case WM_CLOSE: {
+        char addr[96];
+        if (SendDlgItemMessageA(hwnd, IDC_SET_EXTERNAL, BM_GETCHECK, 0, 0) ==
+                BST_CHECKED &&
+            !settings_external_addr(hwnd, addr, sizeof(addr))) {
+            MessageBoxA(hwnd, "That is not an address:port.\n\nExample: "
+                        "127.0.0.1:65503", "External FujiNet",
+                        MB_ICONWARNING);
+            SetFocus(GetDlgItem(hwnd, IDC_SET_EXT_ADDR));
+            return 0;
+        }
         DestroyWindow(hwnd);
         return 0;
+    }
     case WM_DESTROY:
         KillTimer(hwnd, IDT_SETTINGS_PADS);
         g_settings_window = NULL;
@@ -735,7 +801,7 @@ static void show_settings(HINSTANCE inst)
     g_settings_window = CreateWindowA(
         "IntvSettingsWindow", "Settings",
         WS_OVERLAPPEDWINDOW & ~(WS_MAXIMIZEBOX | WS_THICKFRAME),
-        CW_USEDEFAULT, CW_USEDEFAULT, 460, 610, NULL, NULL, inst, NULL);
+        CW_USEDEFAULT, CW_USEDEFAULT, 460, 670, NULL, NULL, inst, NULL);
 
     have_ecs_rom = intvsession_has_ecs_rom(g_session);
     CreateWindowExA(0, "STATIC", "ECS:", WS_CHILD | WS_VISIBLE, 16, y, 120,
@@ -796,10 +862,33 @@ static void show_settings(HINSTANCE inst)
     SendMessageA(check, WM_SETFONT, (WPARAM)font, TRUE);
     y += 32;
 
+    check = CreateWindowExA(
+        0, "BUTTON", "Use external FujiNet (dial another instance)",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 16, y, 420, 22,
+        g_settings_window, (HMENU)(INT_PTR)IDC_SET_EXTERNAL, inst, NULL);
+    SendMessageA(check, BM_SETCHECK,
+                intvsession_get_int(g_session, "fujinet_external", 0)
+                    ? BST_CHECKED
+                    : BST_UNCHECKED,
+                0);
+    SendMessageA(check, WM_SETFONT, (WPARAM)font, TRUE);
+    y += 28;
+    CreateWindowExA(0, "STATIC", "Address:port:", WS_CHILD | WS_VISIBLE, 36,
+                    y + 3, 100, 20, g_settings_window, NULL, inst, NULL);
+    combo = CreateWindowExA(
+        WS_EX_CLIENTEDGE, "EDIT",
+        intvsession_get_str(g_session, "fujinet_external_addr", ""),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 140, y, 220, 22,
+        g_settings_window, (HMENU)(INT_PTR)IDC_SET_EXT_ADDR, inst, NULL);
+    SendMessageA(combo, WM_SETFONT, (WPARAM)font, TRUE);
+    SendMessageA(combo, EM_SETCUEBANNER, FALSE, (LPARAM)L"127.0.0.1:65503");
+    EnableWindow(combo, intvsession_get_int(g_session, "fujinet_external", 0));
+    y += 36;
+
     note = CreateWindowExA(
         0, "STATIC",
-        "ECS/Intellivoice/Video Standard apply when this window is closed "
-        "(the session restarts). ECS Keyboard applies immediately. "
+        "ECS/Intellivoice/Video Standard/FujiNet apply when this window is "
+        "closed (the session restarts). ECS Keyboard applies immediately. "
         "Warning: the FujiNet CONFIG ROM has no ECS keyboard support yet, "
         "so while ECS Keyboard is on its menus can only be driven by a "
         "gamepad or the keypad window (F9).",

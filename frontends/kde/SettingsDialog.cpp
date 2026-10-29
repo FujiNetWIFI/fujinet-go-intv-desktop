@@ -23,6 +23,7 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QVBoxLayout>
@@ -98,8 +99,61 @@ SettingsDialog::SettingsDialog(intvsession *session, QWidget *parent)
     inputNote->setWordWrap(true);
     inputForm->addRow(inputNote);
 
+    auto *fujinetBox = new QGroupBox(QStringLiteral("FujiNet"), this);
+    auto *fujinetForm = new QFormLayout(fujinetBox);
+    m_external = new QCheckBox(fujinetBox);
+    m_external->setChecked(
+        intvsession_get_int(m_session, "fujinet_external", 0) != 0);
+    connect(m_external, &QCheckBox::toggled, this, [this](bool wanted) {
+        if (intvsession_get_int(m_session, "fujinet_external", 0) ==
+            (wanted ? 1 : 0))
+            return;
+        intvsession_set_int(m_session, "fujinet_external", wanted ? 1 : 0);
+        m_sessionDirty = true;
+    });
+    fujinetForm->addRow(QStringLiteral("Use external FujiNet"), m_external);
+    m_externalAddr = new QLineEdit(
+        QString::fromUtf8(intvsession_get_str(m_session,
+                                              "fujinet_external_addr", "")),
+        fujinetBox);
+    m_externalAddr->setPlaceholderText(QStringLiteral("127.0.0.1:65503"));
+    m_externalAddr->setEnabled(m_external->isChecked());
+    connect(m_external, &QCheckBox::toggled, m_externalAddr,
+            &QWidget::setEnabled);
+    /* Valid text (or none, meaning 127.0.0.1:65503) is saved; anything else
+     * is shown in red and not saved. */
+    connect(m_externalAddr, &QLineEdit::textChanged, this,
+            [this](const QString &text) {
+        char host[64];
+        int port;
+        const QByteArray addr = text.trimmed().toUtf8();
+        if (intvsession_parse_hostport(addr.constData(), host, sizeof host,
+                                       &port) != 0) {
+            m_externalAddr->setStyleSheet(
+                QStringLiteral("QLineEdit { color: #d83b3b; }"));
+            return;
+        }
+        m_externalAddr->setStyleSheet(QString());
+        if (QString::fromUtf8(intvsession_get_str(
+                m_session, "fujinet_external_addr", "")) == text.trimmed())
+            return;
+        intvsession_set_str(m_session, "fujinet_external_addr",
+                            addr.constData());
+        m_sessionDirty = true;
+    });
+    fujinetForm->addRow(QStringLiteral("Address:port"), m_externalAddr);
+    auto *fujinetNote = new QLabel(
+        QStringLiteral("Skips the built-in FujiNet and dials another "
+                       "instance. Start that instance listening on this "
+                       "address (its [BOIP] port). Applied by restarting the "
+                       "session when this dialog closes."),
+        fujinetBox);
+    fujinetNote->setWordWrap(true);
+    fujinetForm->addRow(fujinetNote);
+
     outer->addWidget(machineBox);
     outer->addWidget(inputBox);
+    outer->addWidget(fujinetBox);
 
     /* ROMs: the system ROMs, grouped, each imported or not. */
     auto *roms = new QGroupBox(QStringLiteral("ROMs"), this);
@@ -145,7 +199,23 @@ SettingsDialog::SettingsDialog(intvsession *session, QWidget *parent)
     refreshRoms();
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, this);
-    connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, this, [this] {
+        char host[64];
+        int port;
+        if (m_external->isChecked() &&
+            intvsession_parse_hostport(
+                m_externalAddr->text().trimmed().toUtf8().constData(), host,
+                sizeof host, &port) != 0) {
+            QMessageBox::warning(
+                this, QStringLiteral("External FujiNet"),
+                QStringLiteral("\"%1\" is not an address:port. Example: "
+                               "127.0.0.1:65503")
+                    .arg(m_externalAddr->text()));
+            m_externalAddr->setFocus();
+            return;
+        }
+        accept();
+    });
     outer->addWidget(buttons);
 }
 

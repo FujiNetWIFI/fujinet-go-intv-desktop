@@ -914,12 +914,17 @@ static void refresh_fujinet(debugger *d, int force)
     int follow;
 
     d->fuji_ticks = 0;
-    if (!d->session || !intvsession_fujinet_running(d->session))
+    if (!d->session || (!intvsession_fujinet_running(d->session) &&
+                        !intvsession_fujinet_external(d->session))) {
         SetWindowTextA(d->fuji_note, "FujiNet is not running.");
-    else
-        SetWindowTextA(d->fuji_note, intvsession_fujinet_link(d->session)
-                                         ? "FujiNet cartridge, connected."
-                                         : "FujiNet cartridge, not connected.");
+    } else {
+        char note[160];
+        snprintf(note, sizeof(note), "%s FujiNet at %s, cartridge %s.",
+                 intvsession_fujinet_external(d->session) ? "External" : "Built-in",
+                 intvsession_boip_endpoint(d->session),
+                 intvsession_fujinet_link(d->session) ? "connected" : "not connected");
+        SetWindowTextA(d->fuji_note, note);
+    }
     intvdebug_fujinet_state(d->dbg, state, (int)sizeof(state));
     ascii_view_text(state, state_a, sizeof(state_a));
     GetWindowTextA(d->fuji_state, cur, sizeof(cur));

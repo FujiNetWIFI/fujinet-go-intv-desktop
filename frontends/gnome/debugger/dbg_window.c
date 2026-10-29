@@ -435,13 +435,19 @@ static void refresh_fujinet(DbgWin *w, gboolean force)
     int n = intvdebug_fujinet_trace(w->dbg, p, INTVDEBUG_FUJI_TRACE_MAX), i;
 
     w->fuji_at = g_get_monotonic_time();
-    if (!w->session || !intvsession_fujinet_running(w->session))
+    if (!w->session || (!intvsession_fujinet_running(w->session) &&
+                        !intvsession_fujinet_external(w->session))) {
         gtk_label_set_text(w->fuji_note, "FujiNet is not running.");
-    else
-        gtk_label_set_text(w->fuji_note,
-                           intvsession_fujinet_link(w->session)
-                               ? "FujiNet cartridge, connected."
-                               : "FujiNet cartridge, not connected.");
+    } else {
+        char note[160];
+        g_snprintf(note, sizeof(note), "%s FujiNet at %s, cartridge %s.",
+                   intvsession_fujinet_external(w->session) ? "External"
+                                                            : "Built-in",
+                   intvsession_boip_endpoint(w->session),
+                   intvsession_fujinet_link(w->session) ? "connected"
+                                                        : "not connected");
+        gtk_label_set_text(w->fuji_note, note);
+    }
     intvdebug_fujinet_state(w->dbg, state, (int)sizeof(state));
     gtk_text_buffer_get_bounds(sb, &a, &b);
     cur = gtk_text_buffer_get_text(sb, &a, &b, FALSE);

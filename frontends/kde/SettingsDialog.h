@@ -15,6 +15,7 @@
 class QCheckBox;
 class QComboBox;
 class QLabel;
+class QLineEdit;
 
 class SettingsDialog : public QDialog {
     Q_OBJECT
@@ -40,6 +41,8 @@ private:
     intvsession *m_session;
     QComboBox *m_ecsCombo = nullptr;
     QCheckBox *m_ecsKeyboard = nullptr;
+    QCheckBox *m_external = nullptr;
+    QLineEdit *m_externalAddr = nullptr;
     std::vector<QLabel *> m_romRows;
     bool m_sessionDirty = false;
 };

@@ -897,12 +897,13 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     int n = intvdebug_fujinet_trace(_dbg, p, INTVDEBUG_FUJI_TRACE_MAX);
 
     _fujiTicks = 0;
-    if (!_session || !intvsession_fujinet_running(_session))
+    if (!_session || (!intvsession_fujinet_running(_session) && !intvsession_fujinet_external(_session)))
         _fujiNote.stringValue = @"FujiNet is not running.";
     else
-        _fujiNote.stringValue = intvsession_fujinet_link(_session)
-                                    ? @"FujiNet cartridge, connected."
-                                    : @"FujiNet cartridge, not connected.";
+        _fujiNote.stringValue = [NSString stringWithFormat:@"%@ FujiNet at %s, cartridge %@.",
+                                 intvsession_fujinet_external(_session) ? @"External" : @"Built-in",
+                                 intvsession_boip_endpoint(_session),
+                                 intvsession_fujinet_link(_session) ? @"connected" : @"not connected"];
     intvdebug_fujinet_state(_dbg, state, (int)sizeof(state));
     setText(_fujiState, [NSString stringWithUTF8String:state] ?: @"", NO);
 

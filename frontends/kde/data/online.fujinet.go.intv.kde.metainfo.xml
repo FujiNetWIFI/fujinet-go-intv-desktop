@@ -49,6 +49,13 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.12.0" date="2026-10-29">
+      <description>
+        <p>
+          New: use an external FujiNet. A switch in Preferences makes the app connect to another FujiNet instance at a host:port you enter (for example 127.0.0.1:65503) instead of starting the built-in one.
+        </p>
+      </description>
+    </release>
     <release version="0.11.2" date="2026-10-27">
       <description>
         <p>

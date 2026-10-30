@@ -18,6 +18,10 @@ GitHub remote and getting all 5 CI workflows green there (macOS and Windows
 CI in particular are the first real test of those builds outside this
 machine), then cutting the `v0.1.0` release tag.
 
+## External FujiNet
+
+A switch in Preferences makes the app connect to another FujiNet instance at a host:port you enter, e.g. `127.0.0.1:65503`, instead of starting the built-in one.
+
 ## Building
 
 ```sh

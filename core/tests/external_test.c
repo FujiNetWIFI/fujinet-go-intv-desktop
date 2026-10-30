@@ -63,6 +63,8 @@ int main(void)
     socklen_t sinlen = sizeof(sin);
     int listener, conn = -1;
 
+    /* A runner without an audio device would stall jzIntv's first frame. */
+    setenv("SDL_AUDIODRIVER", "dummy", 1);
     test_tmp_template(config_dir, sizeof(config_dir), "intv-external-cfg-");
     test_tmp_template(data_dir, sizeof(data_dir), "intv-external-data-");
     if (!mkdtemp(config_dir) || !mkdtemp(data_dir)) {

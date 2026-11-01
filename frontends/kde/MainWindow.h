@@ -10,7 +10,7 @@
 
 #include "intvsession.h"
 
-class DisplayWidget;
+class DisplayView;
 class QStackedWidget;
 
 class MainWindow : public QMainWindow {
@@ -46,12 +46,14 @@ private:
     QWidget *buildNoBiosPage();
     /* The picture when the ROMs are there, else the No-BIOS page. */
     void showPage();
+    /* No usable GPU device: swap in the QPainter display. */
+    void useSoftwareDisplay();
     /* (Re)starts the session once its ROMs exist (after an import). */
     void startIfReady();
     void screenshotAndQuit(const QString &path);
 
     intvsession *m_session;
-    DisplayWidget *m_display;
+    DisplayView *m_display;
     QStackedWidget *m_stack;
     QWidget *m_noBios;
     QTimer *m_sysactTimer;

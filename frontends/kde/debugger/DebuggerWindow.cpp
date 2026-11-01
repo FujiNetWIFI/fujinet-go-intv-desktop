@@ -185,8 +185,20 @@ DebuggerWindow::DebuggerWindow(QWidget *parent, intvsession *session)
             refreshFujinet(false);
         }
     });
+    refreshAll();   /* the poll itself starts in showEvent */
+}
+
+void DebuggerWindow::showEvent(QShowEvent *e)
+{
+    QMainWindow::showEvent(e);
     m_tick->start(33);
-    refreshAll();
+    refreshAll();   /* whatever moved while it was hidden */
+}
+
+void DebuggerWindow::hideEvent(QHideEvent *e)
+{
+    QMainWindow::hideEvent(e);
+    m_tick->stop();
 }
 
 DebuggerWindow::~DebuggerWindow()

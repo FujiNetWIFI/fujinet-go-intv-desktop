@@ -191,6 +191,20 @@ const char *intvsession_last_error(const intvsession *s);
 int intvsession_copy_frame(intvsession *s, uint32_t *dst,
                            uint64_t *serial_inout);
 
+/* Ask to be told when a new frame is ready, for a frontend with no frame
+ * clock of its own: cb(ctx) runs on the emulator thread after each changed
+ * frame is published (a frame identical to the previous one is not published
+ * again). Keep it quick (post an event and return) and do not call into the
+ * session from it. Passing NULL stops the calls, and returns only after any
+ * call in flight has finished, so ctx may be freed right after. */
+typedef void (*intvsession_frame_cb)(void *ctx);
+void intvsession_set_frame_callback(intvsession *s, intvsession_frame_cb cb,
+                                    void *ctx);
+/* Frames the machine has run since it started, including the ones identical
+ * to their predecessor (which are not published again): use it to ask "is the
+ * machine running", not "is the picture changing". */
+uint64_t intvsession_frame_count(intvsession *s);
+
 /* ---- input -----------------------------------------------------------------
  * See core/jzintv/intv_host.h for exactly what each id writes and why this
  * is a direct pad_t.l[]/r[] injection rather than going through jzIntv's own

@@ -59,6 +59,21 @@ int intv_frame_copy(uint32_t *dst, uint64_t *serial_inout);
  * to clear. Not thread-safe against itself -- call once at startup. */
 void intv_frame_set_publish_hook(void (*hook)(void *ctx), void *ctx);
 
+/* Called on the emulator thread after each CHANGED frame is published (an
+ * identical frame is not published again: no serial bump, no call). Keep it
+ * quick and do not call back into the frame store. NULL stops the calls and
+ * returns only after any call in flight has finished. */
+void intv_frame_set_frame_callback(void (*cb)(void *ctx), void *ctx);
+
+/* Frames the machine has produced since intv_frame_reset, including the
+ * identical ones that were not published: "is the machine running", not "is
+ * the picture changing". */
+uint64_t intv_frame_count(void);
+
+/* Forget the previous frame and zero the count (called when a run starts, so
+ * its first frame is always published). */
+void intv_frame_reset(void);
+
 #ifdef __cplusplus
 }
 #endif

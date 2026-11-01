@@ -32,6 +32,7 @@
 #include <QStatusBar>
 
 #include "DisplayWidget.h"
+#include "SoftDisplayWidget.h"
 #include "FujiNetWindows.h"
 #include "SettingsDialog.h"
 #include "debugger/DebuggerWindow.h"
@@ -48,10 +49,13 @@ MainWindow::MainWindow(intvsession *session, QWidget *parent)
     setWindowTitle(QStringLiteral("FujiNet Go Intv"));
     resize(800, 650);
 
-    m_display = new DisplayWidget(session, this);
+    auto *gpu = new DisplayWidget(session, this);
+    m_display = gpu;
+    connect(gpu, &QRhiWidget::renderFailed, this, &MainWindow::useSoftwareDisplay,
+            Qt::QueuedConnection);
     m_noBios = buildNoBiosPage();
     m_stack = new QStackedWidget(this);
-    m_stack->addWidget(m_display);
+    m_stack->addWidget(gpu);
     m_stack->addWidget(m_noBios);
     setCentralWidget(m_stack);
     statusBar();
@@ -185,10 +189,26 @@ QWidget *MainWindow::buildNoBiosPage()
 void MainWindow::showPage()
 {
     const bool bios = intvsession_has_system_roms(m_session) != 0;
-    m_stack->setCurrentWidget(bios ? static_cast<QWidget *>(m_display)
-                                   : m_noBios);
+    m_stack->setCurrentWidget(bios ? m_display->widget() : m_noBios);
     if (bios)
-        m_display->setFocus();
+        m_display->widget()->setFocus();
+}
+
+void MainWindow::useSoftwareDisplay()
+{
+    if (dynamic_cast<SoftDisplayWidget *>(m_display))
+        return;
+    QWidget *old = m_display->widget();
+    const bool wasCurrent = m_stack->currentWidget() == old;
+    auto *soft = new SoftDisplayWidget(m_session, this);
+    m_display = soft;
+    m_stack->insertWidget(0, soft);
+    m_stack->removeWidget(old);
+    old->deleteLater();   /* stops its feed */
+    if (wasCurrent) {
+        m_stack->setCurrentWidget(soft);
+        soft->setFocus();
+    }
 }
 
 void MainWindow::startIfReady()
@@ -280,7 +300,7 @@ void MainWindow::resetToConfig()
             QString::fromUtf8(intvsession_last_error(m_session)), 5000);
     else
         statusBar()->showMessage(QStringLiteral("Reset to CONFIG"), 5000);
-    m_display->setFocus();
+    m_display->widget()->setFocus();
 }
 
 void MainWindow::resetGame()
@@ -290,7 +310,7 @@ void MainWindow::resetGame()
             QString::fromUtf8(intvsession_last_error(m_session)), 5000);
     else
         statusBar()->showMessage(QStringLiteral("Reset Game"), 5000);
-    m_display->setFocus();
+    m_display->widget()->setFocus();
 }
 
 void MainWindow::showSettings()

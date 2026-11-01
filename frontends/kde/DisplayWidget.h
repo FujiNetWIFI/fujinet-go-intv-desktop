@@ -1,49 +1,70 @@
 /*
- * DisplayWidget: the emulator video widget for the KDE/Qt frontend.
+ * The emulator display on the GPU: a QRhiWidget that keeps one texture the
+ * size of the frame (160x200) and draws one textured quad letterboxed to
+ * 4:3, only when the session has published a new frame (see FrameFeed). Qt
+ * picks Vulkan, Metal, D3D or OpenGL for it.
+ *
+ * If no GPU device can be had it emits renderFailed() and the main window
+ * swaps in the software SoftDisplayWidget.
+ *
+ * Key events are translated by KeyForward (intvForwardKey); press and
+ * release both matter, since jzIntv's pad_t tracks a held key by level.
+ *
+ * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
-
 #pragma once
 
-#include <QImage>
-#include <QWidget>
-
+#include <QFocusEvent>
+#include <QKeyEvent>
+#include <QRhiWidget>
+#include <cstdint>
+#include <memory>
 #include <vector>
+#include <rhi/qrhi.h>
 
+#include "DisplayView.h"
+#include "FrameFeed.h"
 #include "intvsession.h"
 
-class QTimer;
-
-class DisplayWidget : public QWidget {
+class DisplayWidget : public QRhiWidget, public DisplayView {
     Q_OBJECT
 public:
     explicit DisplayWidget(intvsession *session, QWidget *parent = nullptr);
+    ~DisplayWidget() override;
+
+    QWidget *widget() override { return this; }
 
 protected:
-    void paintEvent(QPaintEvent *event) override;
+    void initialize(QRhiCommandBuffer *cb) override;
+    void render(QRhiCommandBuffer *cb) override;
+    void releaseResources() override;
+    void showEvent(QShowEvent *) override;
+    void hideEvent(QHideEvent *) override;
+    bool event(QEvent *e) override;
+    bool eventFilter(QObject *watched, QEvent *e) override;
     void keyPressEvent(QKeyEvent *event) override;
     void keyReleaseEvent(QKeyEvent *event) override;
     void focusOutEvent(QFocusEvent *event) override;
-    bool event(QEvent *event) override;
+    /* Tab belongs to the ECS keyboard, not to focus traversal. */
+    bool focusNextPrevChild(bool) override { return false; }
 
 private:
-    void forwardKey(const QKeyEvent *event, int down);
-    QRectF destRect() const;
+    void onFrame();
+    void updateActive();
 
     intvsession *m_session;
-    /* The session writes tightly-packed XRGB8888 rows, so the frame is kept
-     * in a plain buffer and QImage is only ever a view over it. On a
-     * little-endian host XRGB8888 is exactly QImage::Format_RGB32. Fixed
-     * size (INTVSESSION_FB_WIDTH x _HEIGHT) -- the STIC's output does not
-     * vary at runtime, unlike the CoCo/MSX targets' own DisplayWidgets.
-     *
-     * Plain QWidget + a QTimer poll, not QOpenGLWidget's frameSwapped --
-     * unlike CoCo/MSX, intvsession has no notify_vsync to feed (jzIntv's
-     * own paced thread already governs itself to NTSC/PAL speed
-     * independent of the frontend; see frontends/gnome/display.c's own
-     * comment on this), so there is nothing an OpenGL swap signal would
-     * buy here, and one fewer Qt component (OpenGLWidgets) to depend on. */
+    FrameFeed *m_feed;
+    /* The session writes tightly-packed XRGB8888 rows straight into this;
+     * the upload reads from it. The shader ignores the X byte. */
     std::vector<uint32_t> m_frame;
     uint64_t m_serial = 0;
-    QTimer *m_tick;
+    bool m_dirty = false;      /* m_frame holds a frame not yet uploaded */
+
+    QRhi *m_rhi = nullptr;
+    std::unique_ptr<QRhiBuffer> m_ubuf;
+    std::unique_ptr<QRhiTexture> m_tex;
+    std::unique_ptr<QRhiSampler> m_nearest;
+    std::unique_ptr<QRhiShaderResourceBindings> m_srb;
+    std::unique_ptr<QRhiGraphicsPipeline> m_pipeline;
 };

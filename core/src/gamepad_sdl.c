@@ -654,6 +654,7 @@ static void *thread_main(void *arg)
     while (!s_stop_requested)
     {
         SDL_Event ev;
+        int npads;
         while (SDL_PollEvent(&ev))
         {
             switch (ev.type)
@@ -709,7 +710,12 @@ static void *thread_main(void *arg)
         }
 
         poll_sticks();
-        SDL_Delay(16); /* ~60Hz poll, matching the video frame rate */
+        pthread_mutex_lock(&s_lock);
+        npads = s_pad_count;
+        pthread_mutex_unlock(&s_lock);
+        /* ~60Hz with a pad attached; with none there is only hot-plug to
+         * notice. SDL_Delay, never SDL_WaitEventTimeout (it polls at 1 kHz). */
+        SDL_Delay(npads > 0 ? 16 : 100);
     }
 
     pthread_mutex_lock(&s_lock);

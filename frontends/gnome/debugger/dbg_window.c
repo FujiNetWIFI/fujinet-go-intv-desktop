@@ -82,9 +82,49 @@ typedef struct {
     gint64 fuji_at;
 
     guint tick_id;
+    int kick;            /* ticks to keep running while paused after an action */
+    gulong map_id, unmap_id, susp_id;
     uint64_t seen_serial;
     int was_paused;
 } DbgWin;
+
+/* The tick (one per display frame) runs only while the window is mapped and
+ * there is something to watch: the machine running (a breakpoint can stop it
+ * at any time), or a short while after an action while paused (a step lands
+ * asynchronously). A paused debugger with nothing happening costs no
+ * wakeups. */
+static gboolean tick_cb(GtkWidget *widget, GdkFrameClock *clock,
+                        gpointer user_data);
+
+static void update_tick(DbgWin *w)
+{
+    gboolean want = w->win && gtk_widget_get_mapped(GTK_WIDGET(w->win)) &&
+                    !gtk_window_is_suspended(w->win) && w->dbg &&
+                    (!intvdebug_is_paused(w->dbg) || w->kick > 0);
+
+    if (want && !w->tick_id)
+        w->tick_id = gtk_widget_add_tick_callback(GTK_WIDGET(w->win), tick_cb,
+                                                  w, NULL);
+    else if (!want && w->tick_id) {
+        gtk_widget_remove_tick_callback(GTK_WIDGET(w->win), w->tick_id);
+        w->tick_id = 0;
+    }
+}
+
+/* An action that will change what the panes show: keep ticking for a second
+ * or so after it (paused), until the result has landed. */
+static void kick(DbgWin *w)
+{
+    w->kick = 60;
+    update_tick(w);
+}
+
+/* Force the next tick to rebuild the panes. */
+static void invalidate(DbgWin *w)
+{
+    w->seen_serial = 0;
+    kick(w);
+}
 
 /* All intvstic_render_* outputs are RGBA8888, alpha always 0xFF except
  * intvstic_render_mob (which uses alpha for transparency) -- both are the
@@ -215,7 +255,7 @@ static void on_row_activated(GtkListBox *box, GtkListBoxRow *row,
 
     addr = g_object_get_data(G_OBJECT(row), "intv-addr");
     intvdebug_breakpoint_toggle(w->dbg, (uint16_t)GPOINTER_TO_UINT(addr));
-    w->seen_serial = 0; /* redraw the marker immediately */
+    invalidate(w); /* redraw the marker immediately */
 }
 
 static void refresh_disasm(DbgWin *w)
@@ -308,7 +348,7 @@ static void on_sym_row_activated(GtkListBox *box, GtkListBoxRow *row,
     addr = g_object_get_data(G_OBJECT(row), "intv-addr");
     w->mem_view_addr = (uint16_t)GPOINTER_TO_UINT(addr);
     gtk_editable_set_text(GTK_EDITABLE(w->mem_addr), "");
-    w->seen_serial = 0;
+    invalidate(w);
 }
 
 /* Only rebuilds the list when the table's generation or the filter text has
@@ -511,6 +551,8 @@ static gboolean tick_cb(GtkWidget *widget, GdkFrameClock *clock,
 
     if (!w->dbg)
         return G_SOURCE_CONTINUE;
+    if (w->kick > 0)
+        w->kick--;
 
     serial = intvdebug_stop_serial(w->dbg);
     if (serial != w->seen_serial ||
@@ -522,7 +564,18 @@ static gboolean tick_cb(GtkWidget *widget, GdkFrameClock *clock,
         /* the one view that moves while the machine runs */
         refresh_fujinet(w, FALSE);
     }
+    /* Paused with nothing pending: stop (this removes the callback). */
+    if (intvdebug_is_paused(w->dbg) && w->kick <= 0) {
+        w->tick_id = 0;
+        return G_SOURCE_REMOVE;
+    }
     return G_SOURCE_CONTINUE;
+}
+
+static void on_window_state(GObject *obj, GParamSpec *pspec, gpointer user_data)
+{
+    (void)obj; (void)pspec;
+    update_tick(user_data);
 }
 
 /* ---- actions --------------------------------------------------------------- */
@@ -548,7 +601,7 @@ static void on_clear_bp(GtkButton *b, gpointer u)
     DbgWin *w = u;
     (void)b;
     intvdebug_breakpoint_clear_all(w->dbg);
-    w->seen_serial = 0;
+    invalidate(w);
 }
 
 /* Errors here go straight to the status label, same as on_load_symbols'
@@ -561,7 +614,7 @@ static void go_to_mem_addr(DbgWin *w)
     uint16_t addr;
     if (intvsym_parse_addr(w->symtab, text, &addr)) {
         w->mem_view_addr = addr;
-        w->seen_serial = 0;
+        invalidate(w);
     } else {
         char msg[96];
         snprintf(msg, sizeof(msg), "No such symbol or address: %s", text);
@@ -579,7 +632,7 @@ static void on_break_addr_activate(GtkEntry *entry, gpointer user_data)
     uint16_t addr;
     if (intvsym_parse_addr(w->symtab, text, &addr)) {
         intvdebug_breakpoint_toggle(w->dbg, addr);
-        w->seen_serial = 0; /* redraw the marker immediately */
+        invalidate(w); /* redraw the marker immediately */
     } else {
         char msg[96];
         snprintf(msg, sizeof(msg), "No such symbol or address: %s", text);
@@ -602,7 +655,7 @@ static void on_cards_page(GtkButton *btn, gpointer user_data)
     if (next > last_page)
         next = last_page;
     w->card_first = next;
-    w->seen_serial = 0;
+    invalidate(w);
     if (intvdebug_is_paused(w->dbg))
         refresh_stic(w);
 }
@@ -647,7 +700,7 @@ static void load_symbols_done(GObject *source, GAsyncResult *result,
             intvsession_settings_flush(w->session);
         }
     }
-    w->seen_serial = 0;
+    invalidate(w);
 }
 
 static void on_load_symbols(GtkButton *button, gpointer user_data)
@@ -685,7 +738,7 @@ static void on_clear_symbols(GtkButton *b, gpointer u)
     DbgWin *w = u;
     (void)b;
     intvsymtab_clear_user(w->symtab);
-    w->seen_serial = 0;
+    invalidate(w);
 }
 
 static void on_fuji_clear(GtkButton *b, gpointer u)
@@ -713,6 +766,7 @@ static gboolean on_key(GtkEventControllerKey *c, guint keyval, guint keycode,
     DbgWin *w = user_data;
     (void)c;
     (void)keycode;
+    kick(w);
     switch (keyval) {
     case GDK_KEY_F5:
         on_run_pause(NULL, w);
@@ -752,6 +806,9 @@ static gboolean on_closed(GtkWindow *window, gpointer user_data)
         gtk_widget_remove_tick_callback(GTK_WIDGET(w->win), w->tick_id);
         w->tick_id = 0;
     }
+    g_signal_handler_disconnect(w->win, w->map_id);
+    g_signal_handler_disconnect(w->win, w->unmap_id);
+    g_signal_handler_disconnect(w->win, w->susp_id);
     /* Releasing costs the machine nothing further (see intvdebug.h) and
      * leaving it engaged+paused would look like the emulator had hung. */
     intvdebug_set_engaged(w->dbg, 0);
@@ -769,6 +826,7 @@ static GtkWidget *tool_button(const char *label, const char *tooltip,
     GtkWidget *b = gtk_button_new_with_mnemonic(label);
     gtk_widget_set_tooltip_text(b, tooltip);
     g_signal_connect(b, "clicked", cb, w);
+    g_signal_connect_swapped(b, "clicked", G_CALLBACK(kick), w);
     return b;
 }
 
@@ -1129,7 +1187,10 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     intvdebug_set_engaged(w->dbg, 1);
     intvdebug_pause(w->dbg);
 
-    w->tick_id =
-        gtk_widget_add_tick_callback(GTK_WIDGET(w->win), tick_cb, w, NULL);
+    w->map_id = g_signal_connect_swapped(w->win, "map", G_CALLBACK(kick), w);
+    w->unmap_id = g_signal_connect_swapped(w->win, "unmap",
+                                           G_CALLBACK(update_tick), w);
+    w->susp_id = g_signal_connect(w->win, "notify::suspended",
+                                  G_CALLBACK(on_window_state), w);
     gtk_window_present(w->win);
 }

@@ -6,6 +6,7 @@
  */
 #include <stdint.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -154,6 +155,29 @@ int main(void)
             usleep(10000);
         }
         check("frame published", got);
+
+        /* the frame counter runs whatever the picture does, and the
+         * callback only comes for a changed one */
+        {
+            uint64_t c0 = intvsession_frame_count(s);
+            for (int i = 0; i < 100 && intvsession_frame_count(s) < c0 + 10; i++)
+                usleep(10000);
+            check("frame count advances", intvsession_frame_count(s) >= c0 + 10);
+
+            /* --nobusywait must not cost the pacing: 60 frames take about a
+             * second (NTSC 59.92 Hz); loose bounds, it is a wall-clock test */
+            struct timespec t0, t1;
+            c0 = intvsession_frame_count(s);
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            while (intvsession_frame_count(s) < c0 + 60)
+                usleep(2000);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double secs = (double)(t1.tv_sec - t0.tv_sec) +
+                          (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+            fprintf(stderr, "session_test: 60 frames in %.3f s\n", secs);
+            check("machine holds ~60 Hz", secs > 0.85 && secs < 1.2);
+            intvsession_set_frame_callback(s, NULL, NULL);
+        }
 
         intvsession_pad_key(s, INTVSESSION_PAD_LEFT, INTVSESSION_KEY_1, 1);
         intvsession_pad_key(s, INTVSESSION_PAD_LEFT, INTVSESSION_KEY_1, 0);

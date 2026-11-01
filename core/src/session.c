@@ -300,6 +300,19 @@ int intvsession_copy_frame(intvsession *s, uint32_t *dst,
     return intv_frame_copy(dst, serial_inout);
 }
 
+void intvsession_set_frame_callback(intvsession *s, intvsession_frame_cb cb,
+                                    void *ctx)
+{
+    (void)s;
+    intv_frame_set_frame_callback(cb, ctx);
+}
+
+uint64_t intvsession_frame_count(intvsession *s)
+{
+    (void)s;
+    return intv_frame_count();
+}
+
 int intvsession_render_audio(intvsession *s, int16_t *dst, int max_samples)
 {
     int n = intv_audio_copy(dst, max_samples);

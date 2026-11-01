@@ -23,18 +23,23 @@
 #include "roms_embedded.h"
 #include "test_tmpdir.h"
 
-/* Polls intv_frame_copy until a NEW serial arrives (proving the emulator
- * thread is actively publishing again) or max_ms elapses. Returns 1 on a
- * fresh frame, 0 on timeout. */
-static int wait_for_new_frame(uint64_t *serial, int max_ms)
+/* Polls intv_frame_count until it moves past *count (proving the emulator
+ * thread is still running frames) or max_ms elapses. The count, not the
+ * serial: a frame identical to the previous one is not published again, and
+ * a still picture after a reset is exactly what this test may see. Returns 1
+ * on a new frame, 0 on timeout. */
+static int wait_for_new_frame(uint64_t *count, int max_ms)
 {
-    uint32_t pixels[INTV_FRAME_WIDTH * INTV_FRAME_HEIGHT];
     int waited;
 
     for (waited = 0; waited < max_ms; waited += 10)
     {
-        if (intv_frame_copy(pixels, serial))
+        const uint64_t now = intv_frame_count();
+        if (now > *count + 1)
+        {
+            *count = now;
             return 1;
+        }
         usleep(10000); /* 10ms */
     }
     return 0;
@@ -75,8 +80,8 @@ int main(void)
 
     /* Wait for the machine to actually boot before resetting it -- resetting
      * mid-boot would prove nothing about periph_reset() specifically. */
-    uint64_t serial = 0;
-    if (!wait_for_new_frame(&serial, 3000))
+    uint64_t count = 0;
+    if (!wait_for_new_frame(&count, 3000))
     {
         fprintf(stderr, "reset_test: no frame published before reset\n");
         intv_host_stop();
@@ -105,7 +110,7 @@ int main(void)
      * RESET didn't hang jzintv.c's main loop (see intv_host_reset's own
      * comment: do_reset == 2 clears itself, periph_reset() runs exactly
      * once, one iteration later). */
-    if (!wait_for_new_frame(&serial, 3000))
+    if (!wait_for_new_frame(&count, 3000))
     {
         fprintf(stderr, "reset_test: no frame published after reset\n");
         intv_host_stop();

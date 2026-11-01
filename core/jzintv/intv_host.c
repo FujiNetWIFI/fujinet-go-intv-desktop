@@ -23,6 +23,7 @@
  * be visible before cfg.h is, in the same order jzintv.c uses them.
  */
 #include "intv_audio.h"
+#include "intv_frame.h"
 
 #include "config.h"
 #include "lzoe/lzoe.h"
@@ -370,6 +371,11 @@ int intv_host_start(const intv_host_opts *opts)
      * plat_is_batch_mode(). */
     if (push_arg("-r1") != 0) { free_argv(); return -1; }
 
+    /* speed.c burns the last <= 1 ms of every frame in a spin loop unless
+     * told not to; that is a core pinned for nothing on a desktop that has
+     * a perfectly good timed sleep. */
+    if (push_arg("--nobusywait") != 0) { free_argv(); return -1; }
+
     /* Trailing positional argument: cfg.c reads argv_copy[optind] (the
      * first non-flag argument, which by construction is the last thing we
      * push) into cfg->fn_game when present, and only falls back to booting
@@ -392,6 +398,8 @@ int intv_host_start(const intv_host_opts *opts)
     pthread_mutex_lock(&s_lock);
     s_running = 1;
     pthread_mutex_unlock(&s_lock);
+
+    intv_frame_reset();
 
     if (pthread_create(&s_thread, NULL, thread_main, NULL) != 0)
     {

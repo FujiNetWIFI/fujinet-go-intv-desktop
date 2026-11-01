@@ -32,6 +32,10 @@ private:
     explicit DebuggerWindow(QWidget *parent, intvsession *session);
     ~DebuggerWindow() override;
 
+    /* The 33 ms poll runs only while the window is shown. */
+    void showEvent(QShowEvent *e) override;
+    void hideEvent(QHideEvent *e) override;
+
     void buildUi();
     void refreshAll();
     void refreshDisasm();

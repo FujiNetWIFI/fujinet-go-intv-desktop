@@ -39,6 +39,12 @@ set(JZINTV_VERSION "20200712")
 set(JZINTV_URL "http://spatula-city.org/~im14u2c/intv/dl/jzintv-${JZINTV_VERSION}-src.zip")
 set(JZINTV_SHA256 "b36b3b274d0fc05cb227818d4957f96620d23d8d6b7596c24f07675ced7129f3")
 
+# fujinet-firmware, fork branch boip-idle-wait-on-nodelay (81f9fdb3c): the
+# previous pin (c68e8630, tcp-protocol-disable-nagle) plus the BoIP idle-wait
+# fix (PR #2247; idle wakeups ~1000/s -> ~100/s). Temporary: moves back to
+# master when #2247 merges. The commit lives only on the fork, hence the fork
+# URL. The c68e8630 description follows.
+#
 # fujinet-firmware tcp-protocol-disable-nagle (c68e8630), which is master
 # (baa314e8) plus one commit: TCP.cpp now sets TCP_NODELAY on both the
 # connecting and the accepted socket. N: traffic is small interactive writes,
@@ -52,8 +58,8 @@ set(JZINTV_SHA256 "b36b3b274d0fc05cb227818d4957f96620d23d8d6b7596c24f07675ced712
 # ProtocolParser -> NetworkProtocolFactory (#1600), fujiDeviceID_t as an enum
 # class (#1602), the systembus removal from media (#1646), the O2 and Mac 68k
 # bringups and a round of heap-leak fixes all arrive with it.
-set(FUJINET_COMMIT "c68e863034737611415ca568c3ea4607a2220c7e")
-set(FUJINET_URL "https://github.com/FujiNetWIFI/fujinet-firmware")
+set(FUJINET_COMMIT "81f9fdb3ce7bd7af9ef507282782085ad18fc16c")
+set(FUJINET_URL "https://github.com/tschak909/fujinet-firmware")
 
 # intv_provide_dependency(NAME <n> PATH <p> SENTINEL <file> OVERRIDE <VAR>
 #                          RESULT <out>

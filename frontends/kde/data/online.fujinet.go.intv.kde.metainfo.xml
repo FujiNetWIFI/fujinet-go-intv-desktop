@@ -49,6 +49,13 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.13.0" date="2026-11-01">
+      <description>
+        <p>
+          Lower CPU use: the picture is drawn on the GPU (with a software fallback) only when the emulator has a new frame, and the display stops updating while the window is hidden. The built-in FujiNet wakes about a tenth as often when nothing is happening. The emulator no longer busy-waits for the last millisecond of every frame. Needs Qt 6.7 or newer.
+        </p>
+      </description>
+    </release>
     <release version="0.12.1" date="2026-11-01">
       <description>
         <p>

@@ -10,6 +10,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -149,6 +150,21 @@ static const char *exe_dir(void)
             char *p = strrchr(dir, '\\');
             if (!p) p = strrchr(dir, '/');
             if (p) *p = '\0'; else dir[0] = '\0';
+        }
+    }
+#elif defined(__APPLE__)
+    /* A macOS bundle keeps libfujinet.dylib and fujinet/ in Contents/MacOS
+     * beside the executable. */
+    static int resolved;
+    if (!resolved) {
+        uint32_t sz = (uint32_t)sizeof(dir);
+        extern int _NSGetExecutablePath(char *, uint32_t *);
+        resolved = 1;
+        if (_NSGetExecutablePath(dir, &sz) == 0) {
+            char *p = strrchr(dir, '/');
+            if (p) *p = '\0'; else dir[0] = '\0';
+        } else {
+            dir[0] = '\0';
         }
     }
 #endif

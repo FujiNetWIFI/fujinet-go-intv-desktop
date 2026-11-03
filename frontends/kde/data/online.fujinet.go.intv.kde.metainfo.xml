@@ -49,6 +49,13 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.13.1" date="2026-11-03">
+      <description>
+        <p>
+          macOS: the built-in FujiNet now starts. It was never found inside the app bundle, so CONFIG opened on Select Network with an empty list instead of Hosts.
+        </p>
+      </description>
+    </release>
     <release version="0.13.0" date="2026-11-01">
       <description>
         <p>

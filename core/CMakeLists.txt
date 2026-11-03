@@ -407,6 +407,14 @@ target_link_libraries(fujibus_smoke intv_session)
 add_executable(hostport_test tests/hostport_test.c)
 target_link_libraries(hostport_test intv_session)
 
+# macOS only (skips elsewhere): the runtime bundled beside the executable
+# must be found -- exe_dir() once had no macOS branch.
+add_executable(exe_dir_lib_test tests/exe_dir_lib_test.c)
+target_link_libraries(exe_dir_lib_test intv_session)
+target_include_directories(exe_dir_lib_test PRIVATE src)
+target_compile_definitions(exe_dir_lib_test PRIVATE
+  TEST_EXE_DIR="$<TARGET_FILE_DIR:exe_dir_lib_test>")
+
 add_executable(external_test tests/external_test.c)
 target_link_libraries(external_test intv_session)
 
@@ -450,6 +458,8 @@ add_test(NAME gamepad COMMAND gamepad_test)
 add_test(NAME disc COMMAND disc_test)
 add_test(NAME fujibus_smoke COMMAND fujibus_smoke)
 add_test(NAME hostport COMMAND hostport_test)
+add_test(NAME exe_dir_lib COMMAND exe_dir_lib_test)
+set_tests_properties(exe_dir_lib PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME external COMMAND external_test)
 set_tests_properties(external PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 add_test(NAME debug COMMAND debug_test)

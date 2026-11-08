@@ -414,6 +414,12 @@ patch("lib/http/mgHttpClient.cpp", [
         '            : std::string("data/ca.pem");\n'
         '        tempCa = mg_file_read(&mg_fs_posix, ca_path.c_str());',
     ),
+    # MinGW's CertOpenSystemStoreA takes an integer HCRYPTPROV_LEGACY; NULL
+    # trips -Werror=conversion-null (firmware master since ~#2256).
+    (
+        'CertOpenSystemStore(NULL, "ROOT")',
+        'CertOpenSystemStore(0, "ROOT")',
+    ),
 ])
 
 # --- portability gaps in the RS232 device tree -----------------------------

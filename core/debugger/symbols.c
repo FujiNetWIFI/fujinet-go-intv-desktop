@@ -164,7 +164,8 @@ static const struct { uint16_t lo, hi; const char *name; } k_regions[] = {
     { 0x4000, 0x4000, "STIC alias" },
     { 0x5000, 0x6FFF, "cart" },
     { 0x8000, 0x8000, "STIC alias" },
-    { 0x9C00, 0x9FFF, "FujiNet mailbox" },
+    { 0x9C00, 0x9F3F, "FujiNet mailbox" },
+    { 0x9F80, 0x9FFF, "JLP accelerators" },
     { 0xC000, 0xC000, "STIC alias" },
 };
 #define K_REGION_COUNT (int)(sizeof(k_regions) / sizeof(k_regions[0]))

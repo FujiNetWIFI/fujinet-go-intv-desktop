@@ -155,7 +155,7 @@
 +emulates the RP2040 side of the FujiNet-for-Intellivision bridge from
 +fujinet-firmware/pico/intellivision/ -- see src/fujinet/fujinet.h for the
 +implementation.  It presents the same "mailbox" register window at
-+$9C00-$9FFF that real RP2040 hardware does, but instead of relaying
++$9C00-$9F3F that real RP2040 hardware does, but instead of relaying
 +transactions to a FujiNet over USB CDC, it speaks the same FujiBus wire
 +protocol over a TCP socket to fujinet-firmware's "Bus Over IP" (BoIP)
 +feature.
@@ -199,10 +199,10 @@
 +The upstream ROM declares the full $8000-$9FFF as RAM via
 +"ASM MEMATTR $8000, $9FFF, "+RWN"", because on real hardware the RP2040
 +maps that entire window as physical RAM (the mailbox cells are just
-+polled cells within it).  jzIntv instead models $9C00-$9FFF as its own
++polled cells within it).  jzIntv instead models $9C00-$9F3F as its own
 +FujiNet peripheral -- registered separately from, and behaving just like,
 +the cartridge's RAM for that range -- so this copy declares RAM only for
-+$8000-$9BFF and leaves $9C00-$9FFF to --fujinet.  Declaring RAM over both
++$8000-$9BFF and leaves $9C00-$9F3F to --fujinet.  Declaring RAM over both
 +ranges would register two peripherals over the same addresses; jzIntv's
 +periph_read() ANDs together every reader in a bin, so the FujiNet
 +peripheral's magic-byte and ACKSEQ cells would get corrupted by the cart
@@ -364,20 +364,22 @@
      {   NULL,           0,      NULL,       0                   }
  };
  
-@@ -535,6 +544,12 @@
+@@ -535,6 +544,14 @@
      char       *disp_res = NULL;
      const char *err_msg  = NULL;
      int locutus          = 0;
 +    int fujinet_enable   = 0;
 +    int fujinet_debug    = 0;
 +    int fujinet_use_config_rom = 0;
++    int fujinet_jlp      = 0;   /*  [vars] fujinet = 1: JLP game that keeps */
++                                /*  the mailbox.                            */
 +    char *fujinet_target = NULL;
 +    char *fujinet_bootdump = NULL;
 +    char *fujinet_bootdir  = NULL;
  #ifndef NO_SERIALIZER
      ser_hier_t *ser_cfg;
  #endif
-@@ -845,6 +860,24 @@
+@@ -845,6 +862,24 @@
                  STR_REPLACE(fn_ecs_printer, optarg);
                  break;
  
@@ -402,7 +404,7 @@
              case 'c':
              {
                  const char *name = "Default";
-@@ -909,7 +942,14 @@
+@@ -909,7 +944,14 @@
      }
  
      if (optind < argc)
@@ -417,7 +419,7 @@
  
      CONDFREE(argv_data);
      CONDFREE(argv_copy);
-@@ -1212,62 +1252,92 @@
+@@ -1212,62 +1254,92 @@
      }
  
      /* -------------------------------------------------------------------- */
@@ -553,7 +555,15 @@
      }
  
      /* -------------------------------------------------------------------- */
-@@ -1466,6 +1536,44 @@
+@@ -1327,6 +1399,7 @@
+ 
+         if (jlp_accel == -1) jlp_accel = meta->jlp_accel;
+         if (jlp_flash == -1) jlp_flash = meta->jlp_flash;
++        fujinet_jlp = game_metadata_misc_int(meta, "fujinet", 0);
+ 
+         print_metadata(meta);
+ 
+@@ -1466,6 +1539,57 @@
          exit(1);
      }
  
@@ -590,6 +600,19 @@
 +            exit(1);
 +        }
 +        CONDFREE(fn_host);
++
++        /*  A JLP game shares $8000-$9FFF with the mailbox.  As on the cart */
++        /*  (fujinet-firmware's apply_boot_mapping()), the mailbox stays    */
++        /*  only if the game's .cfg opts in with [vars] fujinet = 1, and    */
++        /*  JLP then stands aside on $9C00-$9F3F.  Without it the mailbox   */
++        /*  is off and JLP keeps its whole window.                          */
++        if (jlp_accel > 0)
++        {
++            if (fujinet_jlp)
++                cfg->jlp.mb_hole = 1;
++            else
++                cfg->fujinet.mailbox_active = 0;
++        }
 +    }
 +    CONDFREE(fujinet_target);
 +    CONDFREE(fujinet_bootdump);
@@ -598,19 +621,20 @@
      if (gfx_init(&cfg->gfx, rx, ry, rd, cfg->gfx_flags, gfx_verbose,
                    cfg->prescale, bx, by, cfg->pal_mode, &cfg->avi,
                    cfg->audio_rate, &cfg->palette))
-@@ -1753,6 +1861,18 @@
+@@ -1753,6 +1877,19 @@
          periph_register(P(jlp            ),  0x8000, 0x9FFF, "JLP Support"   );
  
      /* -------------------------------------------------------------------- */
-+    /*  If the FujiNet mailbox is enabled, install its register window at   */
-+    /*  $9C00 - $9FFF (FUJINET_WINDOW_SIZE in fujinet.h; must match).  This  */
-+    /*  overlaps the tail of the JLP RAM window above -- don't combine      */
-+    /*  --jlp and --fujinet in the same session.                            */
++    /*  If the FujiNet mailbox is enabled, install it at $9C00 - $9F3F      */
++    /*  (FUJI_MB_ADDR_LO..HI in fuji_mailbox.h), inside JLP's window as on  */
++    /*  the cart.  JLP RAM above it ($9F40-$9F7F) and the accelerators      */
++    /*  ($9F80-$9FFF) stay JLP's alone.  Who answers $9C00-$9F3F for a JLP  */
++    /*  game is decided after fujinet_init() above.                         */
 +    /* -------------------------------------------------------------------- */
 +    if (fujinet_enable)
 +    {
-+        periph_register(P(fujinet        ),  0x9C00, 0x9FFF, "FujiNet"       );
-+        cp1600_cacheable(&cfg->cp1600, 0x9C00, 0x9FFF, 0);
++        periph_register(P(fujinet        ),  0x9C00, 0x9F3F, "FujiNet"       );
++        cp1600_cacheable(&cfg->cp1600, 0x9C00, 0x9F3F, 0);
 +    }
 +
 +    /* -------------------------------------------------------------------- */
@@ -661,20 +685,22 @@
  
 --- a/src/cfg/usage.c	2026-08-20 07:54:53.112138410 -0500
 +++ b/src/cfg/usage.c	2026-08-20 07:54:53.123233789 -0500
-@@ -234,6 +234,34 @@
+@@ -234,6 +234,36 @@
  "            --cheat='<cheat>'     Adds a cheat code.  Up to 8 cheats can"  "\n"
  "                                  be added.  See doc/jzintv/cheat.txt."    "\n"
                                                                              "\n"
 +"            --fujinet[=host[:port]]"                                      "\n"
 +"                                  Enable the FujiNet mailbox peripheral"   "\n"
-+"                                  at $9800-$9FFF, connecting over BoIP to"  "\n"
++"                                  at $9C00-$9F3F, connecting over BoIP to"  "\n"
 +"                                  a fujinet-firmware instance.  Defaults" "\n"
 +"                                  to localhost:1985.  If no ROM is given"  "\n"
 +"                                  on the command line, boots the built-in" "\n"
 +"                                  FujiNet config ROM (WiFi setup / host"   "\n"
 +"                                  slots / directory browser) instead of"   "\n"
 +"                                  looking for game.rom; an explicit ROM"   "\n"
-+"                                  argument always overrides this."         "\n"
++"                                  argument always overrides this.  A JLP"  "\n"
++"                                  game keeps the mailbox only if its .cfg" "\n"
++"                                  has [vars] fujinet = 1, as on the cart." "\n"
 +                                                                            "\n"
 +"            --fujinet-debug       Trace FujiNet mailbox transactions and" "\n"
 +"                                  FujiBus frames to stdout."               "\n"
@@ -1822,7 +1848,7 @@
 +#endif /* FUJI_MAILBOX_H */
 --- a/src/fujinet/fujinet.c	1969-12-31 18:00:00.000000000 -0600
 +++ b/src/fujinet/fujinet.c	2026-08-20 07:48:21.030425336 -0500
-@@ -0,0 +1,1564 @@
+@@ -0,0 +1,1577 @@
 +/*
 + * ============================================================================
 + *  Title:    FujiNet mailbox peripheral
@@ -2490,14 +2516,13 @@
 +/*                       in its .cfg [vars], the same way cfg.c does for a  */
 +/*                       command-line --jlp.                                */
 +/*                                                                          */
-+/*  JLP claims $8000-$9FFF whole, which swallows the mailbox window -- so   */
-+/*  the caller disables the mailbox for the session, exactly as it does for */
-+/*  a cart whose own segments cover it.  The RP2040 rejects this            */
-+/*  combination outright (FUJI_BOOT_ERR_MAILBOX) because it has one RAM     */
-+/*  window to hand out; jzIntv can simply stop answering there and let JLP  */
-+/*  have it.                                                                */
++/*  JLP claims $8000-$9FFF, which contains the mailbox.  On the cart        */
++/*  (apply_boot_mapping()) a JLP title keeps the mailbox only if its .cfg   */
++/*  also says fujinet = 1; keep_mailbox carries that, and JLP then stands   */
++/*  aside on $9C00-$9F3F.  Otherwise the caller turns the mailbox off.      */
 +/* ======================================================================== */
-+LOCAL int fujinet_apply_jlp(fujinet_t *const fn, int jlp_accel, int jlp_flash)
++LOCAL int fujinet_apply_jlp(fujinet_t *const fn, int jlp_accel, int jlp_flash,
++                            int keep_mailbox)
 +{
 +    jlp_t *jlp = (jlp_t *)fn->jlp;
 +    char   sgpath[512];
@@ -2539,6 +2564,7 @@
 +    if (jlp_init(jlp, sgpath, &((cp1600_t *)fn->cpu)->xr[0],
 +                 jlp_accel, jlp_flash, 0))
 +        return -1;
++    jlp->mb_hole = keep_mailbox;
 +
 +    if (!fn->jlp_registered)
 +    {
@@ -2547,8 +2573,8 @@
 +    }
 +
 +    if (fn->debug)
-+        jzp_printf("FUJINET: JLP accel=%d flash=%d savegame=%s\n",
-+                   jlp_accel, jlp_flash, sgpath);
++        jzp_printf("FUJINET: JLP accel=%d flash=%d savegame=%s mailbox=%s\n",
++                   jlp_accel, jlp_flash, sgpath, keep_mailbox ? "kept" : "off");
 +
 +    return 0;
 +}
@@ -2589,7 +2615,7 @@
 +{
 +    char      binpath[512], cfgpath[512];
 +    legacy_t *l;
-+    int       jlp_accel = 0, jlp_flash = 0;
++    int       jlp_accel = 0, jlp_flash = 0, fujinet_var = 0;
 +
 +    snprintf(binpath, sizeof(binpath), "%s%cjzintv-fnboot.bin",
 +             fn->bootstage_dir, PATH_SEP);
@@ -2632,9 +2658,20 @@
 +    /* -------------------------------------------------------------------- */
 +    jlp_accel = l->jlp_accel;
 +    if (l->bc && l->bc->metadata)
-+        jlp_flash = l->bc->metadata->jlp_flash;
++    {
++        jlp_flash   = l->bc->metadata->jlp_flash;
++        fujinet_var = game_metadata_misc_int(l->bc->metadata, "fujinet", 0);
++    }
 +
-+    if (l->bc)
++    if (jlp_accel > 0)
++    {
++        /*  JLP's window is $8000-$9FFF and contains the mailbox; the cart  */
++        /*  keeps the mailbox there only for a title that opts in.  Cart    */
++        /*  ROM under the window is JLP's problem (legacy.c hides it while  */
++        /*  JLP is on), not a reason to drop the mailbox.                   */
++        if (!fujinet_var)
++            *disable_mb = 1;
++    } else if (l->bc)
 +    {
 +        const bc_memspan_t *span;
 +        for (span = l->bc->span; span; span = (const bc_memspan_t *)span->l.next)
@@ -2642,10 +2679,6 @@
 +                                        span->e_addr - span->s_addr + 1))
 +                *disable_mb = 1;
 +    }
-+
-+    /*  JLP's window is $8000-$9FFF, which contains the mailbox outright.    */
-+    if (jlp_accel > 0)
-+        *disable_mb = 1;
 +
 +    /* -------------------------------------------------------------------- */
 +    /*  Commit.  Past this point the old cart is gone, so nothing below may  */
@@ -2659,7 +2692,8 @@
 +    fujinet_recacheable_console(fn);
 +    fn->legacy = l;
 +
-+    if (jlp_accel > 0 && fujinet_apply_jlp(fn, jlp_accel, jlp_flash))
++    if (jlp_accel > 0 &&
++        fujinet_apply_jlp(fn, jlp_accel, jlp_flash, !*disable_mb))
 +        fprintf(stderr, "FUJINET: JLP setup failed; the cart will run "
 +                        "without it\n");
 +
@@ -3075,6 +3109,11 @@
 +LOCAL uint32_t fujinet_tick(periph_t *const per, uint32_t len)
 +{
 +    fujinet_t *const fn = PERIPH_AS(fujinet_t, per);
++
++    /*  The cart rewrites LINK on every service pass, so a program can tell */
++    /*  a live mailbox from plain RAM even after it cleared the header.     */
++    if (fn->mailbox_active)
++        fn->ram[OFS(FUJI_MB_LINK)] = fn->state >= FUJINET_ST_IDLE;
 +
 +    switch (fn->state)
 +    {
@@ -5178,7 +5217,7 @@
 +#endif /* FUJINET_CONFIG_ROM_H_ */
 --- a/src/fujinet/fujinet.h	1969-12-31 18:00:00.000000000 -0600
 +++ b/src/fujinet/fujinet.h	2026-08-20 07:31:59.000000000 -0500
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,208 @@
 +/*
 + * ============================================================================
 + *  Title:    FujiNet mailbox peripheral
@@ -5226,8 +5265,8 @@
 + * divides FUJI_MB_ADDR_LO ($9C00 = 0x400 * 39), since fujinet_read()/
 + * fujinet_write() recover the ram[] index with addr & (WINDOW_SIZE - 1) --
 + * 0x400 is the largest such power of 2 that still covers the mailbox's own
-+ * footprint (0x340 words, $9C00-$9F3F); the remaining $9F40-$9FFF is
-+ * unused slack, same as the old $9800-based window had past $9F3F.
++ * footprint (0x340 words, $9C00-$9F3F). cfg.c registers only $9C00-$9F3F:
++ * $9F40-$9FFF is JLP RAM and JLP's accelerators, as on the cart.
 + */
 +#define FUJINET_WINDOW_SIZE  0x0400
 +
@@ -5342,7 +5381,8 @@
 +
 +    /*  Session flag mirroring the RP2040's cart.MailboxActive: cleared    */
 +    /*  when a booted game's map covers the mailbox window (such a game    */
-+    /*  can't be fuji-aware). While clear, reads return ~0 (AND-identity   */
++    /*  can't be fuji-aware), or for a JLP game whose .cfg lacks           */
++    /*  [vars] fujinet = 1. While clear, reads return ~0 (AND-identity     */
 +    /*  on jzIntv's shared bus) and writes are dropped, so the game's own  */
 +    /*  ROM at $9C00-$9FFF reads through cleanly. Restored only by a       */
 +    /*  session restart (fujinet_init), matching the power-cycle watchdog  */
@@ -5761,6 +5801,80 @@
  #endif
  /* ======================================================================== */
  /*  This program is free software; you can redistribute it and/or modify    */
+--- a/src/jlp/jlp.c	2026-11-08 13:30:00.000000000 -0600
++++ b/src/jlp/jlp.c	2026-11-08 13:30:00.000000000 -0600
+@@ -34,6 +34,9 @@
+ 
+ #define JLP_CRC_POLY (0xAD52)
+ 
++#define JLP_IN_MB_HOLE(jlp, addr) \
++    ((jlp)->mb_hole && (addr) >= JLP_MB_HOLE_LO && (addr) <= JLP_MB_HOLE_HI)
++
+ static int jlp_accel_on_reset = 0;
+ int jlp_accel_on = 0;
+ int lto_isa_enabled = 0;
+@@ -49,8 +52,11 @@
+     const uint32_t max_row = jlp->sg_end;
+ 
+     const int have_flash = jlp->sg_img && jlp->sg_bytes;
+-    const int addr_ok = (check_addr == 0 || 
+-                         (addr >= 0x8040 && addr + 95 <= 0x9F7F));
++    const int addr_ok = (check_addr == 0 ||
++                         ((addr >= 0x8040 && addr + 95 <= 0x9F7F) &&
++                          !(jlp->mb_hole &&
++                            addr + 95 >= 0x8000 + JLP_MB_HOLE_LO &&
++                            addr <= 0x8000 + JLP_MB_HOLE_HI)));
+     const int row_ok = (row >= min_row) && (row <= max_row);
+ 
+     if (have_flash && addr_ok && row_ok)
+@@ -169,6 +175,7 @@
+ 
+     UNUSED(ign); UNUSED(data);
+ 
++    if (JLP_IN_MB_HOLE(jlp, addr)) { return ~0u;        }
+     if (jlp->sleep > 0) { jlp->sleep--; return ~0u;     }
+     if (!jlp_accel_on)  { return ~0u;                   }
+     if (addr >= 0x1F90 && addr <= 0x1F9F) { return jlp->xreg[addr & 0xF]; }
+@@ -188,6 +195,7 @@
+     UNUSED(ign);
+     UNUSED(data);
+ 
++    if (JLP_IN_MB_HOLE(jlp, addr)) { return ~0u;        }
+     if (!jlp_accel_on)  { return ~0u;                   }
+     if (addr >= 0x1F90 && addr <= 0x1F9F) { return jlp->xreg[addr & 0xF]; }
+     if (addr == 0x1FFE) { return rand_jz() >> 16;       }
+@@ -205,6 +213,8 @@
+ 
+     UNUSED(ign);
+ 
++    if (JLP_IN_MB_HOLE(jlp, addr)) { return; }
++
+     if (jlp->sleep == 0 && !jlp_accel_on && addr == 0x33 && data == 0x4A5A)
+     {
+         jlp_accel_on = 1;
+--- a/src/jlp/jlp.h	2026-11-08 13:30:00.000000000 -0600
++++ b/src/jlp/jlp.h	2026-11-08 13:30:00.000000000 -0600
+@@ -18,8 +18,20 @@
+     uint16_t    sg_start;   /* Initial flash row                            */
+     uint16_t    sg_end;     /* Final flash row                              */
+     uint32_t    sg_bytes;   /* Total size in bytes                          */
++    int         mb_hole;    /* FujiNet mailbox owns $9C00-$9F3F; see below  */
+ } jlp_t;
+ 
++/* ------------------------------------------------------------------------ */
++/*  A FujiNet cartridge serves its mailbox from inside JLP's window, at     */
++/*  $9C00-$9F3F.  When a JLP game opts in with [vars] fujinet = 1, the      */
++/*  mailbox answers there and JLP stands aside: reads return ~0 (the AND    */
++/*  identity on jzIntv's shared bus) and writes are dropped.  Flash         */
++/*  commands whose 96-word RAM span touches the hole are refused, as the    */
++/*  cart refuses them.  JLP RAM below and above the hole is unaffected.     */
++/* ------------------------------------------------------------------------ */
++#define JLP_MB_HOLE_LO  (0x1C00)    /* $9C00 as an offset into JLP's window */
++#define JLP_MB_HOLE_HI  (0x1F3F)    /* $9F3F                                */
++
+ 
+ /* Approximate numbers for a 256K board and ~20Kw game. */
+ #define JLP_SG_OFS   (224)
 --- a/src/jzintv.c	2026-08-20 07:54:53.103475263 -0500
 +++ b/src/jzintv.c	2026-08-20 07:54:53.114945563 -0500
 @@ -38,6 +38,7 @@
@@ -5809,6 +5923,67 @@
 +jzintv_em.$(O): fujinet/fujinet.h fujinet/fuji_mailbox.h fujinet/fn_sock.h
  jzintv_em.$(O): emscripten/web_files.h
  
+--- a/src/metadata/metadata.c	2026-11-08 13:30:00.000000000 -0600
++++ b/src/metadata/metadata.c	2026-11-08 13:30:00.000000000 -0600
+@@ -80,6 +80,36 @@
+ }
+ 
+ /* ------------------------------------------------------------------------ */
++/*  GAME_METADATA_MISC_INT   -- Integer value of an un-handled [vars] key.  */
++/* ------------------------------------------------------------------------ */
++int game_metadata_misc_int
++(
++    const game_metadata_t *const meta,
++    const char            *const name,
++    const int                    dflt
++)
++{
++    int idx;
++
++    if ( !meta || !meta->misc || !name ) return dflt;
++
++    for ( idx = 0; meta->misc[idx]; idx++ )
++    {
++        const char *misc = meta->misc[idx];
++        const char *want = name;
++
++        while ( *want && tolower( (unsigned char)*misc ) == *want )
++        {
++            misc++;
++            want++;
++        }
++        if ( !*want && *misc == '=' )
++            return atoi( misc + 1 );
++    }
++    return dflt;
++}
++
++/* ------------------------------------------------------------------------ */
+ /*  DEFAULT_GAME_METADATA                                                   */
+ /* ------------------------------------------------------------------------ */
+ game_metadata_t *default_game_metadata( void )
+--- a/src/metadata/metadata.h	2026-11-08 13:30:00.000000000 -0600
++++ b/src/metadata/metadata.h	2026-11-08 13:30:00.000000000 -0600
+@@ -172,6 +172,19 @@
+ );
+     
+ /* ------------------------------------------------------------------------ */
++/*  GAME_METADATA_MISC_INT   -- Integer value of a [vars] key that has no   */
++/*                              field of its own (it lands in misc[] as     */
++/*                              "name=value"), or dflt if it isn't there.   */
++/*                              FujiNet's "fujinet" opt-in is read this way.*/
++/* ------------------------------------------------------------------------ */
++int game_metadata_misc_int
++(
++    const game_metadata_t *const meta,
++    const char            *const name,
++    const int                    dflt
++);
++
++/* ------------------------------------------------------------------------ */
+ /*  PRINT_METADATA   -- Print game metadata.                                */
+ /* ------------------------------------------------------------------------ */
+ void print_metadata
 --- a/src/periph/periph.c	2026-08-20 07:54:53.106673973 -0500
 +++ b/src/periph/periph.c	2026-08-20 07:54:53.117724573 -0500
 @@ -308,6 +308,47 @@

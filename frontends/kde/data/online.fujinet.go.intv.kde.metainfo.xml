@@ -49,6 +49,13 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.14.1" date="2026-11-08">
+      <description>
+        <p>
+          JLP games can use FujiNet. As on the cartridge, the FujiNet mailbox now answers $9C00-$9F3F only, and a JLP game whose .cfg says [vars] fujinet = 1 keeps it beside JLP. Before, a JLP game had no mailbox and its hardware multiply, divide, CRC and random numbers read zero.
+        </p>
+      </description>
+    </release>
     <release version="0.14.0" date="2026-11-08">
       <description>
         <p>

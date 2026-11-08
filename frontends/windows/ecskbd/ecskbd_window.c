@@ -31,6 +31,7 @@
 #include "ecskbd_window.h"
 
 #include "../accent_button.h"
+#include "../help/help_window.h"
 #include "key_forward.h"
 
 #include <stdlib.h>
@@ -90,6 +91,7 @@ static HWND make_key(HWND parent, HINSTANCE inst, const char *text,
 
 #define IDC_ECSKBD_CTRL  1001
 #define IDC_ECSKBD_SHIFT 1002
+#define IDC_ECSKBD_HELP  1003
 
 static HWND make_mod_key(HWND parent, HINSTANCE inst, const char *text,
                          int ctrl_id, int x, int y, int w)
@@ -188,6 +190,9 @@ static void build_keyboard(HWND parent, HINSTANCE inst, intvsession *session)
         x += 40 + 4;
         make_key(parent, inst, "Enter", session, INTVSESSION_ECS_KEY_ENTER, x,
                 y, 56);
+        x += 56 + 4;
+        CreateWindowExA(0, "BUTTON", "Help", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x, y, 48, 32, parent,
+                        (HMENU)(INT_PTR)IDC_ECSKBD_HELP, inst, NULL);
     }
 }
 
@@ -214,7 +219,9 @@ static LRESULT CALLBACK ecskbd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp,
     case WM_COMMAND:
         if (HIWORD(wp) == BN_CLICKED) {
             int id = LOWORD(wp);
-            if (id == IDC_ECSKBD_CTRL || id == IDC_ECSKBD_SHIFT) {
+            if (id == IDC_ECSKBD_HELP) {
+                intv_help_show(hwnd, "ecskbd");
+            } else if (id == IDC_ECSKBD_CTRL || id == IDC_ECSKBD_SHIFT) {
                 HWND ctl = (HWND)lp;
                 int checked =
                     SendMessageA(ctl, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -292,6 +299,7 @@ void intv_ecskbd_window_toggle(HWND parent, intvsession *session)
         inst, NULL);
 
     build_keyboard(g_win, inst, session);
+    intv_help_set_context(g_win, "ecskbd", 0);
     update_notice(session);
 
     ShowWindow(g_win, SW_SHOW);

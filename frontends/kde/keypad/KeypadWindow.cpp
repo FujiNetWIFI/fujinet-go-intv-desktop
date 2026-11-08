@@ -51,6 +51,7 @@
  */
 
 #include "KeypadWindow.h"
+#include "../help/HelpWindow.h"
 
 #include "KeyForward.h"
 
@@ -490,6 +491,7 @@ QWidget *buildMapRow(intvsession *session)
     auto *resetBtn = new QPushButton(QStringLiteral("Reset Bindings"));
     QObject::connect(resetBtn, &QPushButton::clicked, resetBtn, onResetClicked);
     buttons->addWidget(resetBtn);
+    buttons->addWidget(intvHelpButton(QStringLiteral("keypad")));
 
     auto *buttonsWrap = new QHBoxLayout;
     buttonsWrap->addStretch();
@@ -544,6 +546,7 @@ KeypadWindow::KeypadWindow(QWidget *parent, intvsession *session)
 {
     setAttribute(Qt::WA_DeleteOnClose, false);
     setWindowTitle(QStringLiteral("Keypad"));
+    setProperty("intvHelpContext", QStringLiteral("keypad"));
     g_mapSession = session;
 
     auto *panels = new QHBoxLayout;

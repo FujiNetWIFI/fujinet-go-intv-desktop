@@ -33,6 +33,7 @@
  */
 
 #include "DebuggerWindow.h"
+#include "../help/HelpWindow.h"
 
 #include <QComboBox>
 #include <QFileDialog>
@@ -46,6 +47,7 @@
 #include <QMessageBox>
 #include <QPixmap>
 #include <QPlainTextEdit>
+#include <QShortcut>
 #include <QPointer>
 #include <QPushButton>
 #include <QScrollArea>
@@ -262,7 +264,9 @@ void DebuggerWindow::buildUi()
     m_status->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     m_status->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     tb->addWidget(m_status);
+    tb->addWidget(intvHelpButton(QString()));
 
+    new QShortcut(QKeySequence(Qt::Key_F1), this, [this] { intvHelpFor(this); });
     new QShortcut(QKeySequence(Qt::Key_F5), this, [this] { pauseContinue(); });
     new QShortcut(QKeySequence(Qt::Key_F7), this,
                   [this] { intvdebug_step(m_dbg); });
@@ -427,6 +431,16 @@ void DebuggerWindow::buildUi()
 
     m_fujiPage = buildFujinet();
     tabs->addTab(m_fujiPage, QLatin1String(kTabNames[3]));
+    /* Help's contexts (intvhelp.h), one per tab */
+    {
+        static const char *const kHelpTabs[] = { "cpu", "stic", "symbols", "fujinet" };
+        auto setHelpContext = [this](int page) {
+            if (page >= 0 && page < 4)
+                setProperty("intvHelpContext", QStringLiteral("debugger/%1").arg(QLatin1String(kHelpTabs[page])));
+        };
+        setHelpContext(tabs->currentIndex());
+        connect(tabs, &QTabWidget::currentChanged, this, setHelpContext);
+    }
     connect(tabs, &QTabWidget::currentChanged, this, [this] {
         if (fujiShowing())
             refreshFujinet(false);

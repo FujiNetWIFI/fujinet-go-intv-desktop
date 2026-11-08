@@ -64,6 +64,7 @@
 #import "KeypadWindow.h"
 
 #import "IntvKeyForward.h"
+#import "../help/HelpWindow.h"
 
 #include <math.h>
 
@@ -571,7 +572,7 @@ static void MapCompleteButton(intvsession_pad_button button)
     gMapBtn = mapBtn;
 
     NSStackView *buttonRow =
-        [NSStackView stackViewWithViews:@[ mapBtn, resetBtn ]];
+        [NSStackView stackViewWithViews:@[ mapBtn, resetBtn, IntvHelpButton(@"keypad") ]];
     buttonRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     buttonRow.spacing = 8;
 
@@ -755,6 +756,7 @@ static void MapCompleteButton(intvsession_pad_button button)
                     backing:NSBackingStoreBuffered
                       defer:NO];
     _window.title = @"Keypad";
+    IntvSetHelpContext(_window, @"keypad");
     /* Follows the "keyboard_mode" setting, unlike the ECS keyboard window
      * -- typing here means whatever it would mean in the main window. */
     _window.session = _session;

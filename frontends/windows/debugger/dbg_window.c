@@ -51,6 +51,7 @@
 
 #include "intvdebug.h"
 #include "intvstic.h"
+#include "../help/help_window.h"
 #include "symbols.h"
 
 #define DISASM_LINES 32
@@ -71,7 +72,7 @@
 
 enum {
     IDC_PAUSE = 1000, IDC_STEP, IDC_STEP_OVER, IDC_STEP_OUT, IDC_CLEAR_BP,
-    IDC_LOAD_SYMS, IDC_CLEAR_SYMS,
+    IDC_LOAD_SYMS, IDC_CLEAR_SYMS, IDC_HELP_BTN,
     IDC_STATUS, IDC_TABS,
     IDC_DISASM, IDC_FLAGS,
     IDC_MEM_ADDR, IDC_MEM_VIEW,
@@ -93,7 +94,7 @@ typedef struct {
     HWND hwnd;
     HWND tabs;
     HWND pause_btn, step_btn, step_over_btn, step_out_btn, clear_bp_btn;
-    HWND load_syms_btn, clear_syms_btn;
+    HWND load_syms_btn, clear_syms_btn, help_btn;
     HWND status;
 
     HWND disasm;
@@ -373,6 +374,7 @@ static void build_controls(debugger *d)
                              WS_VISIBLE | BS_PUSHBUTTON, IDC_LOAD_SYMS);
     d->clear_syms_btn = child(d, "BUTTON", "Clear Symbols",
                               WS_VISIBLE | BS_PUSHBUTTON, IDC_CLEAR_SYMS);
+    d->help_btn = child(d, "BUTTON", "Help", WS_VISIBLE | BS_PUSHBUTTON, IDC_HELP_BTN);
     d->status = child(d, "STATIC", "Running", WS_VISIBLE | SS_RIGHT,
                      IDC_STATUS);
 
@@ -441,10 +443,18 @@ static void build_controls(debugger *d)
  * the scope of the other three frontends' debugger windows (none offer
  * fluid resizing of their internal panes either). Recomputed on WM_SIZE. */
 
+/* Help's contexts (intvhelp.h), one per tab */
+static const char *const k_tab_contexts[] = {
+    "debugger/cpu", "debugger/stic", "debugger/symbols", "debugger/fujinet",
+};
+
 static void show_page(debugger *d, int page)
 {
     int i;
     d->page = page;
+    /* Help, F1 and Ctrl+Shift+H open the tab's section */
+    if (page >= 0 && page < (int)(sizeof k_tab_contexts / sizeof k_tab_contexts[0]))
+        intv_help_set_context(d->hwnd, k_tab_contexts[page], 1);
     ShowWindow(d->disasm, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
     for (i = 0; i < 8; i++) {
         ShowWindow(d->reg_label[i], page == PAGE_CPU ? SW_SHOW : SW_HIDE);
@@ -503,7 +513,11 @@ static void layout(debugger *d)
     MoveWindow(d->clear_bp_btn, 470, y, 130, 26, TRUE);
     MoveWindow(d->load_syms_btn, 604, y, 120, 26, TRUE);
     MoveWindow(d->clear_syms_btn, 728, y, 110, 26, TRUE);
-    MoveWindow(d->status, client.right - 210, y + 4, 200, 20, TRUE);
+    MoveWindow(d->help_btn, 842, y, 70, 26, TRUE);
+    {
+        const int sx = client.right - 210 > 920 ? client.right - 210 : 920;
+        MoveWindow(d->status, sx, y + 4, client.right - sx - 10 > 40 ? client.right - sx - 10 : 40, 20, TRUE);
+    }
     y += 32;
 
     MoveWindow(d->tabs, 4, y, client.right - 8, client.bottom - y - 4, TRUE);
@@ -1107,6 +1121,7 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             intvdebug_fujinet_trace_clear(d->dbg);
             refresh_fujinet(d, 1);
             return 0;
+        case IDC_HELP_BTN: intv_help_for(d->hwnd); return 0;
         case IDC_CLEAR_SYMS:
             intvsymtab_clear_user(d->symtab);
             d->seen_serial = 0;

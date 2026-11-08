@@ -18,6 +18,14 @@ GitHub remote and getting all 5 CI workflows green there (macOS and Windows
 CI in particular are the first real test of those builds outside this
 machine), then cutting the `v0.1.0` release tag.
 
+## Built-in Help
+
+**Help ▸ FujiNet Go Intv Help** (Ctrl+Shift+H, ⌘? on a Mac) opens a searchable
+Help, and the Help buttons in Preferences, the Keypad and ECS Keyboard windows,
+the debugger and the console log open the topic for what they show. The text is
+[data/help/help.md](data/help/help.md), which GitHub shows as it is; the build
+embeds it and every frontend lays it out natively.
+
 ## External FujiNet
 
 A switch in Preferences makes the app connect to another FujiNet instance at a host:port you enter, e.g. `127.0.0.1:65503`, instead of starting the built-in one.

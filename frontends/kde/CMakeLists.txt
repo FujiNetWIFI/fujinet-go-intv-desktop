@@ -33,6 +33,7 @@ add_executable(fujinet-go-intv-kde
   KeyForward.cpp
   FujiNetWindows.cpp
   SettingsDialog.cpp
+  help/HelpWindow.cpp
   debugger/DebuggerWindow.cpp
   keypad/KeypadWindow.cpp
   ecskbd/EcsKeyboardWindow.cpp

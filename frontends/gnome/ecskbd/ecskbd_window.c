@@ -26,6 +26,7 @@
 
 #include "ecskbd_window.h"
 
+#include "../help/help_window.h"
 #include "../keysym_map.h"
 
 static GtkWindow *g_win;
@@ -282,6 +283,8 @@ static void ensure_window(GtkWindow *parent, intvsession *session)
     gtk_box_append(GTK_BOX(root), build_keyboard(session));
 
     header = adw_header_bar_new();
+    adw_header_bar_pack_end(ADW_HEADER_BAR(header), intv_help_button("ecskbd"));
+    intv_help_set_context(GTK_WINDOW(g_win), "ecskbd");
     tb = adw_toolbar_view_new();
     adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(tb), header);
     adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(tb), root);

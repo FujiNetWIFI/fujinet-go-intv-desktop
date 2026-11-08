@@ -19,6 +19,7 @@ add_executable(fujinet-go-intv-windows WIN32
   display.c
   import.c
   roms.c
+  help/help_window.c
   key_translate.c
   debugger/dbg_window.c
   keypad/keypad_window.c

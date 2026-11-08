@@ -33,6 +33,7 @@
 #include "intvdebug.h"
 #include "intvstic.h"
 #include "symbols.h"
+#include "../help/help_window.h"
 
 #define DISASM_LINES 32
 #define MEM_WORDS_PER_ROW 8
@@ -749,12 +750,18 @@ static void on_fuji_clear(GtkButton *b, gpointer u)
     refresh_fujinet(w, TRUE);
 }
 
+/* Help's contexts (intvhelp.h), one per tab */
+static const char *const k_tab_contexts[] = {
+    "debugger/cpu", "debugger/stic", "debugger/symbols", "debugger/fujinet",
+};
+
 static gboolean on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num,
                                gpointer user_data)
 {
     DbgWin *w = user_data;
     (void)nb;
-    (void)num;
+    if (num < G_N_ELEMENTS(k_tab_contexts))
+        intv_help_set_context(w->win, k_tab_contexts[num]);
     if (page == w->fuji_page)
         refresh_fujinet(w, FALSE);
     return FALSE;
@@ -768,6 +775,9 @@ static gboolean on_key(GtkEventControllerKey *c, guint keyval, guint keycode,
     (void)keycode;
     kick(w);
     switch (keyval) {
+    case GDK_KEY_F1:
+        intv_help_for(w->win);
+        return TRUE;
     case GDK_KEY_F5:
         on_run_pause(NULL, w);
         return TRUE;
@@ -955,6 +965,7 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     w->status = GTK_LABEL(gtk_label_new("Running"));
     adw_header_bar_set_title_widget(ADW_HEADER_BAR(header),
                                     GTK_WIDGET(w->status));
+    adw_header_bar_pack_end(ADW_HEADER_BAR(header), intv_help_button(NULL));
 
     bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_widget_set_margin_top(bar, 6);
@@ -1162,6 +1173,10 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
                              gtk_label_new(k_tab_names[3]));
     w->tabs = GTK_NOTEBOOK(notebook);
     g_signal_connect(notebook, "switch-page", G_CALLBACK(on_switch_page), w);
+    {
+        int cur = gtk_notebook_get_current_page(GTK_NOTEBOOK(notebook));
+        intv_help_set_context(w->win, k_tab_contexts[cur > 0 && cur < 4 ? cur : 0]);
+    }
     if (tab_from_env() >= 0)
         gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), tab_from_env());
 

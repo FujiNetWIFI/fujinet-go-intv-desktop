@@ -18,7 +18,7 @@
       the CP-1610 CPU and the STIC graphics chip -- registers, mode, the
       BACKTAB background grid, the 8 MOBs (sprites), and the GRAM/GROM card
       sheet. Plain Qt6 Widgets, not KDE Frameworks -- Breeze arrives through
-      the platform theme.
+      the platform theme. Built-in, searchable Help covers all of it.
     </p>
   </description>
   <launchable type="desktop-id">online.fujinet.go.intv.kde.desktop</launchable>

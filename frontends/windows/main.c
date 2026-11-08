@@ -32,6 +32,7 @@
 #include "debugger/dbg_window.h"
 #include "display.h"
 #include "import.h"
+#include "help/help_window.h"
 #include "key_forward.h"
 #include "ecskbd/ecskbd_window.h"
 #include "keypad/keypad_window.h"
@@ -46,7 +47,7 @@ static HWND g_log_window;
 static HWND g_log_edit;
 
 static HWND g_display;
-static HWND g_bios_files_btn, g_bios_folder_btn;
+static HWND g_bios_files_btn, g_bios_folder_btn, g_bios_help_btn;
 static HFONT g_ui_font, g_title_font;
 static HICON g_big_icon;
 static int g_dpi = 96;
@@ -69,7 +70,7 @@ static void show_roms(void);
  * two Import buttons. The picture itself is display.c (Direct3D 11, 4:3). */
 
 typedef struct {
-    RECT icon, title, desc, files, folder;
+    RECT icon, title, desc, files, folder, help;
 } nobios_geom;
 
 static const char k_nobios_title[] = "No Intellivision BIOS";
@@ -111,7 +112,8 @@ static void nobios_layout(const RECT *area, nobios_geom *g)
     const int icon = S(64), title_h = text_height(g_title_font, k_nobios_title, width);
     const int desc_h = text_height(g_ui_font, k_nobios_text, width);
     const int bw1 = button_width("Import BIOS..."), bw2 = button_width("Import a Folder...");
-    const int row_w = bw1 + S(12) + bw2, bh = S(32);
+    const int bw3 = button_width("Help");
+    const int row_w = bw1 + S(12) + bw2 + S(12) + bw3, bh = S(32);
     const int total = icon + S(16) + title_h + S(10) + desc_h + S(24) + bh;
     const int x0 = area->left + (aw - width) / 2, cx = area->left + aw / 2;
     int y = area->top + (ah - total) / 2;
@@ -126,6 +128,7 @@ static void nobios_layout(const RECT *area, nobios_geom *g)
     y += desc_h + S(24);
     SetRect(&g->files, cx - row_w / 2, y, cx - row_w / 2 + bw1, y + bh);
     SetRect(&g->folder, g->files.right + S(12), y, g->files.right + S(12) + bw2, y + bh);
+    SetRect(&g->help, g->folder.right + S(12), y, g->folder.right + S(12) + bw3, y + bh);
 }
 
 static void paint_nobios(HDC dc, const RECT *area)
@@ -171,6 +174,8 @@ static void layout(void)
                    g.files.right - g.files.left, g.files.bottom - g.files.top, TRUE);
         MoveWindow(g_bios_folder_btn, g.folder.left, g.folder.top,
                    g.folder.right - g.folder.left, g.folder.bottom - g.folder.top, TRUE);
+        MoveWindow(g_bios_help_btn, g.help.left, g.help.top,
+                   g.help.right - g.help.left, g.help.bottom - g.help.top, TRUE);
     }
     InvalidateRect(g_hwnd, NULL, FALSE);
 }
@@ -184,7 +189,10 @@ static void show_page(void)
     if (g_bios_files_btn) {
         ShowWindow(g_bios_files_btn, bios ? SW_HIDE : SW_SHOW);
         ShowWindow(g_bios_folder_btn, bios ? SW_HIDE : SW_SHOW);
+        ShowWindow(g_bios_help_btn, bios ? SW_HIDE : SW_SHOW);
     }
+    /* F1 is not bound by the console here; Help opens the page that shows */
+    intv_help_set_context(g_hwnd, bios ? "main" : "nobios", 0);
     layout();
 }
 
@@ -198,6 +206,8 @@ static void make_fonts(void)
         SendMessageW(g_bios_files_btn, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
     if (g_bios_folder_btn)
         SendMessageW(g_bios_folder_btn, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+    if (g_bios_help_btn)
+        SendMessageW(g_bios_help_btn, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
 }
 
 /* The VK -> keysym translation and the reserved-hotkey table live in
@@ -355,13 +365,19 @@ static void show_fujinet_config(void)
 }
 
 #define LOG_TIMER_ID 2
+#define LOG_BAR 34
+static HWND g_log_help;
 
 static LRESULT CALLBACK log_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_SIZE:
-        MoveWindow(g_log_edit, 0, 0, LOWORD(lp), HIWORD(lp), TRUE);
+        MoveWindow(g_log_edit, 0, LOG_BAR, LOWORD(lp), HIWORD(lp) > LOG_BAR ? HIWORD(lp) - LOG_BAR : 0, TRUE);
+        if (g_log_help) MoveWindow(g_log_help, LOWORD(lp) - 84, 4, 76, LOG_BAR - 8, TRUE);
         return 0;
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDC_LOG_HELP) { intv_help_for(hwnd); return 0; }
+        break;
     case WM_TIMER: {
         static char buf[128 * 1024];
         int n = intvsession_fujinet_copy_log(g_session, buf, sizeof(buf));
@@ -375,6 +391,7 @@ static LRESULT CALLBACK log_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         DestroyWindow(hwnd);
         g_log_window = NULL;
         g_log_edit = NULL;
+        g_log_help = NULL;
         return 0;
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
@@ -413,6 +430,15 @@ static void show_fujinet_log(HINSTANCE inst)
         0, 0, 0, 0, g_log_window, NULL, inst, NULL);
     SendMessageA(g_log_edit, WM_SETFONT, (WPARAM)GetStockObject(ANSI_FIXED_FONT),
                 TRUE);
+    g_log_help = CreateWindowExA(0, "BUTTON", "Help", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 10, 10,
+                                 g_log_window, (HMENU)(INT_PTR)IDC_LOG_HELP, inst, NULL);
+    SendMessageA(g_log_help, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    intv_help_set_context(g_log_window, "fujilog", 1);
+    {
+        RECT crc;
+        GetClientRect(g_log_window, &crc);
+        SendMessageA(g_log_window, WM_SIZE, 0, MAKELPARAM(crc.right, crc.bottom));
+    }
     SetTimer(g_log_window, LOG_TIMER_ID, 1000, NULL);
     ShowWindow(g_log_window, SW_SHOW);
 }
@@ -636,6 +662,7 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp,
     switch (msg) {
     case WM_COMMAND:
         switch (LOWORD(wp)) {
+        case IDC_SET_HELP: intv_help_for(hwnd); return 0;
         case IDC_SET_ECS:
             if (HIWORD(wp) == CBN_SELCHANGE)
                 settings_hw_combo_changed(IDC_SET_ECS, "ecs");
@@ -930,6 +957,12 @@ static void show_settings(HINSTANCE inst)
                             g_settings_window, (HMENU)(INT_PTR)IDC_SET_ROMS,
                             inst, NULL);
     SendMessageA(check, WM_SETFONT, (WPARAM)font, TRUE);
+    check = CreateWindowExA(0, "BUTTON", "Help",
+                            WS_CHILD | WS_VISIBLE | WS_TABSTOP, 184, y, 80, 28,
+                            g_settings_window, (HMENU)(INT_PTR)IDC_SET_HELP,
+                            inst, NULL);
+    SendMessageA(check, WM_SETFONT, (WPARAM)font, TRUE);
+    intv_help_set_context(g_settings_window, "prefs/Machine", 1);
 
     fill_pad_list(g_settings_window, -1);
     SetTimer(g_settings_window, IDT_SETTINGS_PADS, 1000, NULL);
@@ -1017,6 +1050,8 @@ static HMENU build_menu(void)
     AppendMenuA(settings, MF_STRING, IDM_ROMS, "System ROMs...");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)settings, "&Settings");
 
+    AppendMenuA(help, MF_STRING, IDM_HELP, "FujiNet Go Intv &Help\tCtrl+Shift+H");
+    AppendMenuA(help, MF_SEPARATOR, 0, NULL);
     AppendMenuA(help, MF_STRING, IDM_ABOUT, "About FujiNet Go Intv");
     AppendMenuA(help, MF_SEPARATOR, 0, NULL);
     AppendMenuA(help, MF_STRING, IDM_EXIT, "E&xit");
@@ -1100,6 +1135,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDM_SETTINGS:
             show_settings((HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE));
             break;
+        case IDC_BIOS_HELP: intv_help_show(hwnd, "nobios"); break;
+        case IDM_HELP: intv_help_for(hwnd); break;
         case IDM_ABOUT: {
             char text[512];
             MSGBOXPARAMSA mb;
@@ -1209,6 +1246,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     g_bios_folder_btn = CreateWindowExA(
         0, "BUTTON", "Import a Folder...", WS_CHILD | BS_PUSHBUTTON, 0, 0, 10,
         10, g_hwnd, (HMENU)(INT_PTR)IDC_BIOS_FOLDER, inst, NULL);
+    g_bios_help_btn = CreateWindowExA(
+        0, "BUTTON", "Help", WS_CHILD | BS_PUSHBUTTON, 0, 0, 10, 10, g_hwnd,
+        (HMENU)(INT_PTR)IDC_BIOS_HELP, inst, NULL);
     make_fonts();
     {
         /* a 4:3 client, at this monitor's DPI */
@@ -1245,6 +1285,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 
     while (GetMessageA(&msg, NULL, 0, 0) > 0) {
         if (intv_debugger_pretranslate(&msg))
+            continue;
+        if (intv_help_pretranslate(&msg))
             continue;
         if (intv_keypad_pretranslate(&msg))
             continue;

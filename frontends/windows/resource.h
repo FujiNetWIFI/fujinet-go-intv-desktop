@@ -20,6 +20,7 @@
 #define IDM_IMPORT_SD       214
 #define IDM_OPEN_SD         215
 #define IDM_ROMS            216
+#define IDM_HELP            217
 
 /* Settings window child control ids. */
 #define IDC_SET_ECS          301
@@ -31,14 +32,18 @@
 #define IDC_SET_ROMS         307
 #define IDC_SET_EXTERNAL     308
 #define IDC_SET_EXT_ADDR     309
+#define IDC_SET_HELP         310
 
 /* The No-BIOS page's buttons. */
 #define IDC_BIOS_FILES       401
 #define IDC_BIOS_FOLDER      402
+#define IDC_BIOS_HELP        403
+#define IDC_LOG_HELP         404
 
 /* The System ROMs window. */
 #define IDC_ROMS_FILES       411
 #define IDC_ROMS_FOLDER      412
 #define IDC_ROMS_CLOSE       413
+#define IDC_ROMS_HELP        414
 
 #endif

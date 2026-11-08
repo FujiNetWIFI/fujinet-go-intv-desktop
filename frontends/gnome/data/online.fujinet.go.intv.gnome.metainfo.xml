@@ -17,7 +17,7 @@
       attached over Bus-Over-IP (BoIP) on loopback TCP. The debugger covers
       the CP-1610 CPU and the STIC graphics chip -- registers, mode, the
       BACKTAB background grid, the 8 MOBs (sprites), and the GRAM/GROM card
-      sheet.
+      sheet. Built-in, searchable Help covers all of it.
     </p>
   </description>
   <launchable type="desktop-id">online.fujinet.go.intv.gnome.desktop</launchable>

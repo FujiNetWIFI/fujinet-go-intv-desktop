@@ -15,6 +15,8 @@
 
 #include "SettingsDialog.h"
 
+#include "help/HelpWindow.h"
+
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
@@ -26,6 +28,7 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QShortcut>
 #include <QVBoxLayout>
 
 namespace {
@@ -198,7 +201,12 @@ SettingsDialog::SettingsDialog(intvsession *session, QWidget *parent)
     outer->addWidget(roms);
     refreshRoms();
 
-    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, this);
+    /* Help, F1 and Ctrl+Shift+H (the app's shortcuts don't reach a modal dialog) */
+    setProperty("intvHelpContext", QStringLiteral("prefs/Machine"));
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close | QDialogButtonBox::Help, this);
+    connect(buttons, &QDialogButtonBox::helpRequested, this, [this] { intvHelpFor(this); });
+    for (const char *key : { "F1", "Ctrl+Shift+H" })
+        new QShortcut(QKeySequence(QString::fromLatin1(key)), this, [this] { intvHelpFor(this); });
     connect(buttons, &QDialogButtonBox::rejected, this, [this] {
         char host[64];
         int port;

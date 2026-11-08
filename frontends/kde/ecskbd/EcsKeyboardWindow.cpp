@@ -25,6 +25,7 @@
  */
 
 #include "EcsKeyboardWindow.h"
+#include "../help/HelpWindow.h"
 
 #include "KeyForward.h"
 
@@ -148,6 +149,7 @@ EcsKeyboardWindow::EcsKeyboardWindow(QWidget *parent, intvsession *session)
 {
     setAttribute(Qt::WA_DeleteOnClose, false);
     setWindowTitle(QStringLiteral("ECS Keyboard"));
+    setProperty("intvHelpContext", QStringLiteral("ecskbd"));
 
     auto *root = new QVBoxLayout(this);
 
@@ -190,6 +192,7 @@ QWidget *EcsKeyboardWindow::buildKeyboard()
                             INTVSESSION_ECS_KEY_RIGHT));
     fnRow->addWidget(makeKey(QStringLiteral("Enter"), m_session,
                             INTVSESSION_ECS_KEY_ENTER, 56));
+    fnRow->addWidget(intvHelpButton(QStringLiteral("ecskbd")));
     fnRow->addStretch();
     layout->addLayout(fnRow);
 

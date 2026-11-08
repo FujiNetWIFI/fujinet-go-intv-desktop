@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "help/help_window.h"
 #include "import.h"
 #include "resource.h"
 #include "win_common.h"
@@ -26,7 +27,7 @@
 #define M 14
 #define ROW_H 22
 
-static HWND g_win, g_note, g_path, g_files, g_folder, g_close;
+static HWND g_win, g_note, g_path, g_files, g_folder, g_close, g_help;
 static HWND g_group[MAX_ITEMS], g_name[MAX_ITEMS], g_state[MAX_ITEMS];
 static int g_rows;      /* items */
 static HFONT g_font, g_bold;
@@ -71,6 +72,7 @@ static void layout(void)
     }
     y += S(12);
     MoveWindow(g_close, S(CW) - m - S(96), y, S(96), S(28), TRUE);
+    MoveWindow(g_help, S(CW) - m - S(96) - S(8) - S(80), y, S(80), S(28), TRUE);
 }
 
 static void make_fonts(void)
@@ -121,6 +123,7 @@ static LRESULT CALLBACK roms_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         switch (LOWORD(wp)) {
         case IDC_ROMS_FILES:  do_import(0); return 0;
         case IDC_ROMS_FOLDER: do_import(1); return 0;
+        case IDC_ROMS_HELP: intv_help_for(hwnd); return 0;
         case IDC_ROMS_CLOSE:
         case IDCANCEL:
             DestroyWindow(hwnd);
@@ -201,6 +204,9 @@ void intv_roms_show(HWND parent, intvsession *session, const intv_roms_hooks *ho
         g_state[i] = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_NOPREFIX,
                                    0, 0, 1, 1, g_win, NULL, inst, NULL);
     }
+    g_help = CreateWindowW(L"BUTTON", L"Help", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                           0, 0, 1, 1, g_win, (HMENU)(INT_PTR)IDC_ROMS_HELP, inst, NULL);
+    intv_help_set_context(g_win, "prefs/ROMs", 1);
     g_close = CreateWindowW(L"BUTTON", L"Close", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                             0, 0, 1, 1, g_win, (HMENU)(INT_PTR)IDC_ROMS_CLOSE, inst, NULL);
     make_fonts();

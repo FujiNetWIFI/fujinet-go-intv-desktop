@@ -29,6 +29,7 @@
 #include <string.h>
 
 #include "window.h"
+#include "help/help_window.h"
 
 #define MAX_ROM_ROWS 8
 
@@ -270,6 +271,7 @@ static AdwPreferencesPage *build_roms_page(PrefsState *st, GObject *dialog)
                 gtk_widget_set_valign(dir, GTK_ALIGN_CENTER);
                 gtk_box_append(GTK_BOX(box), files);
                 gtk_box_append(GTK_BOX(box), dir);
+                gtk_box_append(GTK_BOX(box), intv_help_button("prefs/ROMs"));
                 adw_preferences_group_set_header_suffix(group, box);
             }
             adw_preferences_page_add(page, group);
@@ -316,6 +318,7 @@ void intv_prefs_show(IntvWindow *parent, intvsession *session)
     adw_preferences_page_set_icon_name(page, "preferences-system-symbolic");
 
     adw_preferences_group_set_title(machine, "Machine");
+    adw_preferences_group_set_header_suffix(machine, intv_help_button("prefs/Machine"));
     adw_preferences_group_set_description(
         machine, "Applied by restarting the session when this dialog "
                 "closes. FujiNet stays connected.");

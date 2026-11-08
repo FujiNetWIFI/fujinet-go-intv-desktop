@@ -18,6 +18,10 @@ G_DECLARE_FINAL_TYPE(IntvWindow, intv_window, INTV, WINDOW,
 GtkWidget *intv_window_new(AdwApplication *app, intvsession *session);
 void intv_window_toast(IntvWindow *self, const char *message);
 
+/* The Help context the main window shows now: "nobios", "prefs/<page>"
+ * while Preferences is open, else "main". */
+const char *intv_window_help_context(IntvWindow *self);
+
 /* Stops and restarts the session with intvsession_default_opts() re-read
  * from the settings store -- the "apply" side of a Settings dialog change
  * to ECS/Intellivoice/video standard, all of which need a fresh emulator

@@ -20,6 +20,7 @@ add_executable(fujinet-go-intv-macos MACOSX_BUNDLE
   AppDelegate.m
   DisplayView.m
   IntvKeyForward.m
+  help/HelpWindow.m
   debugger/DebuggerWindow.m
   keypad/KeypadWindow.m
   ecskbd/EcsKeyboardWindow.m

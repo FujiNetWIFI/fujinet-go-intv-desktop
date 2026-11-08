@@ -267,6 +267,21 @@ target_include_directories(jzintv_core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 # latter linking SDL3 for audio/gamepad).
 find_package(SDL3 CONFIG REQUIRED)
 
+# The Help, embedded: data/help/help.md as topics of styled spans
+# (core/include/intvhelp.h), which every frontend lays out with its own
+# toolkit. help_data.h declares the table; the build generates it.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(INTV_HELP_C "${CMAKE_BINARY_DIR}/generated/help_content.c")
+add_custom_command(
+  OUTPUT "${INTV_HELP_C}"
+  COMMAND "${Python3_EXECUTABLE}" -I "${CMAKE_SOURCE_DIR}/tools/help/make-help.py"
+          --src "${CMAKE_SOURCE_DIR}/data/help/help.md"
+          --out-c "${INTV_HELP_C}"
+  DEPENDS "${CMAKE_SOURCE_DIR}/tools/help/make-help.py"
+          "${CMAKE_SOURCE_DIR}/data/help/help.md"
+  COMMENT "Help"
+  VERBATIM)
+
 add_library(intv_session STATIC
   src/settings.c
   src/paths.c
@@ -281,6 +296,8 @@ add_library(intv_session STATIC
   src/roms.c
   src/media.c
   src/zipread.c
+  src/help.c
+  "${INTV_HELP_C}"
 )
 set_target_properties(intv_session PROPERTIES C_STANDARD 11)
 target_include_directories(intv_session PRIVATE src)
@@ -368,6 +385,10 @@ add_executable(session_test tests/session_test.c)
 target_link_libraries(session_test intv_session)
 target_include_directories(session_test PRIVATE src)
 
+# The built-in Help covers every setting, key and context.
+add_executable(help_test tests/help_test.c)
+target_link_libraries(help_test intv_session)
+
 add_executable(hid_keys_test tests/hid_keys_test.c)
 target_link_libraries(hid_keys_test intv_session)
 
@@ -441,6 +462,7 @@ add_executable(periph_test tests/periph_test.c)
 target_link_libraries(periph_test jzintv_core)
 
 add_test(NAME hid_keys COMMAND hid_keys_test)
+add_test(NAME help COMMAND help_test)
 add_test(NAME no_sdl_link COMMAND no_sdl_link_test)
 add_test(NAME boot_smoke COMMAND boot_smoke)
 add_test(NAME reset_test COMMAND reset_test)

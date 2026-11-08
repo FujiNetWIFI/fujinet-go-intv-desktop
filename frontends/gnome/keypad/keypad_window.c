@@ -51,6 +51,7 @@
 #define _USE_MATH_DEFINES
 #include <math.h>
 
+#include "../help/help_window.h"
 #include "../keysym_map.h"
 
 #define DISC_SIZE 150
@@ -813,6 +814,8 @@ static void ensure_window(GtkWindow *parent, intvsession *session)
     gtk_box_append(GTK_BOX(outer), build_map_row());
 
     header = adw_header_bar_new();
+    adw_header_bar_pack_end(ADW_HEADER_BAR(header), intv_help_button("keypad"));
+    intv_help_set_context(GTK_WINDOW(g_win), "keypad");
     tb = adw_toolbar_view_new();
     adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(tb), header);
     adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(tb), outer);

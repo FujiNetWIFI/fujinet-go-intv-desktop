@@ -18,6 +18,7 @@ set(GNOME_SOURCES
   window.c
   display.c
   prefs.c
+  help/help_window.c
   debugger/dbg_window.c
   keypad/keypad_window.c
   ecskbd/ecskbd_window.c

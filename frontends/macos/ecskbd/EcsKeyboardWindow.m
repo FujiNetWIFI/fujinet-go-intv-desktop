@@ -30,6 +30,7 @@
 #import "EcsKeyboardWindow.h"
 
 #import "IntvKeyForward.h"
+#import "../help/HelpWindow.h"
 
 /* ---- ordinary keys ------------------------------------------------------ */
 
@@ -249,7 +250,7 @@ static const EcsKeyLabel kRowZxcv[10] = {
                                                key:INTVSESSION_ECS_KEY_ENTER
                                              width:56];
     NSStackView *fnRow = [NSStackView stackViewWithViews:@[
-        esc, ctrl, shift, space, up, down, right, enter
+        esc, ctrl, shift, space, up, down, right, enter, IntvHelpButton(@"ecskbd")
     ]];
     fnRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     fnRow.spacing = 4;
@@ -270,6 +271,7 @@ static const EcsKeyLabel kRowZxcv[10] = {
                     backing:NSBackingStoreBuffered
                       defer:NO];
     _window.title = @"ECS Keyboard";
+    IntvSetHelpContext(_window, @"ecskbd");
     _window.session = _session;
     /* This window IS the ECS keyboard, so its keystrokes drive the ECS
      * matrix whether or not "keyboard_mode" is on -- matching its

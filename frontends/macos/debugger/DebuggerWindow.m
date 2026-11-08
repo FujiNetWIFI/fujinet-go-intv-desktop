@@ -38,6 +38,7 @@
  */
 
 #import "DebuggerWindow.h"
+#import "../help/HelpWindow.h"
 
 #include <float.h>
 #include <stdlib.h>
@@ -639,9 +640,11 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     _status = [self label:@"Running"];
     _status.alignment = NSTextAlignmentRight;
 
+    NSButton *helpBtn = IntvHelpButton(nil);
+    [helpBtn setRefusesFirstResponder:YES];
     NSStackView *toolbar = [NSStackView stackViewWithViews:@[
         _runBtn, stepBtn, stepOverBtn, stepOutBtn, clearBpBtn, loadSymsBtn,
-        clearSymsBtn, _status
+        clearSymsBtn, _status, helpBtn
     ]];
     toolbar.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     toolbar.spacing = 8;
@@ -669,6 +672,7 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     tabs.delegate = self;
     if (tabFromEnv() >= 0)
         [tabs selectTabViewItemAtIndex:tabFromEnv()];
+    [self updateHelpContext];
 
     NSStackView *root = [NSStackView stackViewWithViews:@[ toolbar, tabs ]];
     root.orientation = NSUserInterfaceLayoutOrientationVertical;
@@ -839,9 +843,18 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     [self refreshFujinet:YES];
 }
 
+/* Help's contexts (intvhelp.h): the tab identifiers are the contexts' ends */
+- (void)updateHelpContext
+{
+    NSString *ident = _tabs.selectedTabViewItem.identifier;
+    if (ident)
+        IntvSetHelpContext(_window, [@"debugger/" stringByAppendingString:ident]);
+}
+
 - (void)tabView:(NSTabView *)tabView didSelectTabViewItem:(NSTabViewItem *)item
 {
     (void)tabView;
+    [self updateHelpContext];
     if (item == _fujiItem)
         [self refreshFujinet:NO];
 }

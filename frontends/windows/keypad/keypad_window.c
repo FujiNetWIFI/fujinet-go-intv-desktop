@@ -60,6 +60,7 @@
 #include "keypad_window.h"
 
 #include "../accent_button.h"
+#include "../help/help_window.h"
 #include "key_forward.h"
 
 #include <math.h>
@@ -114,6 +115,7 @@ typedef enum {
 
 #define IDC_KEYPAD_MAP    2001
 #define IDC_KEYPAD_RESET  2002
+#define IDC_KEYPAD_HELP   2090
 /* One id per intvsession_sysaction, IDC_KEYPAD_SYSACT_BASE + a -- see
  * build_system_row and keypad_wnd_proc's own WM_COMMAND handling. */
 #define IDC_KEYPAD_SYSACT_BASE 2003
@@ -655,6 +657,9 @@ static void build_map_row(HWND parent, HINSTANCE inst)
     CreateWindowExA(0, "BUTTON", "Reset Bindings",
                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 258, 416, 140, 28,
                     parent, (HMENU)(INT_PTR)IDC_KEYPAD_RESET, inst, NULL);
+    CreateWindowExA(0, "BUTTON", "Help",
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 406, 416, 64, 28,
+                    parent, (HMENU)(INT_PTR)IDC_KEYPAD_HELP, inst, NULL);
     g_status_label =
         CreateWindowExA(0, "STATIC", "",
                         WS_CHILD | WS_VISIBLE | SS_CENTER, 8, 452, 464, 48,
@@ -678,6 +683,8 @@ static LRESULT CALLBACK keypad_wnd_proc(HWND hwnd, UINT msg, WPARAM wp,
                     set_highlighted(g_map_btn, 1);
                     map_set_status("Press button to map");
                 }
+            } else if (id == IDC_KEYPAD_HELP) {
+                intv_help_show(hwnd, "keypad");
             } else if (id == IDC_KEYPAD_RESET) {
                 map_reset_ui();
                 if (g_map_session) {

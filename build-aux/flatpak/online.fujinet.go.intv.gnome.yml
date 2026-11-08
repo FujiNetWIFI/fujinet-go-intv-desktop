@@ -138,6 +138,6 @@ modules:
         strip-components: 1
         dest: third_party/jzintv
       - type: git
-        url: https://github.com/tschak909/fujinet-firmware
-        commit: 81f9fdb3ce7bd7af9ef507282782085ad18fc16c
+        url: https://github.com/FujiNetWIFI/fujinet-firmware
+        commit: 2ee2e03ee03eadb6d86b5abc6e42abb94824e15e
         dest: third_party/fujinet-firmware

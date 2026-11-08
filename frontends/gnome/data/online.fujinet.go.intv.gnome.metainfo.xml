@@ -50,6 +50,13 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.14.2" date="2026-11-08">
+      <description>
+        <p>
+          Updated the bundled FujiNet runtime to the current fujinet-firmware master, including the BoIP idle-wait fix that cuts idle wakeups from about 1000 to about 100 a second.
+        </p>
+      </description>
+    </release>
     <release version="0.14.1" date="2026-11-08">
       <description>
         <p>

@@ -584,6 +584,81 @@ int intvsym_annotate_line(const intvsymtab *t, const intvdebug_dasm_line *l,
     return snprintf(dst, (size_t)dstsz, "   ; %s", operand);
 }
 
+int intvsym_resolve_basic(const intvsymtab *t, const char *name, intvsym_var *out)
+{
+    static const char *const prefixes[] = { "var_", "array_", "label_" };
+    char base[SYM_NAME_MAX], key[SYM_NAME_MAX];
+    const char *p, *paren;
+    int has_index = 0, index = 0, len, k;
+    uint16_t addr = 0;
+    int kind = -1;
+
+    if (!t || !name)
+        return 0;
+    while (isspace((unsigned char)*name))
+        name++;
+    paren = strchr(name, '(');
+    len = (int)(paren ? paren - name : (int)strlen(name));
+    while (len > 0 && isspace((unsigned char)name[len - 1]))
+        len--;
+    if (len <= 0 || len >= (int)sizeof(base) - 8)
+        return 0;
+    for (k = 0; k < len; k++) {
+        const unsigned char c = (unsigned char)name[k];
+        if (!isalnum(c) && c != '_' && c != '#' && c != '&')
+            return 0;
+        base[k] = c == '#' ? '&' : (char)toupper(c);
+    }
+    base[len] = 0;
+    if (paren) {
+        char *end;
+        long v = strtol(paren + 1, &end, 10);
+        while (isspace((unsigned char)*end))
+            end++;
+        if (*end != ')' || v < 0 || v > 65535)
+            return 0;
+        has_index = 1;
+        index = (int)v;
+        for (p = end + 1; *p; p++)
+            if (!isspace((unsigned char)*p))
+                return 0;
+    }
+    for (k = 0; k < 3; k++) {
+        snprintf(key, sizeof(key), "%s%s", prefixes[k], base);
+        if (intvsymtab_lookup_name(t, key, &addr)) {
+            kind = k;
+            break;
+        }
+    }
+    if (kind < 0 || (has_index && kind != 1))
+        return 0;
+
+    out->is_array = kind == 1;
+    out->count = 1;
+    if (kind == 1) {   /* an array runs to the next symbol above it */
+        intvsymtab *mt = (intvsymtab *)t;
+        const int n = intvsymtab_count(mt);
+        unsigned next = 0x10000;
+        int i;
+        for (i = 0; i < n; i++) {   /* the next variable, or where the area ends */
+            uint16_t a;
+            char nm[SYM_NAME_MAX];
+            if (!intvsymtab_enum(mt, i, &a, nm, sizeof(nm), NULL, 0) || a <= addr || a >= next)
+                continue;
+            if (strncmp(nm, "var_", 4) == 0 || strncmp(nm, "array_", 6) == 0 ||
+                strcmp(nm, "_SCRATCH") == 0 || strcmp(nm, "STACK") == 0)
+                next = a;
+        }
+        if (next - addr < 4096)
+            out->count = (uint16_t)(next - addr);
+        if (has_index && out->count > 1 && index >= out->count)
+            return 0;
+    }
+    out->width = (strchr(base, '&') || addr >= 0x0200) && !(addr >= 0x0100 && addr <= 0x01EF) ? 16 : 8;
+    out->addr = (uint16_t)(addr + (has_index ? index : 0));
+    return 1;
+}
+
 int intvsym_parse_addr(const intvsymtab *t, const char *text,
                        uint16_t *addr_out)
 {
@@ -611,6 +686,15 @@ int intvsym_parse_addr(const intvsymtab *t, const char *text,
      * symbol, not be shadowed by the hex parse below. */
     if (t && intvsymtab_lookup_name(t, trimmed, addr_out))
         return 1;
+
+    if (t && trimmed[0] != '$' && !(trimmed[0] == '0' && (trimmed[1] == 'x' || trimmed[1] == 'X'))) {
+        intvsym_var var;
+        if (intvsym_resolve_basic(t, trimmed, &var)) {
+            if (addr_out)
+                *addr_out = var.addr;
+            return 1;
+        }
+    }
 
     hex = trimmed;
     if (hex[0] == '$') {

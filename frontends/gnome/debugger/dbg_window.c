@@ -37,6 +37,7 @@
 
 #include "intvdebug.h"
 #include "intvstic.h"
+#include "memtools.h"
 #include "srcmap.h"
 #include "symbols.h"
 #include "../help/help_window.h"
@@ -47,10 +48,12 @@
 #define CARD_ROWS_PER_PAGE 8 /* 128 cards/page at CARDS_PER_ROW=16 */
 #define FUJI_REFRESH_US 500000 /* the FujiNet tab, while it shows */
 
-enum { TAB_CPU, TAB_BASIC, TAB_MEMORY, TAB_STIC, TAB_SYMBOLS, TAB_FUJINET };
+enum { TAB_CPU, TAB_BASIC, TAB_MEMORY, TAB_BREAKS, TAB_WATCHES, TAB_STIC, TAB_SYMBOLS, TAB_FUJINET };
 
 /* A breakpoint in a gutter: a red dot. */
 #define BP_DOT "<span foreground=\"#e01b24\">\xe2\x97\x8f</span>"
+/* a disabled one: a hollow grey dot */
+#define BP_DOT_OFF "<span foreground=\"#8a8a8a\">\xe2\x97\x8b</span>"
 
 typedef struct {
     GtkWindow *win;
@@ -97,6 +100,24 @@ typedef struct {
     unsigned bas_gen;        /* intvsrcmap_generation() the list was built from */
     int bas_scroll_line;     /* a line to bring into view once it has a size */
     gboolean bas_syncing;    /* dropdown being set by us, not the user */
+
+    /* Memory tab: the highlighted words, and the search */
+    gboolean mem_hl;
+    uint16_t mem_hl_lo, mem_hl_hi;
+    GtkDropDown *srch_kind;
+    GtkEntry *srch_entry;
+    GtkLabel *srch_note;
+
+    /* Breakpoints tab */
+    GtkDropDown *bp_type, *bp_cond;
+    GtkEntry *bp_addr, *bp_value;
+    GtkListBox *bp_list;
+    GtkLabel *bp_stop;
+    unsigned bp_gen;
+
+    /* Watches tab */
+    GtkEntry *wt_entry;
+    GtkListBox *wt_list;
 
     GtkNotebook *notebook;
     GtkWidget *fuji_page;
@@ -283,6 +304,12 @@ static void on_row_activated(GtkListBox *box, GtkListBoxRow *row,
     invalidate(w); /* redraw the marker immediately */
 }
 
+/* The gutter's mark for an EXEC breakpoint's state (0 none, 1 on, 2 off). */
+static const char *bp_dot(int state)
+{
+    return state == 1 ? BP_DOT : state == 2 ? BP_DOT_OFF : " ";
+}
+
 static void refresh_disasm(DbgWin *w)
 {
     intvdebug_dasm_line lines[DISASM_LINES];
@@ -307,8 +334,7 @@ static void refresh_disasm(DbgWin *w)
         body = g_strdup_printf("%04X  %-24s%s", l->addr, l->text, symsuffix);
         esc = g_markup_escape_text(body, -1);
         text = g_strdup_printf(
-            "%s %s", intvdebug_breakpoint_is_set(w->dbg, l->addr) ? BP_DOT : " ",
-            esc);
+            "%s %s", bp_dot(intvdebug_breakpoint_state(w->dbg, l->addr)), esc);
         gtk_label_set_markup(GTK_LABEL(label), text);
         if (l->addr == r.pc)   /* the machine is here: a bar in the accent */
             gtk_widget_add_css_class(row, "intv-pcrow");
@@ -337,7 +363,13 @@ static void refresh_mem(DbgWin *w)
         g_string_append_printf(text, "%04X ", row_addr);
         for (col = 0; col < MEM_WORDS_PER_ROW; col++) {
             int idx = row * MEM_WORDS_PER_ROW + col;
-            if (idx < n)
+            const uint16_t a = (uint16_t)(row_addr + col);
+            if (idx >= n)
+                break;
+            if (w->mem_hl && a >= w->mem_hl_lo && a <= w->mem_hl_hi)   /* a variable, symbol or hit */
+                g_string_append_printf(text,
+                    " <span background=\"#1E4912\" foreground=\"#ffffff\">%04X</span>", words[idx]);
+            else
                 g_string_append_printf(text, " %04X", words[idx]);
         }
         /* Only label the first row of a run in the same region -- repeating
@@ -349,7 +381,7 @@ static void refresh_mem(DbgWin *w)
         if ((row + 1) * MEM_WORDS_PER_ROW < n)
             g_string_append_c(text, '\n');
     }
-    gtk_label_set_text(w->mem, text->str);
+    gtk_label_set_markup(w->mem, text->str);
     g_string_free(text, TRUE);
 }
 
@@ -558,8 +590,8 @@ static void basic_mark(DbgWin *w, int line, int pc_line, char out[3])
 {
     int addr = intvsrcmap_first_addr(w->srcmap, w->bas_file, line);
     out[0] = line == pc_line ? '>' : ' ';
-    out[1] = addr >= 0 && intvdebug_breakpoint_is_set(w->dbg, (uint16_t)addr)
-                 ? '*' : ' ';
+    out[1] = addr < 0 ? ' ' : intvdebug_breakpoint_state(w->dbg, (uint16_t)addr) == 1 ? '*'
+             : intvdebug_breakpoint_state(w->dbg, (uint16_t)addr) == 2 ? 'o' : ' ';
     out[2] = '\0';
 }
 
@@ -569,7 +601,7 @@ static void basic_set_row(DbgWin *w, int line, const char mark[3])
     const char *src = intvsrcmap_line_text(w->srcmap, w->bas_file, line);
     g_autofree char *esc = g_markup_escape_text(src ? src : "", -1);
     g_autofree char *text = g_strdup_printf(
-        "%s %5d  %s", mark[1] == '*' ? BP_DOT : " ", line, esc);
+        "%s %5d  %s", mark[1] == '*' ? BP_DOT : mark[1] == 'o' ? BP_DOT_OFF : " ", line, esc);
     GtkWidget *row = gtk_widget_get_parent(GTK_WIDGET(label));
 
     gtk_label_set_markup(label, text);
@@ -751,6 +783,288 @@ static void on_bas_row_activated(GtkListBox *box, GtkListBoxRow *row,
     invalidate(w);
 }
 
+/* ---- Breakpoints and Watches tabs ----------------------------------------- */
+
+static void show_in_memory(DbgWin *w, uint16_t lo, uint16_t hi);
+
+/* One line on why the machine stopped. */
+static void stop_text(const intvdebug_stop_info *st, char *dst, size_t n)
+{
+    switch (st->reason) {
+    case INTVDEBUG_STOP_WATCH_WRITE:
+        snprintf(dst, n, "wrote $%04X = $%02X (was $%02X), now at $%04X", st->addr,
+                 st->value & 0xFF, st->old_value & 0xFF, st->pc);
+        break;
+    case INTVDEBUG_STOP_WATCH_READ:
+        snprintf(dst, n, "read $%04X, now at $%04X", st->addr, st->pc);
+        break;
+    case INTVDEBUG_STOP_BREAKPOINT:
+        snprintf(dst, n, "breakpoint at $%04X", st->pc);
+        break;
+    default:
+        dst[0] = '\0';
+    }
+}
+
+static void on_bp_enable_toggled(GtkCheckButton *cb, gpointer user_data)
+{
+    DbgWin *w = user_data;
+    intvdebug_bp_enable(w->dbg, GPOINTER_TO_INT(g_object_get_data(G_OBJECT(cb), "bp-id")),
+                        gtk_check_button_get_active(cb));
+    invalidate(w);
+}
+
+static void on_bp_remove(GtkButton *b, gpointer user_data)
+{
+    DbgWin *w = user_data;
+    intvdebug_bp_remove(w->dbg, GPOINTER_TO_INT(g_object_get_data(G_OBJECT(b), "bp-id")));
+    invalidate(w);
+}
+
+static void bp_rebuild(DbgWin *w)
+{
+    intvdebug_bp bps[INTVDEBUG_MAX_BREAKPOINTS];
+    const int n = intvdebug_bp_list(w->dbg, bps, INTVDEBUG_MAX_BREAKPOINTS);
+    int i;
+
+    gtk_list_box_remove_all(w->bp_list);
+    for (i = 0; i < n; i++) {
+        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        GtkWidget *check = gtk_check_button_new();
+        GtkWidget *label = gtk_label_new(NULL);
+        GtkWidget *del = gtk_button_new_with_label("Remove");
+        char desc[160];
+        g_autofree char *text = NULL;
+
+        intvbp_describe(&bps[i], w->symtab, desc, sizeof(desc));
+        text = g_strdup_printf("%s    hits %u", desc, bps[i].hits);
+        gtk_label_set_text(GTK_LABEL(label), text);
+        gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+        gtk_widget_set_hexpand(label, TRUE);
+        gtk_widget_add_css_class(label, "monospace");
+        gtk_check_button_set_active(GTK_CHECK_BUTTON(check), bps[i].enabled);
+        gtk_widget_set_tooltip_text(check, "Enabled");
+        g_object_set_data(G_OBJECT(check), "bp-id", GINT_TO_POINTER(bps[i].id));
+        g_signal_connect(check, "toggled", G_CALLBACK(on_bp_enable_toggled), w);
+        gtk_widget_add_css_class(del, "flat");
+        g_object_set_data(G_OBJECT(del), "bp-id", GINT_TO_POINTER(bps[i].id));
+        g_signal_connect(del, "clicked", G_CALLBACK(on_bp_remove), w);
+        gtk_widget_set_margin_start(row, 6);
+        gtk_widget_set_margin_end(row, 6);
+        gtk_box_append(GTK_BOX(row), check);
+        gtk_box_append(GTK_BOX(row), label);
+        gtk_box_append(GTK_BOX(row), del);
+        gtk_list_box_append(w->bp_list, row);
+    }
+}
+
+static void bp_refresh(DbgWin *w)
+{
+    const unsigned gen = intvdebug_bp_generation(w->dbg);
+    intvdebug_stop_info st;
+    char text[160], line[200];
+
+    if (gen != w->bp_gen) {
+        w->bp_gen = gen;
+        bp_rebuild(w);
+    }
+    if (intvdebug_is_paused(w->dbg) && intvdebug_last_stop(w->dbg, &st)) {
+        stop_text(&st, text, sizeof(text));
+        snprintf(line, sizeof(line), "Stopped: %s", text[0] ? text : "paused");
+    } else {
+        snprintf(line, sizeof(line), "%s", intvdebug_is_paused(w->dbg) ? "Paused." : "Running.");
+    }
+    gtk_label_set_text(w->bp_stop, line);
+}
+
+static void on_bp_add(GtkButton *button, gpointer user_data)
+{
+    DbgWin *w = user_data;
+    const guint type = gtk_drop_down_get_selected(w->bp_type);
+    const guint cond = gtk_drop_down_get_selected(w->bp_cond);
+    const char *text = gtk_editable_get_text(GTK_EDITABLE(w->bp_addr));
+    intvdebug_bp bp;
+    uint16_t lo, hi;
+    (void)button;
+
+    memset(&bp, 0, sizeof(bp));
+    if (type == 0 ? !intvsym_parse_addr(w->symtab, text, &lo)
+                  : !intvsym_parse_range(w->symtab, text, &lo, &hi, NULL)) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "No such symbol, variable or address: %s", text);
+        gtk_label_set_text(w->status, msg);
+        return;
+    }
+    if (type == 0)
+        hi = lo;
+    bp.type = type == 0 ? INTVDEBUG_BP_EXEC : type == 1 ? INTVDEBUG_BP_READ
+              : type == 2 ? INTVDEBUG_BP_WRITE : (INTVDEBUG_BP_READ | INTVDEBUG_BP_WRITE);
+    bp.lo = lo;
+    bp.hi = hi;
+    bp.cond = (int)cond;   /* any, changed, =, != in the dropdown's order */
+    bp.value = (uint16_t)strtoul(gtk_editable_get_text(GTK_EDITABLE(w->bp_value)) +
+                                     (gtk_editable_get_text(GTK_EDITABLE(w->bp_value))[0] == '$' ? 1 : 0),
+                                 NULL, 16);
+    bp.mask = lo >= 0x0100 && hi <= 0x01EF ? 0x00FF : 0xFFFF;   /* the scratchpad is 8 bits */
+    if (intvdebug_bp_add(w->dbg, &bp) < 0) {
+        gtk_label_set_text(w->status, "The breakpoint table is full");
+        return;
+    }
+    gtk_editable_set_text(GTK_EDITABLE(w->bp_addr), "");
+    invalidate(w);
+}
+
+static void on_bp_entry_activate(GtkEntry *entry, gpointer user_data)
+{
+    (void)entry;
+    on_bp_add(NULL, user_data);
+}
+
+static void on_bp_clear_hits(GtkButton *b, gpointer u)
+{
+    DbgWin *w = u;
+    (void)b;
+    intvdebug_bp_clear_hits(w->dbg);
+    invalidate(w);
+}
+
+static void on_bp_remove_all(GtkButton *b, gpointer u)
+{
+    DbgWin *w = u;
+    (void)b;
+    intvdebug_breakpoint_clear_all(w->dbg);
+    invalidate(w);
+}
+
+/* ---- watches ---- */
+
+static void on_wt_remove(GtkButton *b, gpointer user_data)
+{
+    DbgWin *w = user_data;
+    intvwatch_remove(GPOINTER_TO_INT(g_object_get_data(G_OBJECT(b), "wt-idx")));
+    invalidate(w);
+}
+
+static void on_wt_memory(GtkButton *b, gpointer user_data)
+{
+    DbgWin *w = user_data;
+    uint16_t lo, hi;
+    if (intvwatch_range(w->symtab, GPOINTER_TO_INT(g_object_get_data(G_OBJECT(b), "wt-idx")), &lo, &hi)) {
+        gtk_notebook_set_current_page(w->tabs, TAB_MEMORY);
+        show_in_memory(w, lo, hi);
+    }
+}
+
+static void on_wt_break(GtkButton *b, gpointer user_data)
+{
+    DbgWin *w = user_data;
+    intvdebug_bp bp;
+    uint16_t lo, hi;
+    if (!intvwatch_range(w->symtab, GPOINTER_TO_INT(g_object_get_data(G_OBJECT(b), "wt-idx")), &lo, &hi))
+        return;
+    memset(&bp, 0, sizeof(bp));
+    bp.type = INTVDEBUG_BP_WRITE;
+    bp.lo = lo;
+    bp.hi = hi;
+    bp.cond = INTVDEBUG_COND_CHANGED;
+    bp.mask = lo >= 0x0100 && hi <= 0x01EF ? 0x00FF : 0xFFFF;
+    if (intvdebug_bp_add(w->dbg, &bp) >= 0)
+        gtk_label_set_text(w->status, "Breaking when it changes");
+    invalidate(w);
+}
+
+static void wt_rebuild(DbgWin *w)
+{
+    const int n = intvwatch_count();
+    int i;
+
+    gtk_list_box_remove_all(w->wt_list);
+    for (i = 0; i < n; i++) {
+        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        GtkWidget *label = gtk_label_new(NULL);
+        static const struct { const char *text, *tip; GCallback cb; } btns[] = {
+            { "Memory", "Show it in the Memory tab", G_CALLBACK(on_wt_memory) },
+            { "Break", "Break when it changes", G_CALLBACK(on_wt_break) },
+            { "Remove", "Forget this watch", G_CALLBACK(on_wt_remove) },
+        };
+        char line[200];
+        size_t k;
+
+        intvwatch_format(w->dbg, w->symtab, i, line, sizeof(line));
+        gtk_label_set_text(GTK_LABEL(label), line);
+        gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+        gtk_widget_set_hexpand(label, TRUE);
+        gtk_widget_add_css_class(label, "monospace");
+        gtk_widget_set_margin_start(row, 6);
+        gtk_widget_set_margin_end(row, 6);
+        gtk_box_append(GTK_BOX(row), label);
+        for (k = 0; k < G_N_ELEMENTS(btns); k++) {
+            GtkWidget *b = gtk_button_new_with_label(btns[k].text);
+            gtk_widget_add_css_class(b, "flat");
+            gtk_widget_set_tooltip_text(b, btns[k].tip);
+            g_object_set_data(G_OBJECT(b), "wt-idx", GINT_TO_POINTER(i));
+            g_signal_connect(b, "clicked", btns[k].cb, w);
+            gtk_box_append(GTK_BOX(row), b);
+        }
+        gtk_list_box_append(w->wt_list, row);
+    }
+}
+
+static void on_wt_add(GtkButton *button, gpointer user_data)
+{
+    DbgWin *w = user_data;
+    (void)button;
+    if (intvwatch_add(gtk_editable_get_text(GTK_EDITABLE(w->wt_entry))) < 0) {
+        gtk_label_set_text(w->status, "Type an address, symbol or BASIC variable (x, #score, a(3))");
+        return;
+    }
+    gtk_editable_set_text(GTK_EDITABLE(w->wt_entry), "");
+    invalidate(w);
+}
+
+static void on_wt_entry_activate(GtkEntry *entry, gpointer user_data)
+{
+    (void)entry;
+    on_wt_add(NULL, user_data);
+}
+
+/* ---- memory search ---- */
+
+static void on_search(GtkButton *button, gpointer user_data)
+{
+    DbgWin *w = user_data;
+    const int backward = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "back"));
+    uint16_t pat[64], mask, found;
+    int flags, n;
+    uint16_t from;
+
+    n = intvsearch_parse((int)gtk_drop_down_get_selected(w->srch_kind),
+                         gtk_editable_get_text(GTK_EDITABLE(w->srch_entry)), pat, &mask, &flags);
+    if (!n) {
+        gtk_label_set_text(w->srch_note, "Type hex words (02A0 0268) or some text.");
+        return;
+    }
+    if (!intvdebug_is_paused(w->dbg)) {
+        gtk_label_set_text(w->srch_note, "Pause the machine to search its memory.");
+        return;
+    }
+    from = w->mem_hl ? (backward ? w->mem_hl_lo : (uint16_t)(w->mem_hl_lo + 1)) : w->mem_view_addr;
+    if (intvsearch_next(w->dbg, pat, n, mask, flags, from, backward, &found)) {
+        g_autofree char *msg = g_strdup_printf("Found at $%04X", found);
+        gtk_label_set_text(w->srch_note, msg);
+        show_in_memory(w, found, (uint16_t)(found + n - 1));
+    } else {
+        gtk_label_set_text(w->srch_note, "Not found.");
+    }
+}
+
+static void on_search_entry_activate(GtkEntry *entry, gpointer user_data)
+{
+    DbgWin *w = user_data;
+    GtkWidget *fwd = g_object_get_data(G_OBJECT(entry), "next-button");
+    on_search(GTK_BUTTON(fwd), w);
+}
+
 static void refresh_all(DbgWin *w)
 {
     int paused = intvdebug_is_paused(w->dbg);
@@ -760,7 +1074,19 @@ static void refresh_all(DbgWin *w)
         gtk_widget_add_css_class(GTK_WIDGET(w->run_pause), "intv-accent");
     else
         gtk_widget_remove_css_class(GTK_WIDGET(w->run_pause), "intv-accent");
-    gtk_label_set_text(w->status, paused ? "Paused" : "Running");
+    {
+        intvdebug_stop_info st;
+        char why[160], status[200];
+        why[0] = '\0';
+        if (paused && intvdebug_last_stop(w->dbg, &st))
+            stop_text(&st, why, sizeof(why));
+        if (why[0] && st.reason != INTVDEBUG_STOP_BREAKPOINT) {
+            snprintf(status, sizeof(status), "Paused: %s", why);
+            gtk_label_set_text(w->status, status);
+        } else {
+            gtk_label_set_text(w->status, paused ? "Paused" : "Running");
+        }
+    }
 
     if (paused) {
         refresh_regs(w);
@@ -777,6 +1103,8 @@ static void refresh_all(DbgWin *w)
      * not machine state, and is cheap to skip when nothing changed (see
      * refresh_symbols's own comment). */
     refresh_symbols(w);
+    bp_refresh(w);
+    wt_rebuild(w);
     if (fuji_showing(w))
         refresh_fujinet(w, FALSE);
     w->was_paused = paused;
@@ -873,16 +1201,27 @@ static void on_clear_bp(GtkButton *b, gpointer u)
  * "Could not open symbol file" -- and, like that one, must NOT touch
  * seen_serial: doing so would force the very next tick_cb to overwrite the
  * message with the plain Paused/Running text before the user reads it. */
+/* Shows a range in the Memory tab, highlighted, on a row boundary. */
+static void show_in_memory(DbgWin *w, uint16_t lo, uint16_t hi)
+{
+    w->mem_view_addr = (uint16_t)(lo & 0xFFF8);
+    w->mem_hl = TRUE;
+    w->mem_hl_lo = lo;
+    w->mem_hl_hi = hi;
+    invalidate(w);
+    if (intvdebug_is_paused(w->dbg))
+        refresh_mem(w);
+}
+
 static void go_to_mem_addr(DbgWin *w)
 {
     const char *text = gtk_editable_get_text(GTK_EDITABLE(w->mem_addr));
-    uint16_t addr;
-    if (intvsym_parse_addr(w->symtab, text, &addr)) {
-        w->mem_view_addr = addr;
-        invalidate(w);
+    uint16_t lo, hi;
+    if (intvsym_parse_range(w->symtab, text, &lo, &hi, NULL)) {
+        show_in_memory(w, lo, hi);
     } else {
         char msg[96];
-        snprintf(msg, sizeof(msg), "No such symbol or address: %s", text);
+        snprintf(msg, sizeof(msg), "No such symbol, variable or address: %s", text);
         gtk_label_set_text(w->status, msg);
     }
 }
@@ -1143,8 +1482,8 @@ static void on_fuji_clear(GtkButton *b, gpointer u)
 
 /* Help's contexts (intvhelp.h), one per tab */
 static const char *const k_tab_contexts[] = {
-    "debugger/cpu", "debugger/basic", "debugger/memory", "debugger/stic",
-    "debugger/symbols", "debugger/fujinet",
+    "debugger/cpu", "debugger/basic", "debugger/memory", "debugger/breakpoints",
+    "debugger/watches", "debugger/stic", "debugger/symbols", "debugger/fujinet",
 };
 
 static gboolean on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num,
@@ -1362,9 +1701,117 @@ static GtkWidget *build_basic(DbgWin *w)
     return box;
 }
 
+static GtkWidget *build_search_bar(DbgWin *w)
+{
+    GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *next = tool_button("Find _Next", "Next match after the highlight", G_CALLBACK(on_search), w);
+    GtkWidget *prev = tool_button("Find _Previous", "Previous match before the highlight", G_CALLBACK(on_search), w);
+    static const char *const kinds[] = { "Hex words", "Text", NULL };
+
+    g_object_set_data(G_OBJECT(prev), "back", GINT_TO_POINTER(1));
+    w->srch_kind = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(kinds));
+    gtk_widget_set_tooltip_text(GTK_WIDGET(w->srch_kind), "Hex words (02A0 0268) or text, one character per word");
+    w->srch_entry = GTK_ENTRY(gtk_entry_new());
+    gtk_widget_set_hexpand(GTK_WIDGET(w->srch_entry), TRUE);
+    g_object_set_data(G_OBJECT(w->srch_entry), "next-button", next);
+    g_signal_connect(w->srch_entry, "activate", G_CALLBACK(on_search_entry_activate), w);
+    w->srch_note = GTK_LABEL(gtk_label_new(""));
+    gtk_widget_add_css_class(GTK_WIDGET(w->srch_note), "dim-label");
+    gtk_widget_set_margin_top(bar, 0);
+    gtk_widget_set_margin_bottom(bar, 6);
+    gtk_widget_set_margin_start(bar, 6);
+    gtk_widget_set_margin_end(bar, 6);
+    gtk_box_append(GTK_BOX(bar), gtk_label_new("Search:"));
+    gtk_box_append(GTK_BOX(bar), GTK_WIDGET(w->srch_kind));
+    gtk_box_append(GTK_BOX(bar), GTK_WIDGET(w->srch_entry));
+    gtk_box_append(GTK_BOX(bar), next);
+    gtk_box_append(GTK_BOX(bar), prev);
+    gtk_box_append(GTK_BOX(bar), GTK_WIDGET(w->srch_note));
+    return bar;
+}
+
+static GtkWidget *build_breaks(DbgWin *w)
+{
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *form = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *scroll = gtk_scrolled_window_new();
+    GtkWidget *foot = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    static const char *const types[] = { "Execute", "Read", "Write", "Access", NULL };
+    static const char *const conds[] = { "any value", "changed", "equals", "not equal", NULL };
+
+    w->bp_type = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(types));
+    gtk_widget_set_tooltip_text(GTK_WIDGET(w->bp_type),
+        "Execute stops before an instruction; Read, Write and Access stop after the "
+        "instruction that touched the words (data accesses only, not code fetches)");
+    w->bp_addr = GTK_ENTRY(gtk_entry_new());
+    gtk_entry_set_placeholder_text(w->bp_addr, "address, lo-hi, symbol, x, #score, a(3)");
+    gtk_widget_set_hexpand(GTK_WIDGET(w->bp_addr), TRUE);
+    g_signal_connect(w->bp_addr, "activate", G_CALLBACK(on_bp_entry_activate), w);
+    w->bp_cond = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(conds));
+    gtk_widget_set_tooltip_text(GTK_WIDGET(w->bp_cond), "A condition on the value written (Write and Access)");
+    w->bp_value = GTK_ENTRY(gtk_entry_new());
+    gtk_entry_set_placeholder_text(w->bp_value, "value (hex)");
+    gtk_editable_set_width_chars(GTK_EDITABLE(w->bp_value), 10);
+    gtk_box_append(GTK_BOX(form), GTK_WIDGET(w->bp_type));
+    gtk_box_append(GTK_BOX(form), GTK_WIDGET(w->bp_addr));
+    gtk_box_append(GTK_BOX(form), GTK_WIDGET(w->bp_cond));
+    gtk_box_append(GTK_BOX(form), GTK_WIDGET(w->bp_value));
+    gtk_box_append(GTK_BOX(form), tool_button("_Add", "Add the breakpoint", G_CALLBACK(on_bp_add), w));
+
+    w->bp_list = GTK_LIST_BOX(gtk_list_box_new());
+    gtk_list_box_set_selection_mode(w->bp_list, GTK_SELECTION_NONE);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), GTK_WIDGET(w->bp_list));
+    gtk_widget_set_vexpand(scroll, TRUE);
+
+    w->bp_stop = GTK_LABEL(gtk_label_new(""));
+    gtk_label_set_xalign(w->bp_stop, 0.0f);
+    gtk_widget_add_css_class(GTK_WIDGET(w->bp_stop), "dim-label");
+    gtk_widget_set_hexpand(GTK_WIDGET(w->bp_stop), TRUE);
+    gtk_box_append(GTK_BOX(foot), GTK_WIDGET(w->bp_stop));
+    gtk_box_append(GTK_BOX(foot), tool_button("Clear _Hits", "Zero the hit counts", G_CALLBACK(on_bp_clear_hits), w));
+    gtk_box_append(GTK_BOX(foot), tool_button("_Remove All", "Remove every breakpoint", G_CALLBACK(on_bp_remove_all), w));
+
+    gtk_widget_set_margin_top(box, 6);
+    gtk_widget_set_margin_bottom(box, 6);
+    gtk_widget_set_margin_start(box, 6);
+    gtk_widget_set_margin_end(box, 6);
+    gtk_box_append(GTK_BOX(box), form);
+    gtk_box_append(GTK_BOX(box), scroll);
+    gtk_box_append(GTK_BOX(box), foot);
+    return box;
+}
+
+static GtkWidget *build_watches(DbgWin *w)
+{
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *form = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *scroll = gtk_scrolled_window_new();
+
+    w->wt_entry = GTK_ENTRY(gtk_entry_new());
+    gtk_entry_set_placeholder_text(w->wt_entry, "address, symbol, x, #score, a(3), lo-hi");
+    gtk_widget_set_hexpand(GTK_WIDGET(w->wt_entry), TRUE);
+    g_signal_connect(w->wt_entry, "activate", G_CALLBACK(on_wt_entry_activate), w);
+    gtk_box_append(GTK_BOX(form), gtk_label_new("Watch:"));
+    gtk_box_append(GTK_BOX(form), GTK_WIDGET(w->wt_entry));
+    gtk_box_append(GTK_BOX(form), tool_button("_Add", "Watch it", G_CALLBACK(on_wt_add), w));
+
+    w->wt_list = GTK_LIST_BOX(gtk_list_box_new());
+    gtk_list_box_set_selection_mode(w->wt_list, GTK_SELECTION_NONE);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), GTK_WIDGET(w->wt_list));
+    gtk_widget_set_vexpand(scroll, TRUE);
+
+    gtk_widget_set_margin_top(box, 6);
+    gtk_widget_set_margin_bottom(box, 6);
+    gtk_widget_set_margin_start(box, 6);
+    gtk_widget_set_margin_end(box, 6);
+    gtk_box_append(GTK_BOX(box), form);
+    gtk_box_append(GTK_BOX(box), scroll);
+    return box;
+}
+
 /* The notebook's pages, in order; INTV_DEBUGGER_TAB picks one by number or
  * by the start of its name (any case), for tests and captures. */
-static const char *const k_tab_names[] = { "CPU", "BASIC", "Memory", "STIC", "Symbols", "FujiNet" };
+static const char *const k_tab_names[] = { "CPU", "BASIC", "Memory", "Breakpoints", "Watches", "STIC", "Symbols", "FujiNet" };
 
 static int tab_from_env(void)
 {
@@ -1588,10 +2035,15 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     {
         GtkWidget *mem_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
         gtk_box_append(GTK_BOX(mem_page), mem_bar);
+        gtk_box_append(GTK_BOX(mem_page), build_search_bar(w));
         gtk_box_append(GTK_BOX(mem_page), mem_scroller);
         gtk_notebook_append_page(GTK_NOTEBOOK(notebook), mem_page,
                                  gtk_label_new(k_tab_names[TAB_MEMORY]));
     }
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_breaks(w),
+                             gtk_label_new(k_tab_names[TAB_BREAKS]));
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_watches(w),
+                             gtk_label_new(k_tab_names[TAB_WATCHES]));
     {
         GtkWidget *outer_scroll = gtk_scrolled_window_new();
         gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(outer_scroll),
@@ -1676,6 +2128,28 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
                     intvdebug_breakpoint_toggle(w->dbg, (uint16_t)addr);
             }
         }
+    }
+
+    /* More captures: INTV_WATCH="x" adds a watch, INTV_WATCH_BREAK="x" a
+     * write-when-changed breakpoint on it, INTV_MEM_GOTO="x" shows it in Memory. */
+    {
+        const char *wt = g_getenv("INTV_WATCH"), *wb = g_getenv("INTV_WATCH_BREAK"),
+                   *mg = g_getenv("INTV_MEM_GOTO");
+        uint16_t lo, hi;
+        if (wt && *wt)
+            intvwatch_add(wt);
+        if (wb && *wb && intvsym_parse_range(w->symtab, wb, &lo, &hi, NULL)) {
+            intvdebug_bp bp;
+            memset(&bp, 0, sizeof(bp));
+            bp.type = INTVDEBUG_BP_WRITE;
+            bp.lo = lo;
+            bp.hi = hi;
+            bp.cond = INTVDEBUG_COND_CHANGED;
+            bp.mask = 0xFF;
+            intvdebug_bp_add(w->dbg, &bp);
+        }
+        if (mg && *mg && intvsym_parse_range(w->symtab, mg, &lo, &hi, NULL))
+            show_in_memory(w, lo, hi);
     }
 
     /* Engaging switches the CPU hook to the path that honours breakpoints

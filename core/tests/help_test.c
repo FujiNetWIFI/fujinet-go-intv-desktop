@@ -26,7 +26,7 @@ static const char *const platform_names[] = { "GNOME", "KDE", "Windows", "macOS"
 /* What the frontends' Help buttons and menus open. */
 static const char *const contexts[] = {
     "main", "nobios", "keypad", "ecskbd", "fujilog", "prefs/Machine", "prefs/ROMs",
-    "debugger/cpu", "debugger/basic", "debugger/memory", "debugger/stic", "debugger/symbols", "debugger/fujinet",
+    "debugger/cpu", "debugger/basic", "debugger/memory", "debugger/breakpoints", "debugger/watches", "debugger/stic", "debugger/symbols", "debugger/fujinet",
 };
 
 /* The Preferences pages: what each one has, as the frontends label it. */
@@ -184,7 +184,7 @@ static void
 check_debugger(int p)
 {
     static const char *const words[] = { "Pause", "Step Over", "Step Out", "Clear Breakpoints", "Break at",
-                                         "Load Symbols", "Clear Symbols", "six tabs", "red dot", "Import File", "Import Folder", "Load Map", ".smap", "INCLUDE", "GRAM", "BACKTAB", "Filter" };
+                                         "Load Symbols", "Clear Symbols", "eight tabs", "red dot", "Break on Change", "Find Next", "Import File", "Import Folder", "Load Map", ".smap", "INCLUDE", "GRAM", "BACKTAB", "Filter" };
     for (size_t k = 0; k < sizeof words / sizeof *words; k++)
         require(p, "debugger", "button", words[k]);
 }

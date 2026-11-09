@@ -360,7 +360,7 @@ controls that differ from the defaults).
 # Debugger
 
 The Debugger (<kbd>F12</kbd>) stops the console and shows what it is doing.
-It has six tabs; closing it lets the console go on as it was.
+It has eight tabs; closing it lets the console go on as it was.
 
 | Button | Does |
 |---|---|
@@ -386,7 +386,12 @@ its breakpoint. The registers are in the strip under every tab.
 
 A hex view of memory: type an address or a symbol after **Address:** and press
 Enter. The rows are labelled with the hardware that answers there (STIC, PSG,
-EXEC ROM and so on).
+EXEC ROM and so on). A variable, symbol or range you go to is highlighted, as is
+a search hit.
+
+**Search** finds hex words (`02A0 0268`) or text, one character per word, from
+the highlight onward; **Find Next** and **Find Previous** step through the
+matches.
 
 <!-- context: debugger/basic -->
 ## BASIC
@@ -410,6 +415,32 @@ On this tab Step, Step Over and Step Out (<kbd>F7</kbd>, <kbd>F8</kbd>,
 it, and Step Out runs until the procedure returns. The IntyBASIC runtime is no
 line of yours, so stepping runs straight through it. The map has to come from
 the ROM that is running.
+
+<!-- context: debugger/breakpoints -->
+## Breakpoints
+
+Every breakpoint and watchpoint. **Add** one with a type, an address, and for
+Write and Access a condition on the value written:
+
+- **Execute** stops before an instruction runs.
+- **Read**, **Write** and **Access** (both) stop *after* the instruction that
+  touched the words, and the status line says what it did, for instance
+  `wrote $010C = $1D (was $1C)`. They see the CPU's data accesses only: an
+  instruction fetch is not one, so use Execute to catch code.
+
+The address can be a number (`$010C`), a range (`$0100-$010F`), a symbol, or an
+IntyBASIC variable: `x`, `#score`, or an array element `a(3)`. The box beside
+each entry enables or disables it (a disabled one is a hollow dot in the
+margin), and the list shows how many times each has fired.
+
+<!-- context: debugger/watches -->
+## Watches
+
+Variables to keep an eye on, with their live values while the machine is
+stopped. Type an address, a symbol, an IntyBASIC variable (`x`, `#score`,
+`a(3)`) or a range after **Watch** and press Enter. **Show in Memory** jumps to
+it in the Memory tab, and **Break on Change** adds a Write breakpoint that
+fires when its value changes.
 
 <!-- context: debugger/stic -->
 ## STIC

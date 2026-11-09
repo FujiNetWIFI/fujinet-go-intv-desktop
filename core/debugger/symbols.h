@@ -94,7 +94,8 @@ int intvsym_annotate_line(const intvsymtab *t, const intvdebug_dasm_line *l,
 
 /* Resolves user-typed text (a memory "go to" box, a "break at" box, ...) to
  * an address: an exact, case-sensitive symbol name if one matches (as1600
- * symbols are case-sensitive), otherwise hex with an optional leading '$'
+ * symbols are case-sensitive), then an IntyBASIC variable (intvsym_resolve_basic;
+ * not for text with a `$` or `0x` prefix), otherwise hex with an optional leading '$'
  * or "0x"/"0X". Surrounding whitespace is ignored; trailing garbage after
  * the hex digits, or anything decoding above $FFFF, is rejected. Name is
  * tried before hex, so a symbol literally named e.g. "1000" resolves as
@@ -102,6 +103,23 @@ int intvsym_annotate_line(const intvsymtab *t, const intvdebug_dasm_line *l,
  * success, 0 (== *addr_out unchanged) otherwise. t may be NULL (hex-only). */
 int intvsym_parse_addr(const intvsymtab *t, const char *text,
                        uint16_t *addr_out);
+
+/* An IntyBASIC variable, resolved from the compiler's own symbols: it names
+ * variables var_NAME, arrays array_NAME and labels label_NAME, upper-cased,
+ * with `#` written `&` (so #score is var_&SCORE). 8-bit variables live in the
+ * scratchpad ($0100-$01EF), 16-bit ones in system RAM ($0200-$03FF, or the
+ * JLP/CC3 range). */
+typedef struct {
+    uint16_t addr;      /* the word (for an indexed array, the element) */
+    uint16_t count;     /* words in the array, 1 for a variable or label */
+    uint8_t  width;     /* 8 or 16 bits */
+    uint8_t  is_array;
+} intvsym_var;
+
+/* Resolves "x", "#score", "a(3)" (case-insensitive, `#` for 16 bits) or "label"
+ * against the table. Returns 1 and fills *out, 0 if no such variable. An
+ * index past the array's end is refused when its length is known. */
+int intvsym_resolve_basic(const intvsymtab *t, const char *name, intvsym_var *out);
 
 /* Directory part of path, accepting both '/' and '\\' as separators (a
  * loaded .sym's path may come from any of the four frontends' native file

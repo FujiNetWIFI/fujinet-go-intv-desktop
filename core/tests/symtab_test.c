@@ -329,6 +329,39 @@ int main(void)
               a == 0x7000);
     }
 
+    /* ---- IntyBASIC variables: var_/array_/label_, # is & ---- */
+    {
+        intvsymtab *b = intvsymtab_create();
+        intvsym_var v;
+        uint16_t a = 0;
+        intvsymtab_add(b, 0x010C, "var_X");
+        intvsymtab_add(b, 0x02F0, "var_&SCORE");
+        intvsymtab_add(b, 0x0120, "array_ARR");
+        intvsymtab_add(b, 0x0128, "var_Z");
+        intvsymtab_add(b, 0x50C8, "label_MAIN");
+        check("x is an 8-bit variable", intvsym_resolve_basic(b, "x", &v) && v.addr == 0x010C &&
+                                            v.width == 8 && !v.is_array && v.count == 1);
+        check("#score is 16 bits", intvsym_resolve_basic(b, "#score", &v) && v.addr == 0x02F0 && v.width == 16);
+        check("case and spaces are forgiven", intvsym_resolve_basic(b, "  #ScOrE ", &v) && v.addr == 0x02F0);
+        check("an array runs to the next symbol", intvsym_resolve_basic(b, "arr", &v) && v.addr == 0x0120 &&
+                                                      v.is_array && v.count == 8);
+        check("an element", intvsym_resolve_basic(b, "arr(3)", &v) && v.addr == 0x0123);
+        check("an element past the end is refused", !intvsym_resolve_basic(b, "arr(8)", &v));
+        check("an index on a plain variable is refused", !intvsym_resolve_basic(b, "x(1)", &v));
+        check("a label", intvsym_resolve_basic(b, "main", &v) && v.addr == 0x50C8);
+        check("no such variable", !intvsym_resolve_basic(b, "nosuch", &v) && !intvsym_resolve_basic(b, "", &v));
+        check("garbage is refused", !intvsym_resolve_basic(b, "x y", &v) && !intvsym_resolve_basic(b, "a(", &v));
+        check("parse_addr takes a BASIC variable", intvsym_parse_addr(b, "x", &a) && a == 0x010C);
+        check("and #variables", intvsym_parse_addr(b, "#score", &a) && a == 0x02F0);
+        check("an array element", intvsym_parse_addr(b, "arr(2)", &a) && a == 0x0122);
+        check("hex still works", intvsym_parse_addr(b, "$10C", &a) && a == 0x010C);
+        check("hex that is not a variable", intvsym_parse_addr(b, "dead", &a) && a == 0xDEAD);
+        check("a $ prefix is hex even if a variable has the name",
+              (intvsymtab_add(b, 0x0140, "var_DEAD"), intvsym_parse_addr(b, "$dead", &a) && a == 0xDEAD));
+        check("but a bare name is the variable", intvsym_parse_addr(b, "dead", &a) && a == 0x0140);
+        intvsymtab_destroy(b);
+    }
+
     if (failed) {
         fprintf(stderr, "symtab_test: FAILED\n");
         return 1;

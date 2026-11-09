@@ -49,6 +49,13 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.17.0" date="2026-11-09">
+      <description>
+        <p>
+          Debugger: a Breakpoints tab with Execute, Read, Write and Access breakpoints (Write can test the value written), on an address, a range, a symbol or an IntyBASIC variable such as x, #score or a(3). A Watches tab shows variables with their live values. The Memory tab highlights a variable or hit and can search for hex words or text. When the machine stops, the status line says why.
+        </p>
+      </description>
+    </release>
     <release version="0.16.0" date="2026-11-09">
       <description>
         <p>

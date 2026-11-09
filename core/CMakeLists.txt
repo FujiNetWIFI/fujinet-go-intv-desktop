@@ -176,6 +176,7 @@ list(APPEND JZINTV_CORE_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/jzintv/intv_host.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/debugger.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/fujitrace.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/debugger/memtools.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/srcmap.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/sticview.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/symbols.c"
@@ -467,6 +468,18 @@ target_include_directories(linestep_test PRIVATE src debugger)
 target_compile_definitions(linestep_test PRIVATE
   SRCMAP_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/srcmap")
 
+# Pure: watch list, range parsing, search queries, breakpoint descriptions.
+add_executable(memtools_test tests/memtools_test.c)
+target_link_libraries(memtools_test jzintv_core)
+target_include_directories(memtools_test PRIVATE debugger)
+
+# Breakpoint table and access watchpoints on a real machine (needs the ROMs).
+add_executable(watch_test tests/watch_test.c)
+target_link_libraries(watch_test jzintv_core)
+target_include_directories(watch_test PRIVATE src debugger)
+target_compile_definitions(watch_test PRIVATE
+  SRCMAP_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/srcmap")
+
 # Pure decoder test: synthetic SLIP bytes, no ROMs, no network.
 add_executable(fujitrace_test tests/fujitrace_test.c)
 target_link_libraries(fujitrace_test jzintv_core)
@@ -506,6 +519,9 @@ add_test(NAME symtab COMMAND symtab_test)
 add_test(NAME srcmap COMMAND srcmap_test)
 add_test(NAME linestep COMMAND linestep_test)
 set_tests_properties(linestep PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
+add_test(NAME memtools COMMAND memtools_test)
+add_test(NAME watch COMMAND watch_test)
+set_tests_properties(watch PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
 add_test(NAME fujitrace COMMAND fujitrace_test)
 add_test(NAME periph COMMAND periph_test)
 add_test(NAME rom_import COMMAND rom_import_test)

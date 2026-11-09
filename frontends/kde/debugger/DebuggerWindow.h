@@ -52,6 +52,15 @@ private:
     void breakAtAddr();
     void refreshSymbols();
     QWidget *buildBasic();
+    QWidget *buildBreaks();
+    QWidget *buildWatches();
+    QWidget *buildSearchBar();
+    void refreshBreaks();
+    void refreshWatches();
+    void showInMemory(uint16_t lo, uint16_t hi);
+    void addBreak();
+    void addWatch();
+    void search(bool backward);
     void refreshBasic(bool paused);
     void basicReload();
     void basicShowFile(int file);
@@ -107,6 +116,25 @@ private:
     int m_basBar = -1;        /* the block wearing the current-line bar */
     int m_basPcLine = 0;      /* the machine's line in the file shown, 0 = none */
     bool m_basGuard = false;  /* we are moving the cursor, not the user */
+
+    /* Memory tab: the highlighted words, and the search */
+    bool m_memHl = false;
+    uint16_t m_memHlLo = 0, m_memHlHi = 0;
+    QComboBox *m_srchKind;
+    QLineEdit *m_srchEntry;
+    QLabel *m_srchNote;
+
+    /* Breakpoints tab */
+    QComboBox *m_bpType, *m_bpCond;
+    QLineEdit *m_bpAddr, *m_bpValue;
+    QListWidget *m_bpList;
+    QLabel *m_bpStop;
+    unsigned m_bpGen = 0;
+    bool m_bpBuilding = false;
+
+    /* Watches tab */
+    QLineEdit *m_wtEntry;
+    QListWidget *m_wtList;
 
     QTabWidget *m_tabs;
     QWidget *m_fujiPage;

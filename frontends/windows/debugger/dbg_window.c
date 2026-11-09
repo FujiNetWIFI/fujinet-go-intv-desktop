@@ -54,6 +54,7 @@
 #include "intvstic.h"
 #include "../accent_button.h"
 #include "../help/help_window.h"
+#include "memtools.h"
 #include "srcmap.h"
 #include "symbols.h"
 
@@ -70,9 +71,11 @@
 #define PAGE_CPU 0
 #define PAGE_BASIC 1
 #define PAGE_MEMORY 2
-#define PAGE_STIC 3
-#define PAGE_SYMBOLS 4
-#define PAGE_FUJINET 5
+#define PAGE_BREAKS 3
+#define PAGE_WATCHES 4
+#define PAGE_STIC 5
+#define PAGE_SYMBOLS 6
+#define PAGE_FUJINET 7
 
 #define FUJI_TICKS 5 /* the FujiNet tab, every 500ms while it shows */
 
@@ -80,6 +83,10 @@ enum {
     IDC_PAUSE = 1000, IDC_STEP, IDC_STEP_OVER, IDC_STEP_OUT, IDC_CLEAR_BP,
     IDC_LOAD_SYMS, IDC_CLEAR_SYMS, IDC_HELP_BTN,
     IDC_BAS_FILE, IDC_BAS_FOLDER, IDC_BAS_MAP, IDC_BAS_FILES, IDC_BAS_VIEW,
+    IDC_BP_TYPE, IDC_BP_ADDR, IDC_BP_COND, IDC_BP_VALUE, IDC_BP_ADD, IDC_BP_LIST,
+    IDC_BP_TOGGLE, IDC_BP_REMOVE, IDC_BP_HITS, IDC_BP_CLEAR, IDC_BP_STOP,
+    IDC_WT_ENTRY, IDC_WT_ADD, IDC_WT_LIST, IDC_WT_MEM, IDC_WT_BRK, IDC_WT_REMOVE,
+    IDC_SRCH_KIND, IDC_SRCH_ENTRY, IDC_SRCH_NEXT, IDC_SRCH_PREV, IDC_SRCH_NOTE,
     IDC_STATUS, IDC_TABS,
     IDC_DISASM, IDC_FLAGS,
     IDC_MEM_ADDR, IDC_MEM_VIEW,
@@ -112,6 +119,17 @@ typedef struct {
 
     /* BASIC page: the imported IntyBASIC source (core/debugger/srcmap.h) */
     HWND bas_file_btn, bas_folder_btn, bas_map_btn, bas_files, bas_note, bas_view;
+
+    /* Memory page: the highlighted words and the search */
+    int mem_hl;
+    uint16_t mem_hl_lo, mem_hl_hi;
+    HWND srch_label, srch_kind, srch_entry, srch_next, srch_prev, srch_note;
+
+    /* Breakpoints and Watches pages */
+    HWND bp_type, bp_addr, bp_cond, bp_value, bp_add, bp_list;
+    HWND bp_toggle, bp_remove, bp_hits, bp_clear, bp_stop;
+    unsigned bp_gen;
+    HWND wt_label, wt_entry, wt_add, wt_list, wt_mem, wt_brk, wt_remove;
     int bas_file;       /* index into the map; -1 = nothing shown */
     unsigned bas_gen;   /* intvsrcmap_generation() the view was built from */
     int bas_pc_line;    /* the machine's line in the file shown, 0 = none */
@@ -157,8 +175,8 @@ static const char *const kRegNames[8] = {"R0", "R1", "R2", "R3",
 
 /* The tabs, in PAGE_* order; INTV_DEBUGGER_TAB picks one by number or by the
  * start of its name (any case), for tests and captures. */
-static const char *const k_tab_names[] = {"CPU", "BASIC", "Memory", "STIC",
-                                          "Symbols", "FujiNet"};
+static const char *const k_tab_names[] = {"CPU", "BASIC", "Memory", "Breakpoints",
+                                          "Watches", "STIC", "Symbols", "FujiNet"};
 #define TAB_COUNT ((int)(sizeof(k_tab_names) / sizeof(k_tab_names[0])))
 
 static int tab_from_env(void)
@@ -260,6 +278,7 @@ static LRESULT CALLBACK edit_subclass(HWND hwnd, UINT msg, WPARAM wp,
 
 #define LV_PC 1
 #define LV_BP 2
+#define LV_BP_OFF 4   /* a disabled breakpoint: a hollow grey dot */
 #define LV_GUTTER 22
 
 typedef struct {
@@ -480,9 +499,15 @@ static LRESULT CALLBACK lines_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
             }
             TextOutA(hdc, LV_GUTTER, y + 1, lv->text[i], (int)strlen(lv->text[i]));
-            if (lv->flags[i] & LV_BP) {
-                HGDIOBJ ob = SelectObject(hdc, dot), op = SelectObject(hdc, dotpen);
+            if (lv->flags[i] & (LV_BP | LV_BP_OFF)) {
+                const int off = (lv->flags[i] & LV_BP_OFF) != 0;
+                static HPEN greypen;
+                HGDIOBJ ob, op;
                 const int top = y + (rh - 10) / 2;
+                if (!greypen)
+                    greypen = CreatePen(PS_SOLID, 1, RGB(0x8A, 0x8A, 0x8A));
+                ob = SelectObject(hdc, off ? GetStockObject(NULL_BRUSH) : dot);
+                op = SelectObject(hdc, off ? greypen : dotpen);
                 Ellipse(hdc, 6, top, 16, top + 10);
                 SelectObject(hdc, ob);
                 SelectObject(hdc, op);
@@ -627,7 +652,9 @@ static void build_controls(debugger *d)
     d->mem_label = label(d, "Address:");
     d->mem_addr = field(d, IDC_MEM_ADDR);
     SetWindowTextA(d->mem_addr, "0000");
-    d->mem_view = mono_view(d, IDC_MEM_VIEW);
+    d->mem_view = child(d, "EDIT", "", WS_VISIBLE | WS_BORDER | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
+                                          ES_READONLY | ES_AUTOVSCROLL | ES_NOHIDESEL,
+                        IDC_MEM_VIEW);
     d->break_label = label(d, "Break at:");
     d->break_addr = field(d, IDC_BREAK_ADDR);
 
@@ -647,6 +674,54 @@ static void build_controls(debugger *d)
     d->bas_view = child(d, "IntvDbgLines", "", WS_VISIBLE | WS_BORDER | WS_VSCROLL,
                         IDC_BAS_VIEW);
     d->bas_file = -1;
+
+    /* Memory page: search */
+    d->srch_label = label(d, "Search:");
+    d->srch_kind = child(d, "COMBOBOX", "", WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_HASSTRINGS,
+                         IDC_SRCH_KIND);
+    SendMessageA(d->srch_kind, CB_ADDSTRING, 0, (LPARAM)"Hex words");
+    SendMessageA(d->srch_kind, CB_ADDSTRING, 0, (LPARAM)"Text");
+    SendMessageA(d->srch_kind, CB_SETCURSEL, 0, 0);
+    d->srch_entry = field(d, IDC_SRCH_ENTRY);
+    d->srch_next = child(d, "BUTTON", "Find Next", WS_VISIBLE | BS_PUSHBUTTON, IDC_SRCH_NEXT);
+    d->srch_prev = child(d, "BUTTON", "Find Previous", WS_VISIBLE | BS_PUSHBUTTON, IDC_SRCH_PREV);
+    d->srch_note = label(d, "");
+
+    /* Breakpoints page */
+    d->bp_type = child(d, "COMBOBOX", "", WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_HASSTRINGS,
+                       IDC_BP_TYPE);
+    SendMessageA(d->bp_type, CB_ADDSTRING, 0, (LPARAM)"Execute");
+    SendMessageA(d->bp_type, CB_ADDSTRING, 0, (LPARAM)"Read");
+    SendMessageA(d->bp_type, CB_ADDSTRING, 0, (LPARAM)"Write");
+    SendMessageA(d->bp_type, CB_ADDSTRING, 0, (LPARAM)"Access");
+    SendMessageA(d->bp_type, CB_SETCURSEL, 0, 0);
+    d->bp_addr = field(d, IDC_BP_ADDR);
+    d->bp_cond = child(d, "COMBOBOX", "", WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_HASSTRINGS,
+                       IDC_BP_COND);
+    SendMessageA(d->bp_cond, CB_ADDSTRING, 0, (LPARAM)"any value");
+    SendMessageA(d->bp_cond, CB_ADDSTRING, 0, (LPARAM)"changed");
+    SendMessageA(d->bp_cond, CB_ADDSTRING, 0, (LPARAM)"equals");
+    SendMessageA(d->bp_cond, CB_ADDSTRING, 0, (LPARAM)"not equal");
+    SendMessageA(d->bp_cond, CB_SETCURSEL, 0, 0);
+    d->bp_value = field(d, IDC_BP_VALUE);
+    d->bp_add = child(d, "BUTTON", "Add", WS_VISIBLE | BS_PUSHBUTTON, IDC_BP_ADD);
+    d->bp_list = child(d, "LISTBOX", "", WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+                       IDC_BP_LIST);
+    d->bp_toggle = child(d, "BUTTON", "Enable / Disable", WS_VISIBLE | BS_PUSHBUTTON, IDC_BP_TOGGLE);
+    d->bp_remove = child(d, "BUTTON", "Remove", WS_VISIBLE | BS_PUSHBUTTON, IDC_BP_REMOVE);
+    d->bp_hits = child(d, "BUTTON", "Clear Hits", WS_VISIBLE | BS_PUSHBUTTON, IDC_BP_HITS);
+    d->bp_clear = child(d, "BUTTON", "Remove All", WS_VISIBLE | BS_PUSHBUTTON, IDC_BP_CLEAR);
+    d->bp_stop = child(d, "STATIC", "", WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS, IDC_BP_STOP);
+
+    /* Watches page */
+    d->wt_label = label(d, "Watch:");
+    d->wt_entry = field(d, IDC_WT_ENTRY);
+    d->wt_add = child(d, "BUTTON", "Add", WS_VISIBLE | BS_PUSHBUTTON, IDC_WT_ADD);
+    d->wt_list = child(d, "LISTBOX", "", WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+                       IDC_WT_LIST);
+    d->wt_mem = child(d, "BUTTON", "Show in Memory", WS_VISIBLE | BS_PUSHBUTTON, IDC_WT_MEM);
+    d->wt_brk = child(d, "BUTTON", "Break on Change", WS_VISIBLE | BS_PUSHBUTTON, IDC_WT_BRK);
+    d->wt_remove = child(d, "BUTTON", "Remove", WS_VISIBLE | BS_PUSHBUTTON, IDC_WT_REMOVE);
 
     /* STIC page */
     d->backtab_label = label(d, "BACKTAB");
@@ -705,8 +780,8 @@ static void build_controls(debugger *d)
 
 /* Help's contexts (intvhelp.h), one per tab */
 static const char *const k_tab_contexts[] = {
-    "debugger/cpu", "debugger/basic", "debugger/memory", "debugger/stic",
-    "debugger/symbols", "debugger/fujinet",
+    "debugger/cpu", "debugger/basic", "debugger/memory", "debugger/breakpoints",
+    "debugger/watches", "debugger/stic", "debugger/symbols", "debugger/fujinet",
 };
 
 static void show_page(debugger *d, int page)
@@ -728,6 +803,20 @@ static void show_page(debugger *d, int page)
     ShowWindow(d->break_label, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
     ShowWindow(d->break_addr, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
 
+    {
+        const int m = page == PAGE_MEMORY ? SW_SHOW : SW_HIDE;
+        const int b = page == PAGE_BREAKS ? SW_SHOW : SW_HIDE;
+        const int w = page == PAGE_WATCHES ? SW_SHOW : SW_HIDE;
+        ShowWindow(d->srch_label, m); ShowWindow(d->srch_kind, m); ShowWindow(d->srch_entry, m);
+        ShowWindow(d->srch_next, m); ShowWindow(d->srch_prev, m); ShowWindow(d->srch_note, m);
+        ShowWindow(d->bp_type, b); ShowWindow(d->bp_addr, b); ShowWindow(d->bp_cond, b);
+        ShowWindow(d->bp_value, b); ShowWindow(d->bp_add, b); ShowWindow(d->bp_list, b);
+        ShowWindow(d->bp_toggle, b); ShowWindow(d->bp_remove, b); ShowWindow(d->bp_hits, b);
+        ShowWindow(d->bp_clear, b); ShowWindow(d->bp_stop, b);
+        ShowWindow(d->wt_label, w); ShowWindow(d->wt_entry, w); ShowWindow(d->wt_add, w);
+        ShowWindow(d->wt_list, w); ShowWindow(d->wt_mem, w); ShowWindow(d->wt_brk, w);
+        ShowWindow(d->wt_remove, w);
+    }
     ShowWindow(d->bas_file_btn, page == PAGE_BASIC ? SW_SHOW : SW_HIDE);
     ShowWindow(d->bas_folder_btn, page == PAGE_BASIC ? SW_SHOW : SW_HIDE);
     ShowWindow(d->bas_map_btn, page == PAGE_BASIC ? SW_SHOW : SW_HIDE);
@@ -803,8 +892,42 @@ static void layout(debugger *d)
     /* Memory page */
     MoveWindow(d->mem_label, page.left, page.top + 2, 70, 18, TRUE);
     MoveWindow(d->mem_addr, page.left + 74, page.top, 260, 22, TRUE);
-    MoveWindow(d->mem_view, page.left, page.top + 28, page.right - page.left - 8,
-              page.bottom - page.top - 32, TRUE);
+    MoveWindow(d->srch_label, page.left, page.top + 34, 70, 18, TRUE);
+    MoveWindow(d->srch_kind, page.left + 74, page.top + 30, 110, 200, TRUE);
+    MoveWindow(d->srch_entry, page.left + 190, page.top + 30, 260, 22, TRUE);
+    MoveWindow(d->srch_next, page.left + 456, page.top + 28, 90, 26, TRUE);
+    MoveWindow(d->srch_prev, page.left + 550, page.top + 28, 110, 26, TRUE);
+    MoveWindow(d->srch_note, page.left + 668, page.top + 34, 260, 18, TRUE);
+    MoveWindow(d->mem_view, page.left, page.top + 60, page.right - page.left - 8,
+              page.bottom - page.top - 64, TRUE);
+
+    /* Breakpoints page */
+    {
+        const int R = page.right - 8, top = page.top;
+        MoveWindow(d->bp_type, page.left, top, 90, 200, TRUE);
+        MoveWindow(d->bp_add, R - 60, top - 2, 60, 26, TRUE);
+        MoveWindow(d->bp_value, R - 60 - 4 - 90, top, 90, 22, TRUE);
+        MoveWindow(d->bp_cond, R - 60 - 4 - 90 - 4 - 110, top, 110, 200, TRUE);
+        MoveWindow(d->bp_addr, page.left + 94, top, R - 60 - 4 - 90 - 4 - 110 - 4 - (page.left + 94), 22, TRUE);
+        MoveWindow(d->bp_list, page.left, top + 30, R - page.left, page.bottom - top - 30 - 64, TRUE);
+        MoveWindow(d->bp_toggle, page.left, page.bottom - 58, 130, 26, TRUE);
+        MoveWindow(d->bp_remove, page.left + 134, page.bottom - 58, 80, 26, TRUE);
+        MoveWindow(d->bp_hits, page.left + 218, page.bottom - 58, 90, 26, TRUE);
+        MoveWindow(d->bp_clear, page.left + 312, page.bottom - 58, 100, 26, TRUE);
+        MoveWindow(d->bp_stop, page.left, page.bottom - 26, R - page.left, 20, TRUE);
+    }
+
+    /* Watches page */
+    {
+        const int R = page.right - 8, top = page.top;
+        MoveWindow(d->wt_label, page.left, top + 4, 60, 18, TRUE);
+        MoveWindow(d->wt_entry, page.left + 64, top, R - 60 - 4 - (page.left + 64), 22, TRUE);
+        MoveWindow(d->wt_add, R - 60, top - 2, 60, 26, TRUE);
+        MoveWindow(d->wt_list, page.left, top + 30, R - page.left, page.bottom - top - 30 - 36, TRUE);
+        MoveWindow(d->wt_mem, page.left, page.bottom - 30, 130, 26, TRUE);
+        MoveWindow(d->wt_brk, page.left + 134, page.bottom - 30, 140, 26, TRUE);
+        MoveWindow(d->wt_remove, page.left + 278, page.bottom - 30, 80, 26, TRUE);
+    }
 
     /* Registers: a strip under every page */
     {
@@ -918,7 +1041,8 @@ static void refresh_disasm(debugger *d)
                  lines[i].text, symsuffix);
         lv_add(d->disasm, text,
                (lines[i].addr == r.pc ? LV_PC : 0) |
-                   (intvdebug_breakpoint_is_set(d->dbg, lines[i].addr) ? LV_BP : 0),
+                   (intvdebug_breakpoint_state(d->dbg, lines[i].addr) == 1 ? LV_BP :
+                    intvdebug_breakpoint_state(d->dbg, lines[i].addr) == 2 ? LV_BP_OFF : 0),
                lines[i].addr);
     }
     lv_top(d->disasm);
@@ -950,7 +1074,7 @@ static void refresh_mem(debugger *d)
 {
     uint16_t words[MEM_WORDS_PER_ROW * MEM_ROWS];
     char text[8192];
-    int n, row, col, len = 0;
+    int n, row, col, len = 0, sel_start = -1, sel_end = -1;
 
     n = intvdebug_read(d->dbg, d->mem_base, words, MEM_WORDS_PER_ROW * MEM_ROWS);
     {
@@ -963,9 +1087,16 @@ static void refresh_mem(debugger *d)
                            row_addr);
             for (col = 0; col < MEM_WORDS_PER_ROW; col++) {
                 int idx = row * MEM_WORDS_PER_ROW + col;
-                if (idx < n)
-                    len += snprintf(text + len, sizeof(text) - (size_t)len,
-                                   " %04X", words[idx]);
+                const uint16_t a = (uint16_t)(row_addr + col);
+                if (idx >= n)
+                    continue;
+                if (d->mem_hl && a >= d->mem_hl_lo && a <= d->mem_hl_hi) {
+                    if (sel_start < 0)
+                        sel_start = len + 1;   /* the word, after its space */
+                    sel_end = len + 5;
+                }
+                len += snprintf(text + len, sizeof(text) - (size_t)len,
+                               " %04X", words[idx]);
             }
             /* Only label the first row of a run in the same region -- see
              * symbols.c's k_regions and the GNOME frontend's own
@@ -978,6 +1109,20 @@ static void refresh_mem(debugger *d)
         }
     }
     SetWindowTextA(d->mem_view, text);
+    if (sel_start >= 0)   /* the words of a variable, symbol or hit: selected */
+        SendMessageA(d->mem_view, EM_SETSEL, (WPARAM)sel_start, (LPARAM)sel_end);
+}
+
+/* Shows a range in the Memory tab, highlighted, on a row boundary. */
+static void show_in_memory(debugger *d, uint16_t lo, uint16_t hi)
+{
+    d->mem_base = (uint16_t)(lo & 0xFFF8);
+    d->mem_hl = 1;
+    d->mem_hl_lo = lo;
+    d->mem_hl_hi = hi;
+    d->seen_serial = 0;
+    if (intvdebug_is_paused(d->dbg))
+        refresh_mem(d);
 }
 
 /* Shared scratch buffer for all four STIC renders below -- sized to the
@@ -1304,7 +1449,8 @@ static void refresh_basic(debugger *d, int paused)
         snprintf(text, sizeof(text), "%5d  %.250s", i, src ? src : "");
         lv_add(d->bas_view, text,
                (pf == d->bas_file && i == pl ? LV_PC : 0) |
-                   (addr >= 0 && intvdebug_breakpoint_is_set(d->dbg, (uint16_t)addr) ? LV_BP : 0),
+                   (addr < 0 ? 0 : intvdebug_breakpoint_state(d->dbg, (uint16_t)addr) == 1 ? LV_BP :
+                    intvdebug_breakpoint_state(d->dbg, (uint16_t)addr) == 2 ? LV_BP_OFF : 0),
                i);
     }
     line = pf == d->bas_file ? pl : 0;
@@ -1446,11 +1592,182 @@ static void do_step(debugger *d, int how)
     }
 }
 
+/* ---- Breakpoints, Watches, memory search ------------------------------------ */
+
+/* One line on why the machine stopped. */
+static void stop_text(const intvdebug_stop_info *st, char *dst, size_t n)
+{
+    switch (st->reason) {
+    case INTVDEBUG_STOP_WATCH_WRITE:
+        snprintf(dst, n, "wrote $%04X = $%02X (was $%02X), now at $%04X", st->addr,
+                 st->value & 0xFF, st->old_value & 0xFF, st->pc);
+        break;
+    case INTVDEBUG_STOP_WATCH_READ:
+        snprintf(dst, n, "read $%04X, now at $%04X", st->addr, st->pc);
+        break;
+    case INTVDEBUG_STOP_BREAKPOINT:
+        snprintf(dst, n, "breakpoint at $%04X", st->pc);
+        break;
+    default:
+        dst[0] = '\0';
+    }
+}
+
+static void refresh_breaks(debugger *d)
+{
+    const unsigned gen = intvdebug_bp_generation(d->dbg);
+    intvdebug_stop_info st;
+    char why[160], line[220];
+    const int paused = intvdebug_is_paused(d->dbg);
+
+    if (gen != d->bp_gen) {
+        intvdebug_bp bps[INTVDEBUG_MAX_BREAKPOINTS];
+        const int n = intvdebug_bp_list(d->dbg, bps, INTVDEBUG_MAX_BREAKPOINTS);
+        const int keep = (int)SendMessageA(d->bp_list, LB_GETCURSEL, 0, 0);
+        int i;
+        d->bp_gen = gen;
+        SendMessageA(d->bp_list, WM_SETREDRAW, FALSE, 0);
+        SendMessageA(d->bp_list, LB_RESETCONTENT, 0, 0);
+        for (i = 0; i < n; i++) {
+            char desc[160];
+            int at;
+            intvbp_describe(&bps[i], d->symtab, desc, sizeof(desc));
+            snprintf(line, sizeof(line), "[%c] %s    hits %u", bps[i].enabled ? 'x' : ' ', desc, bps[i].hits);
+            at = (int)SendMessageA(d->bp_list, LB_ADDSTRING, 0, (LPARAM)line);
+            SendMessageA(d->bp_list, LB_SETITEMDATA, (WPARAM)at, (LPARAM)bps[i].id);
+        }
+        if (keep >= 0 && keep < n)
+            SendMessageA(d->bp_list, LB_SETCURSEL, (WPARAM)keep, 0);
+        SendMessageA(d->bp_list, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(d->bp_list, NULL, TRUE);
+    }
+    why[0] = '\0';
+    if (paused && intvdebug_last_stop(d->dbg, &st))
+        stop_text(&st, why, sizeof(why));
+    snprintf(line, sizeof(line), "%s", paused ? (why[0] ? "Stopped: " : "Paused.") : "Running.");
+    if (paused && why[0])
+        snprintf(line + strlen(line), sizeof(line) - strlen(line), "%s", why);
+    SetWindowTextA(d->bp_stop, line);
+}
+
+static void refresh_watches(debugger *d)
+{
+    const int n = intvwatch_count();
+    const int keep = (int)SendMessageA(d->wt_list, LB_GETCURSEL, 0, 0);
+    int i;
+
+    SendMessageA(d->wt_list, WM_SETREDRAW, FALSE, 0);
+    SendMessageA(d->wt_list, LB_RESETCONTENT, 0, 0);
+    for (i = 0; i < n; i++) {
+        char line[200];
+        intvwatch_format(d->dbg, d->symtab, i, line, sizeof(line));
+        SendMessageA(d->wt_list, LB_ADDSTRING, 0, (LPARAM)line);
+    }
+    if (keep >= 0 && keep < n)
+        SendMessageA(d->wt_list, LB_SETCURSEL, (WPARAM)keep, 0);
+    SendMessageA(d->wt_list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(d->wt_list, NULL, TRUE);
+}
+
+static void add_break(debugger *d)
+{
+    char text[128], val[32];
+    const int type = (int)SendMessageA(d->bp_type, CB_GETCURSEL, 0, 0);
+    uint16_t lo = 0, hi = 0;
+    intvdebug_bp bp;
+    const char *v = val;
+
+    GetWindowTextA(d->bp_addr, text, sizeof(text));
+    GetWindowTextA(d->bp_value, val, sizeof(val));
+    memset(&bp, 0, sizeof(bp));
+    if (type == 0 ? !intvsym_parse_addr(d->symtab, text, &lo)
+                  : !intvsym_parse_range(d->symtab, text, &lo, &hi, NULL)) {
+        char msg[200];
+        snprintf(msg, sizeof(msg), "No such symbol, variable or address: %s", text);
+        SetWindowTextA(d->status, msg);
+        return;
+    }
+    if (type == 0)
+        hi = lo;
+    bp.type = type == 0 ? INTVDEBUG_BP_EXEC : type == 1 ? INTVDEBUG_BP_READ
+              : type == 2 ? INTVDEBUG_BP_WRITE : (INTVDEBUG_BP_READ | INTVDEBUG_BP_WRITE);
+    bp.lo = lo;
+    bp.hi = hi;
+    bp.cond = (int)SendMessageA(d->bp_cond, CB_GETCURSEL, 0, 0);
+    if (*v == '$')
+        v++;
+    bp.value = (uint16_t)strtoul(v, NULL, 16);
+    bp.mask = lo >= 0x0100 && hi <= 0x01EF ? 0x00FF : 0xFFFF; /* the scratchpad is 8 bits */
+    if (intvdebug_bp_add(d->dbg, &bp) < 0) {
+        SetWindowTextA(d->status, "The breakpoint table is full");
+        return;
+    }
+    SetWindowTextA(d->bp_addr, "");
+    d->seen_serial = 0;
+}
+
+static void add_watch(debugger *d)
+{
+    char text[64];
+    GetWindowTextA(d->wt_entry, text, sizeof(text));
+    if (intvwatch_add(text) < 0) {
+        SetWindowTextA(d->status, "Type an address, symbol or BASIC variable (x, #score, a(3))");
+        return;
+    }
+    SetWindowTextA(d->wt_entry, "");
+    d->seen_serial = 0;
+}
+
+static void do_search(debugger *d, int backward)
+{
+    char text[200];
+    uint16_t pat[64], mask, found, from;
+    int flags, n;
+
+    GetWindowTextA(d->srch_entry, text, sizeof(text));
+    n = intvsearch_parse((int)SendMessageA(d->srch_kind, CB_GETCURSEL, 0, 0), text, pat, &mask, &flags);
+    if (!n) {
+        SetWindowTextA(d->srch_note, "Type hex words (02A0 0268) or some text.");
+        return;
+    }
+    if (!intvdebug_is_paused(d->dbg)) {
+        SetWindowTextA(d->srch_note, "Pause the machine to search its memory.");
+        return;
+    }
+    from = d->mem_hl ? (backward ? d->mem_hl_lo : (uint16_t)(d->mem_hl_lo + 1)) : d->mem_base;
+    if (intvsearch_next(d->dbg, pat, n, mask, flags, from, backward, &found)) {
+        char note[40];
+        snprintf(note, sizeof(note), "Found at $%04X", found);
+        SetWindowTextA(d->srch_note, note);
+        show_in_memory(d, found, (uint16_t)(found + n - 1));
+    } else {
+        SetWindowTextA(d->srch_note, "Not found.");
+    }
+}
+
+static void selected_watch_range(debugger *d, uint16_t *lo, uint16_t *hi, int *ok)
+{
+    const int sel = (int)SendMessageA(d->wt_list, LB_GETCURSEL, 0, 0);
+    *ok = sel >= 0 && intvwatch_range(d->symtab, sel, lo, hi);
+}
+
 static void refresh_all(debugger *d)
 {
     int paused = intvdebug_is_paused(d->dbg);
     SetWindowTextA(d->pause_btn, paused ? "Continue (F5)" : "Pause (F5)");
-    SetWindowTextA(d->status, paused ? "Paused" : "Running");
+    {
+        intvdebug_stop_info st;
+        char why[160], status[220];
+        why[0] = '\0';
+        if (paused && intvdebug_last_stop(d->dbg, &st) && st.reason != INTVDEBUG_STOP_BREAKPOINT)
+            stop_text(&st, why, sizeof(why));
+        if (why[0]) {
+            snprintf(status, sizeof(status), "Paused: %s", why);
+            SetWindowTextA(d->status, status);
+        } else {
+            SetWindowTextA(d->status, paused ? "Paused" : "Running");
+        }
+    }
 
     if (paused) {
         refresh_regs(d);
@@ -1470,6 +1787,8 @@ static void refresh_all(debugger *d)
      * refresh_symbols's own comment). */
     refresh_symbols(d);
     refresh_basic(d, paused);
+    refresh_breaks(d);
+    refresh_watches(d);
     if (d->page == PAGE_FUJINET)
         refresh_fujinet(d, 0);
     d->was_paused = paused;
@@ -1528,13 +1847,18 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DBG_ACCEPT:
         if (!d)
             return 0;
-        if (wp == IDC_MEM_ADDR) {
+        if (wp == IDC_BP_ADDR || wp == IDC_BP_VALUE) {
+            add_break(d);
+        } else if (wp == IDC_WT_ENTRY) {
+            add_watch(d);
+        } else if (wp == IDC_SRCH_ENTRY) {
+            do_search(d, 0);
+        } else if (wp == IDC_MEM_ADDR) {
             char buf[64];
-            uint16_t addr;
+            uint16_t lo, hi;
             GetWindowTextA(d->mem_addr, buf, sizeof(buf));
-            if (intvsym_parse_addr(d->symtab, buf, &addr)) {
-                d->mem_base = addr;
-                d->seen_serial = 0;
+            if (intvsym_parse_range(d->symtab, buf, &lo, &hi, NULL)) {
+                show_in_memory(d, lo, hi);
             } else {
                 char msg[96];
                 snprintf(msg, sizeof(msg), "No such symbol or address: %s",
@@ -1581,6 +1905,73 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_BAS_MAP:
             basic_pick(d, LOWORD(wp));
             return 0;
+        case IDC_BP_ADD: add_break(d); return 0;
+        case IDC_WT_ADD: add_watch(d); return 0;
+        case IDC_SRCH_NEXT: do_search(d, 0); return 0;
+        case IDC_SRCH_PREV: do_search(d, 1); return 0;
+        case IDC_BP_TOGGLE:
+        case IDC_BP_REMOVE: {
+            const int sel = (int)SendMessageA(d->bp_list, LB_GETCURSEL, 0, 0);
+            if (sel >= 0) {
+                const int id = (int)SendMessageA(d->bp_list, LB_GETITEMDATA, (WPARAM)sel, 0);
+                intvdebug_bp bps[INTVDEBUG_MAX_BREAKPOINTS];
+                const int n = intvdebug_bp_list(d->dbg, bps, INTVDEBUG_MAX_BREAKPOINTS);
+                int i;
+                if (LOWORD(wp) == IDC_BP_REMOVE)
+                    intvdebug_bp_remove(d->dbg, id);
+                else
+                    for (i = 0; i < n; i++)
+                        if (bps[i].id == id)
+                            intvdebug_bp_enable(d->dbg, id, !bps[i].enabled);
+                d->seen_serial = 0;
+            }
+            return 0;
+        }
+        case IDC_BP_HITS:
+            intvdebug_bp_clear_hits(d->dbg);
+            d->seen_serial = 0;
+            return 0;
+        case IDC_BP_CLEAR:
+            intvdebug_breakpoint_clear_all(d->dbg);
+            d->seen_serial = 0;
+            return 0;
+        case IDC_WT_MEM: {
+            uint16_t lo, hi;
+            int ok;
+            selected_watch_range(d, &lo, &hi, &ok);
+            if (ok) {
+                SendMessageA(d->tabs, TCM_SETCURSEL, PAGE_MEMORY, 0);
+                show_page(d, PAGE_MEMORY);
+                show_in_memory(d, lo, hi);
+            }
+            return 0;
+        }
+        case IDC_WT_BRK: {
+            uint16_t lo, hi;
+            int ok;
+            selected_watch_range(d, &lo, &hi, &ok);
+            if (ok) {
+                intvdebug_bp bp;
+                memset(&bp, 0, sizeof(bp));
+                bp.type = INTVDEBUG_BP_WRITE;
+                bp.lo = lo;
+                bp.hi = hi;
+                bp.cond = INTVDEBUG_COND_CHANGED;
+                bp.mask = lo >= 0x0100 && hi <= 0x01EF ? 0x00FF : 0xFFFF;
+                if (intvdebug_bp_add(d->dbg, &bp) >= 0)
+                    SetWindowTextA(d->status, "Breaking when it changes");
+                d->seen_serial = 0;
+            }
+            return 0;
+        }
+        case IDC_WT_REMOVE: {
+            const int sel = (int)SendMessageA(d->wt_list, LB_GETCURSEL, 0, 0);
+            if (sel >= 0) {
+                intvwatch_remove(sel);
+                d->seen_serial = 0;
+            }
+            return 0;
+        }
         case IDC_BAS_FILES:
             if (HIWORD(wp) == CBN_SELCHANGE) {
                 const int sel = (int)SendMessageA(d->bas_files, CB_GETCURSEL, 0, 0);
@@ -1812,6 +2203,28 @@ void intv_debugger_show(HWND parent, intvsession *session)
                     intvdebug_breakpoint_toggle(d->dbg, (uint16_t)addr);
             }
         }
+    }
+
+    /* More captures: INTV_WATCH="x" adds a watch, INTV_WATCH_BREAK="x" a
+     * write-when-changed breakpoint on it, INTV_MEM_GOTO="x" shows it in Memory. */
+    {
+        const char *wt = getenv("INTV_WATCH"), *wb = getenv("INTV_WATCH_BREAK"),
+                   *mg = getenv("INTV_MEM_GOTO");
+        uint16_t lo, hi;
+        if (wt && *wt)
+            intvwatch_add(wt);
+        if (wb && *wb && intvsym_parse_range(d->symtab, wb, &lo, &hi, NULL)) {
+            intvdebug_bp bp;
+            memset(&bp, 0, sizeof(bp));
+            bp.type = INTVDEBUG_BP_WRITE;
+            bp.lo = lo;
+            bp.hi = hi;
+            bp.cond = INTVDEBUG_COND_CHANGED;
+            bp.mask = 0xFF;
+            intvdebug_bp_add(d->dbg, &bp);
+        }
+        if (mg && *mg && intvsym_parse_range(d->symtab, mg, &lo, &hi, NULL))
+            show_in_memory(d, lo, hi);
     }
 
     /* Engaging switches the CPU hook to the path that honours breakpoints

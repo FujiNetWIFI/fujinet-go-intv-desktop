@@ -47,6 +47,7 @@
 
 #include "intvdebug.h"
 #include "intvstic.h"
+#include "memtools.h"
 #include "srcmap.h"
 #include "symbols.h"
 
@@ -73,7 +74,7 @@ static DebuggerWindow *g_debugger;
 
 /* The tabs, in order; INTV_DEBUGGER_TAB picks one by number or by the start
  * of its name (any case), for tests and captures. */
-static const char *const kTabNames[] = {"CPU", "BASIC", "Memory", "STIC", "Symbols", "FujiNet"};
+static const char *const kTabNames[] = {"CPU", "BASIC", "Memory", "Breakpoints", "Watches", "STIC", "Symbols", "FujiNet"};
 #define TAB_COUNT ((int)(sizeof(kTabNames) / sizeof(kTabNames[0])))
 
 static int tabFromEnv(void)
@@ -172,6 +173,33 @@ static int tabFromEnv(void)
 }
 @end
 
+/* A list of lines the user picks one of by clicking (the Breakpoints and
+ * Watches tabs). The picked line is kept in `picked`, -1 for none, and
+ * drawn with a background by whoever owns the text. */
+@interface PickTextView : NSTextView
+@property(nonatomic) int picked;
+@property(nonatomic, copy) void (^onPick)(int line);
+@end
+
+@implementation PickTextView
+- (void)mouseDown:(NSEvent *)event
+{
+    NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+    NSUInteger idx = [self characterIndexForInsertionAtPoint:p];
+    NSString *text = self.string;
+    if (idx > text.length)
+        idx = text.length;
+    const NSUInteger start = [text lineRangeForRange:NSMakeRange(idx, 0)].location;
+    int line = 0;
+    for (NSUInteger i = 0; i < start; i++)
+        if ([text characterAtIndex:i] == '\n')
+            line++;
+    self.picked = line;
+    if (self.onPick)
+        self.onPick(line);
+}
+@end
+
 @interface DebuggerWindow () <NSWindowDelegate, NSTabViewDelegate>
 - (instancetype)initWithSession:(intvsession *)session;
 @end
@@ -182,6 +210,24 @@ static int tabFromEnv(void)
     intvsymtab *_symtab;
     intvsrcmap *_srcmap;
     NSWindow *_window;
+
+    /* Memory tab: the highlighted words, and the search */
+    BOOL _memHl;
+    uint16_t _memHlLo, _memHlHi;
+    NSPopUpButton *_srchKind;
+    NSTextField *_srchEntry;
+    NSTextField *_srchNote;
+
+    /* Breakpoints tab */
+    NSPopUpButton *_bpType, *_bpCond;
+    NSTextField *_bpAddr, *_bpValue, *_bpStop;
+    PickTextView *_bpList;
+    NSMutableArray<NSNumber *> *_bpIds;
+    unsigned _bpGen;
+
+    /* Watches tab */
+    NSTextField *_wtEntry;
+    PickTextView *_wtList;
 
     /* BASIC tab: the imported IntyBASIC source (core/debugger/srcmap.h) */
     NSTabViewItem *_basicItem;
@@ -269,10 +315,10 @@ static NSColor *breakpointRed(void)
 }
 
 /* Appends one source/disassembly line to `out`: gutter dot, text, newline. */
-static void appendLine(NSMutableAttributedString *out, NSString *body, BOOL pc, BOOL bp)
+static void appendLine(NSMutableAttributedString *out, NSString *body, BOOL pc, int bp)
 {
     NSFont *font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
-    NSString *line = [NSString stringWithFormat:@"%@ %@\n", bp ? @"\u25CF" : @" ", body];
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", bp == 1 ? @"\u25CF" : bp == 2 ? @"\u25CB" : @" ", body];
     NSMutableAttributedString *a = [[NSMutableAttributedString alloc]
         initWithString:line
             attributes:@{ NSFontAttributeName : font, NSForegroundColorAttributeName : NSColor.textColor }];
@@ -280,8 +326,10 @@ static void appendLine(NSMutableAttributedString *out, NSString *body, BOOL pc, 
         [a addAttribute:NSBackgroundColorAttributeName value:accentColor() range:NSMakeRange(0, line.length)];
         [a addAttribute:NSForegroundColorAttributeName value:NSColor.whiteColor range:NSMakeRange(1, line.length - 1)];
     }
-    if (bp)
-        [a addAttribute:NSForegroundColorAttributeName value:breakpointRed() range:NSMakeRange(0, 1)];
+    if (bp)   /* enabled: red; disabled: a hollow grey dot */
+        [a addAttribute:NSForegroundColorAttributeName
+                  value:bp == 1 ? breakpointRed() : NSColor.systemGrayColor
+                  range:NSMakeRange(0, 1)];
     [out appendAttributedString:a];
 }
 
@@ -510,11 +558,26 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     memRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     NSScrollView *memScroll;
     _memView = monoView(&memScroll);
-    NSStackView *root = [NSStackView stackViewWithViews:@[ memRow, memScroll ]];
+    _srchKind = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    [_srchKind addItemsWithTitles:@[ @"Hex words", @"Text" ]];
+    _srchKind.toolTip = @"Hex words (02A0 0268) or text, one character per word";
+    _srchEntry = [[NSTextField alloc] init];
+    _srchEntry.target = self;
+    _srchEntry.action = @selector(searchNext:);
+    _srchNote = [self label:@""];
+    _srchNote.textColor = NSColor.secondaryLabelColor;
+    NSStackView *searchRow = [NSStackView stackViewWithViews:@[
+        [self label:@"Search"], _srchKind, _srchEntry,
+        [self button:@"Find Next" action:@selector(searchNext:)],
+        [self button:@"Find Previous" action:@selector(searchPrev:)], _srchNote
+    ]];
+    searchRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    NSStackView *root = [NSStackView stackViewWithViews:@[ memRow, searchRow, memScroll ]];
     root.orientation = NSUserInterfaceLayoutOrientationVertical;
     root.alignment = NSLayoutAttributeLeading;
     root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
     [memRow.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    [searchRow.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
     [memScroll.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
     return root;
 }
@@ -816,20 +879,28 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     NSTabViewItem *memTab = [[NSTabViewItem alloc] initWithIdentifier:@"memory"];
     memTab.label = @(kTabNames[2]);
     memTab.view = [self buildMemoryTab];
+    NSTabViewItem *bpTab = [[NSTabViewItem alloc] initWithIdentifier:@"breakpoints"];
+    bpTab.label = @(kTabNames[3]);
+    bpTab.view = [self buildBreaksTab];
+    NSTabViewItem *wtTab = [[NSTabViewItem alloc] initWithIdentifier:@"watches"];
+    wtTab.label = @(kTabNames[4]);
+    wtTab.view = [self buildWatchesTab];
     NSTabViewItem *sticTab =
         [[NSTabViewItem alloc] initWithIdentifier:@"stic"];
-    sticTab.label = @(kTabNames[3]);
+    sticTab.label = @(kTabNames[5]);
     sticTab.view = [self buildSticTab];
     NSTabViewItem *symTab =
         [[NSTabViewItem alloc] initWithIdentifier:@"symbols"];
-    symTab.label = @(kTabNames[4]);
+    symTab.label = @(kTabNames[6]);
     symTab.view = [self buildSymbolsTab];
     _fujiItem = [[NSTabViewItem alloc] initWithIdentifier:@"fujinet"];
-    _fujiItem.label = @(kTabNames[5]);
+    _fujiItem.label = @(kTabNames[7]);
     _fujiItem.view = [self buildFujinetTab];
     [tabs addTabViewItem:cpuTab];
     [tabs addTabViewItem:_basicItem];
     [tabs addTabViewItem:memTab];
+    [tabs addTabViewItem:bpTab];
+    [tabs addTabViewItem:wtTab];
     [tabs addTabViewItem:sticTab];
     [tabs addTabViewItem:symTab];
     [tabs addTabViewItem:_fujiItem];
@@ -988,16 +1059,27 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
         [self refreshStic];
 }
 
+/* Shows a range in the Memory tab, highlighted, on a row boundary. */
+- (void)showInMemoryLo:(uint16_t)lo hi:(uint16_t)hi
+{
+    _memBase = (uint16_t)(lo & 0xFFF8);
+    _memHl = YES;
+    _memHlLo = lo;
+    _memHlHi = hi;
+    _seenSerial = 0;
+    if (intvdebug_is_paused(_dbg))
+        [self refreshMem];
+}
+
 - (void)gotoMem:(id)sender
 {
     (void)sender;
-    uint16_t addr;
-    if (intvsym_parse_addr(_symtab, _memAddr.stringValue.UTF8String, &addr)) {
-        _memBase = addr;
-        _seenSerial = 0;
+    uint16_t lo, hi;
+    if (intvsym_parse_range(_symtab, _memAddr.stringValue.UTF8String, &lo, &hi, NULL)) {
+        [self showInMemoryLo:lo hi:hi];
     } else {
         _status.stringValue = [NSString
-            stringWithFormat:@"No such symbol or address: %@",
+            stringWithFormat:@"No such symbol, variable or address: %@",
                             _memAddr.stringValue];
     }
 }
@@ -1128,7 +1210,7 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
             const BOOL isPc = pf == _basFile && i == pl;
             const NSUInteger before = text.length;
             appendLine(text, [NSString stringWithFormat:@"%5d  %s", i, src ? src : ""], isPc,
-                       addr >= 0 && intvdebug_breakpoint_is_set(_dbg, (uint16_t)addr));
+                       addr >= 0 ? intvdebug_breakpoint_state(_dbg, (uint16_t)addr) : 0);
             if (isPc)
                 pcRange = NSMakeRange(before, text.length - before);
         }
@@ -1236,13 +1318,356 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     [self refreshBasic:intvdebug_is_paused(_dbg)];
 }
 
+/* ---- Breakpoints, Watches, memory search ------------------------------------- */
+
+/* One line on why the machine stopped. */
+- (NSString *)stopText:(const intvdebug_stop_info *)st
+{
+    switch (st->reason) {
+    case INTVDEBUG_STOP_WATCH_WRITE:
+        return [NSString stringWithFormat:@"wrote $%04X = $%02X (was $%02X), now at $%04X", st->addr,
+                                          st->value & 0xFF, st->old_value & 0xFF, st->pc];
+    case INTVDEBUG_STOP_WATCH_READ:
+        return [NSString stringWithFormat:@"read $%04X, now at $%04X", st->addr, st->pc];
+    case INTVDEBUG_STOP_BREAKPOINT:
+        return [NSString stringWithFormat:@"breakpoint at $%04X", st->pc];
+    }
+    return @"";
+}
+
+/* Text for a pick list, the picked line drawn with a background. */
+static void setPickText(PickTextView *view, NSArray<NSString *> *lines)
+{
+    NSMutableAttributedString *text = [[NSMutableAttributedString alloc] init];
+    NSFont *font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    int i = 0;
+    for (NSString *l in lines) {
+        NSMutableAttributedString *a = [[NSMutableAttributedString alloc]
+            initWithString:[l stringByAppendingString:@"\n"]
+                attributes:@{ NSFontAttributeName : font, NSForegroundColorAttributeName : NSColor.textColor }];
+        if (i == view.picked) {
+            [a addAttribute:NSBackgroundColorAttributeName value:accentColor() range:NSMakeRange(0, a.length)];
+            [a addAttribute:NSForegroundColorAttributeName value:NSColor.whiteColor range:NSMakeRange(0, a.length)];
+        }
+        [text appendAttributedString:a];
+        i++;
+    }
+    setAttrText(view, text);
+}
+
+static PickTextView *makePickView(NSScrollView **scrollOut)
+{
+    NSScrollView *scroll = [[NSScrollView alloc] init];
+    scroll.hasVerticalScroller = YES;
+    PickTextView *view = [[PickTextView alloc] initWithFrame:NSMakeRect(0, 0, 900, 400)];
+    view.editable = NO;
+    view.richText = YES;
+    view.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    view.autoresizingMask = NSViewWidthSizable;
+    view.picked = -1;
+    scroll.documentView = view;
+    *scrollOut = scroll;
+    return view;
+}
+
+- (NSView *)buildBreaksTab
+{
+    _bpType = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    [_bpType addItemsWithTitles:@[ @"Execute", @"Read", @"Write", @"Access" ]];
+    _bpType.toolTip = @"Execute stops before an instruction; Read, Write and Access stop after the "
+                      @"instruction that touched the words (data accesses only, not code fetches)";
+    _bpAddr = [[NSTextField alloc] init];
+    _bpAddr.placeholderString = @"address, lo-hi, symbol, x, #score, a(3)";
+    _bpAddr.target = self;
+    _bpAddr.action = @selector(addBreak:);
+    _bpCond = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    [_bpCond addItemsWithTitles:@[ @"any value", @"changed", @"equals", @"not equal" ]];
+    _bpCond.toolTip = @"A condition on the value written (Write and Access)";
+    _bpValue = [[NSTextField alloc] init];
+    _bpValue.placeholderString = @"value (hex)";
+    [_bpValue.widthAnchor constraintEqualToConstant:100].active = YES;
+    NSStackView *form = [NSStackView stackViewWithViews:@[
+        _bpType, _bpAddr, _bpCond, _bpValue, [self button:@"Add" action:@selector(addBreak:)]
+    ]];
+    form.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+
+    NSScrollView *scroll;
+    _bpList = makePickView(&scroll);
+    _bpIds = [NSMutableArray array];
+    __weak DebuggerWindow *weakSelf = self;
+    _bpList.onPick = ^(int line) {
+        (void)line;
+        DebuggerWindow *s = weakSelf;
+        if (s) {
+            s->_bpGen = 0;   /* redraw with the pick */
+            [s refreshBreaks];
+        }
+    };
+
+    _bpStop = [self label:@""];
+    _bpStop.textColor = NSColor.secondaryLabelColor;
+    NSStackView *foot = [NSStackView stackViewWithViews:@[
+        [self button:@"Enable / Disable" action:@selector(bpToggle:)],
+        [self button:@"Remove" action:@selector(bpRemove:)],
+        [self button:@"Clear Hits" action:@selector(bpHits:)],
+        [self button:@"Remove All" action:@selector(bpClear:)], _bpStop
+    ]];
+    foot.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+
+    NSStackView *root = [NSStackView stackViewWithViews:@[ form, scroll, foot ]];
+    root.orientation = NSUserInterfaceLayoutOrientationVertical;
+    root.alignment = NSLayoutAttributeLeading;
+    root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
+    [form.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    [scroll.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    [foot.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    return root;
+}
+
+- (NSView *)buildWatchesTab
+{
+    _wtEntry = [[NSTextField alloc] init];
+    _wtEntry.placeholderString = @"address, symbol, x, #score, a(3), lo-hi";
+    _wtEntry.target = self;
+    _wtEntry.action = @selector(addWatch:);
+    NSStackView *form = [NSStackView stackViewWithViews:@[
+        [self label:@"Watch"], _wtEntry, [self button:@"Add" action:@selector(addWatch:)]
+    ]];
+    form.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+
+    NSScrollView *scroll;
+    _wtList = makePickView(&scroll);
+    __weak DebuggerWindow *weakSelf = self;
+    _wtList.onPick = ^(int line) {
+        (void)line;
+        DebuggerWindow *s = weakSelf;
+        if (s)
+            [s refreshWatches];
+    };
+
+    NSStackView *foot = [NSStackView stackViewWithViews:@[
+        [self button:@"Show in Memory" action:@selector(wtMemory:)],
+        [self button:@"Break on Change" action:@selector(wtBreak:)],
+        [self button:@"Remove" action:@selector(wtRemove:)]
+    ]];
+    foot.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+
+    NSStackView *root = [NSStackView stackViewWithViews:@[ form, scroll, foot ]];
+    root.orientation = NSUserInterfaceLayoutOrientationVertical;
+    root.alignment = NSLayoutAttributeLeading;
+    root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
+    [form.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    [scroll.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    return root;
+}
+
+- (void)refreshBreaks
+{
+    intvdebug_bp bps[INTVDEBUG_MAX_BREAKPOINTS];
+    const unsigned gen = intvdebug_bp_generation(_dbg);
+    if (gen != _bpGen) {
+        const int n = intvdebug_bp_list(_dbg, bps, INTVDEBUG_MAX_BREAKPOINTS);
+        NSMutableArray<NSString *> *lines = [NSMutableArray array];
+        _bpGen = gen;
+        [_bpIds removeAllObjects];
+        for (int i = 0; i < n; i++) {
+            char desc[160];
+            intvbp_describe(&bps[i], _symtab, desc, sizeof(desc));
+            [lines addObject:[NSString stringWithFormat:@"[%c] %s    hits %u", bps[i].enabled ? 'x' : ' ',
+                                                        desc, bps[i].hits]];
+            [_bpIds addObject:@(bps[i].id)];
+        }
+        if (_bpList.picked >= n)
+            _bpList.picked = -1;
+        setPickText(_bpList, lines);
+    }
+    {
+        intvdebug_stop_info st;
+        const BOOL paused = intvdebug_is_paused(_dbg);
+        NSString *why = paused && intvdebug_last_stop(_dbg, &st) ? [self stopText:&st] : @"";
+        _bpStop.stringValue = !paused ? @"Running." : why.length ? [@"Stopped: " stringByAppendingString:why] : @"Paused.";
+    }
+}
+
+- (void)refreshWatches
+{
+    const int n = intvwatch_count();
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    for (int i = 0; i < n; i++) {
+        char line[200];
+        intvwatch_format(_dbg, _symtab, i, line, sizeof(line));
+        [lines addObject:@(line)];
+    }
+    if (_wtList.picked >= n)
+        _wtList.picked = -1;
+    setPickText(_wtList, lines);
+}
+
+- (void)addBreak:(id)sender
+{
+    (void)sender;
+    const int type = (int)_bpType.indexOfSelectedItem;
+    const char *text = _bpAddr.stringValue.UTF8String;
+    uint16_t lo = 0, hi = 0;
+    intvdebug_bp bp;
+    memset(&bp, 0, sizeof(bp));
+
+    if (type == 0 ? !intvsym_parse_addr(_symtab, text, &lo)
+                  : !intvsym_parse_range(_symtab, text, &lo, &hi, NULL)) {
+        _status.stringValue = [NSString stringWithFormat:@"No such symbol, variable or address: %@", _bpAddr.stringValue];
+        return;
+    }
+    if (type == 0)
+        hi = lo;
+    bp.type = type == 0 ? INTVDEBUG_BP_EXEC : type == 1 ? INTVDEBUG_BP_READ
+              : type == 2 ? INTVDEBUG_BP_WRITE : (INTVDEBUG_BP_READ | INTVDEBUG_BP_WRITE);
+    bp.lo = lo;
+    bp.hi = hi;
+    bp.cond = (int)_bpCond.indexOfSelectedItem;
+    {
+        const char *v = _bpValue.stringValue.UTF8String;
+        if (*v == '$')
+            v++;
+        bp.value = (uint16_t)strtoul(v, NULL, 16);
+    }
+    bp.mask = lo >= 0x0100 && hi <= 0x01EF ? 0x00FF : 0xFFFF;   /* the scratchpad is 8 bits */
+    if (intvdebug_bp_add(_dbg, &bp) < 0) {
+        _status.stringValue = @"The breakpoint table is full";
+        return;
+    }
+    _bpAddr.stringValue = @"";
+    _seenSerial = 0;
+}
+
+- (void)bpToggle:(id)sender
+{
+    (void)sender;
+    const int sel = _bpList.picked;
+    intvdebug_bp bps[INTVDEBUG_MAX_BREAKPOINTS];
+    const int n = intvdebug_bp_list(_dbg, bps, INTVDEBUG_MAX_BREAKPOINTS);
+    if (sel >= 0 && sel < n) {
+        intvdebug_bp_enable(_dbg, bps[sel].id, !bps[sel].enabled);
+        _seenSerial = 0;
+    }
+}
+
+- (void)bpRemove:(id)sender
+{
+    (void)sender;
+    const int sel = _bpList.picked;
+    if (sel >= 0 && sel < (int)_bpIds.count) {
+        intvdebug_bp_remove(_dbg, _bpIds[(NSUInteger)sel].intValue);
+        _bpList.picked = -1;
+        _seenSerial = 0;
+    }
+}
+
+- (void)bpHits:(id)sender
+{
+    (void)sender;
+    intvdebug_bp_clear_hits(_dbg);
+    _seenSerial = 0;
+}
+
+- (void)bpClear:(id)sender
+{
+    (void)sender;
+    intvdebug_breakpoint_clear_all(_dbg);
+    _bpList.picked = -1;
+    _seenSerial = 0;
+}
+
+- (void)addWatch:(id)sender
+{
+    (void)sender;
+    if (intvwatch_add(_wtEntry.stringValue.UTF8String) < 0) {
+        _status.stringValue = @"Type an address, symbol or BASIC variable (x, #score, a(3))";
+        return;
+    }
+    _wtEntry.stringValue = @"";
+    _seenSerial = 0;
+    [self refreshWatches];
+}
+
+- (void)wtMemory:(id)sender
+{
+    (void)sender;
+    uint16_t lo, hi;
+    if (_wtList.picked >= 0 && intvwatch_range(_symtab, _wtList.picked, &lo, &hi)) {
+        [_tabs selectTabViewItemWithIdentifier:@"memory"];
+        [self showInMemoryLo:lo hi:hi];
+    }
+}
+
+- (void)wtBreak:(id)sender
+{
+    (void)sender;
+    uint16_t lo, hi;
+    if (_wtList.picked < 0 || !intvwatch_range(_symtab, _wtList.picked, &lo, &hi))
+        return;
+    intvdebug_bp bp;
+    memset(&bp, 0, sizeof(bp));
+    bp.type = INTVDEBUG_BP_WRITE;
+    bp.lo = lo;
+    bp.hi = hi;
+    bp.cond = INTVDEBUG_COND_CHANGED;
+    bp.mask = lo >= 0x0100 && hi <= 0x01EF ? 0x00FF : 0xFFFF;
+    if (intvdebug_bp_add(_dbg, &bp) >= 0)
+        _status.stringValue = @"Breaking when it changes";
+    _seenSerial = 0;
+}
+
+- (void)wtRemove:(id)sender
+{
+    (void)sender;
+    if (_wtList.picked >= 0) {
+        intvwatch_remove(_wtList.picked);
+        _wtList.picked = -1;
+        _seenSerial = 0;
+        [self refreshWatches];
+    }
+}
+
+- (void)searchBackward:(BOOL)backward
+{
+    uint16_t pat[64], mask, found;
+    int flags;
+    const int n = intvsearch_parse((int)_srchKind.indexOfSelectedItem, _srchEntry.stringValue.UTF8String,
+                                   pat, &mask, &flags);
+    if (!n) {
+        _srchNote.stringValue = @"Type hex words (02A0 0268) or some text.";
+        return;
+    }
+    if (!intvdebug_is_paused(_dbg)) {
+        _srchNote.stringValue = @"Pause the machine to search its memory.";
+        return;
+    }
+    const uint16_t from = _memHl ? (backward ? _memHlLo : (uint16_t)(_memHlLo + 1)) : _memBase;
+    if (intvsearch_next(_dbg, pat, n, mask, flags, from, backward ? 1 : 0, &found)) {
+        _srchNote.stringValue = [NSString stringWithFormat:@"Found at $%04X", found];
+        [self showInMemoryLo:found hi:(uint16_t)(found + n - 1)];
+    } else {
+        _srchNote.stringValue = @"Not found.";
+    }
+}
+
+- (void)searchNext:(id)sender { (void)sender; [self searchBackward:NO]; }
+- (void)searchPrev:(id)sender { (void)sender; [self searchBackward:YES]; }
+
 - (void)refreshAll:(BOOL)paused
 {
     _runBtn.title = paused ? @"Continue (F5)" : @"Pause (F5)";
     /* the action on offer wears the accent: Continue while stopped */
     _runBtn.bezelColor = paused ? accentColor() : nil;
     _runBtn.contentTintColor = paused ? NSColor.whiteColor : nil;
-    _status.stringValue = paused ? @"Paused" : @"Running";
+    {
+        intvdebug_stop_info st;
+        NSString *why = nil;
+        if (paused && intvdebug_last_stop(_dbg, &st) && st.reason != INTVDEBUG_STOP_BREAKPOINT)
+            why = [self stopText:&st];
+        _status.stringValue = why.length ? [@"Paused: " stringByAppendingString:why]
+                                         : paused ? @"Paused" : @"Running";
+    }
     if (paused) {
         [self refreshRegs];
         [self refreshDisasm];
@@ -1258,6 +1683,8 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
      * refreshSymbols's own comment). */
     [self refreshSymbols];
     [self refreshBasic:paused];
+    [self refreshBreaks];
+    [self refreshWatches];
     if ([self fujiShowing])
         [self refreshFujinet:NO];
 }
@@ -1356,7 +1783,7 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
         NSString *body = [NSString stringWithFormat:@"%04X  %-24s%s", lines[i].addr,
                                                     lines[i].text, symsuffix];
         appendLine(text, body, lines[i].addr == r.pc,
-                   intvdebug_breakpoint_is_set(_dbg, lines[i].addr));
+                   intvdebug_breakpoint_state(_dbg, lines[i].addr));
     }
     setAttrText(_disasm, text);
 }
@@ -1379,6 +1806,7 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     int n = intvdebug_read(_dbg, _memBase, words,
                            MEM_WORDS_PER_ROW * MEM_ROWS);
     NSMutableString *text = [NSMutableString string];
+    NSMutableArray<NSValue *> *marks = [NSMutableArray array];
     const char *lastRegion = NULL;
     for (int row = 0; row * MEM_WORDS_PER_ROW < n; row++) {
         uint16_t rowAddr = (uint16_t)(_memBase + row * MEM_WORDS_PER_ROW);
@@ -1387,8 +1815,13 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
         [text appendFormat:@"%04X ", (unsigned)rowAddr];
         for (int col = 0; col < MEM_WORDS_PER_ROW; col++) {
             int idx = row * MEM_WORDS_PER_ROW + col;
-            if (idx < n)
-                [text appendFormat:@" %04X", words[idx]];
+            const uint16_t a = (uint16_t)(rowAddr + col);
+            if (idx >= n)
+                continue;
+            [text appendString:@" "];
+            if (_memHl && a >= _memHlLo && a <= _memHlHi)   /* a variable, symbol or hit */
+                [marks addObject:[NSValue valueWithRange:NSMakeRange(text.length, 4)]];
+            [text appendFormat:@"%04X", words[idx]];
         }
         /* Only label the first row of a run in the same region -- see
          * symbols.c's k_regions and the GNOME/Windows/KDE frontends' own
@@ -1398,7 +1831,15 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
         lastRegion = region;
         [text appendString:@"\n"];
     }
-    _memView.string = text;
+    NSMutableAttributedString *styled = [[NSMutableAttributedString alloc]
+        initWithString:text
+            attributes:@{ NSFontAttributeName : [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular],
+                          NSForegroundColorAttributeName : NSColor.textColor }];
+    for (NSValue *v in marks) {
+        [styled addAttribute:NSBackgroundColorAttributeName value:accentColor() range:v.rangeValue];
+        [styled addAttribute:NSForegroundColorAttributeName value:NSColor.whiteColor range:v.rangeValue];
+    }
+    setAttrText(_memView, styled);
 }
 
 - (void)refreshStic

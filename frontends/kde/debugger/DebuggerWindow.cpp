@@ -36,6 +36,7 @@
 #include "../help/HelpWindow.h"
 
 #include <QComboBox>
+#include <QCheckBox>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QGridLayout>
@@ -67,6 +68,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "memtools.h"
 #include "srcmap.h"
 #include "symbols.h"
 
@@ -79,8 +81,8 @@ constexpr int kFujiTicks = 15;      /* the FujiNet tab, 500 ms at 33 ms */
 
 /* The tabs, in order; INTV_DEBUGGER_TAB picks one by number or by the start
  * of its name (any case), for tests and captures. */
-const char *const kTabNames[] = {"CPU", "BASIC", "Memory", "STIC", "Symbols", "FujiNet"};
-enum { kTabCpu, kTabBasic, kTabMemory, kTabStic, kTabSymbols, kTabFujinet };
+const char *const kTabNames[] = {"CPU", "BASIC", "Memory", "Breakpoints", "Watches", "STIC", "Symbols", "FujiNet"};
+enum { kTabCpu, kTabBasic, kTabMemory, kTabBreaks, kTabWatches, kTabStic, kTabSymbols, kTabFujinet };
 enum { kPickFile, kPickFolder, kPickMap };
 constexpr int kTabCount = int(sizeof(kTabNames) / sizeof(kTabNames[0]));
 
@@ -182,16 +184,23 @@ void pcBar(QList<QTextEdit::ExtraSelection> &out, QPlainTextEdit *v, int &prev, 
 }
 
 /* A breakpoint's gutter dot, red (drawn over the bar when both apply). */
-QTextEdit::ExtraSelection bpDot(QPlainTextEdit *v, int block)
+QTextEdit::ExtraSelection bpDot(QPlainTextEdit *v, int block, bool enabled = true)
 {
     QTextEdit::ExtraSelection sel;
     sel.cursor = QTextCursor(v->document()->findBlockByNumber(block));
     sel.cursor.movePosition(QTextCursor::NextCharacter, QTextCursor::KeepAnchor);
-    sel.format.setForeground(QColor(0xE0, 0x1B, 0x24));
+    sel.format.setForeground(enabled ? QColor(0xE0, 0x1B, 0x24) : QColor(0x8A, 0x8A, 0x8A));
     return sel;
 }
 
 const QString kBpDot = QStringLiteral("\u25CF");
+const QString kBpDotOff = QStringLiteral("\u25CB");   /* disabled: a hollow grey dot */
+
+/* The gutter's mark for an EXEC breakpoint's state (0 none, 1 on, 2 off). */
+QString dotFor(int state)
+{
+    return state == 1 ? kBpDot : state == 2 ? kBpDotOff : QStringLiteral(" ");
+}
 
 QPointer<DebuggerWindow> g_singleton;
 
@@ -237,6 +246,28 @@ DebuggerWindow::DebuggerWindow(QWidget *parent, intvsession *session)
                 !intvdebug_breakpoint_is_set(m_dbg, uint16_t(addr)))
                 intvdebug_breakpoint_toggle(m_dbg, uint16_t(addr));
         }
+    }
+
+    /* More captures: INTV_WATCH="x" adds a watch, INTV_WATCH_BREAK="x" a
+     * write-when-changed breakpoint on it, INTV_MEM_GOTO="x" shows it in Memory. */
+    {
+        const char *wt = std::getenv("INTV_WATCH"), *wb = std::getenv("INTV_WATCH_BREAK"),
+                   *mg = std::getenv("INTV_MEM_GOTO");
+        uint16_t lo, hi;
+        if (wt && *wt)
+            intvwatch_add(wt);
+        if (wb && *wb && intvsym_parse_range(m_symtab, wb, &lo, &hi, nullptr)) {
+            intvdebug_bp bp;
+            std::memset(&bp, 0, sizeof(bp));
+            bp.type = INTVDEBUG_BP_WRITE;
+            bp.lo = lo;
+            bp.hi = hi;
+            bp.cond = INTVDEBUG_COND_CHANGED;
+            bp.mask = 0xFF;
+            intvdebug_bp_add(m_dbg, &bp);
+        }
+        if (mg && *mg && intvsym_parse_range(m_symtab, mg, &lo, &hi, nullptr))
+            showInMemory(lo, hi);
     }
 
     /* Engaging switches the CPU hook to the path that honours breakpoints
@@ -396,12 +427,15 @@ void DebuggerWindow::buildUi()
     connect(m_memAddr, &QLineEdit::returnPressed, this,
             &DebuggerWindow::goToAddr);
     memLayout->addWidget(m_memAddr);
+    memLayout->addWidget(buildSearchBar());
     m_memView = monoView();
     memLayout->addWidget(m_memView, 1);
 
     tabs->addTab(cpu, QLatin1String(kTabNames[kTabCpu]));
     tabs->addTab(buildBasic(), QLatin1String(kTabNames[kTabBasic]));
     tabs->addTab(memTab, QLatin1String(kTabNames[kTabMemory]));
+    tabs->addTab(buildBreaks(), QLatin1String(kTabNames[kTabBreaks]));
+    tabs->addTab(buildWatches(), QLatin1String(kTabNames[kTabWatches]));
 
     /* ---- STIC tab ---- */
     auto *stic = new QWidget;
@@ -504,7 +538,7 @@ void DebuggerWindow::buildUi()
     tabs->addTab(m_fujiPage, QLatin1String(kTabNames[kTabFujinet]));
     /* Help's contexts (intvhelp.h), one per tab */
     {
-        static const char *const kHelpTabs[] = { "cpu", "basic", "memory", "stic", "symbols", "fujinet" };
+        static const char *const kHelpTabs[] = { "cpu", "basic", "memory", "breakpoints", "watches", "stic", "symbols", "fujinet" };
         auto setHelpContext = [this](int page) {
             if (page >= 0 && page < kTabCount)
                 setProperty("intvHelpContext", QStringLiteral("debugger/%1").arg(QLatin1String(kHelpTabs[page])));
@@ -541,6 +575,304 @@ void DebuggerWindow::doStepOver()
 void DebuggerWindow::doStepOut()
 {
     if (basicTab()) intvdebug_step_line_out(m_dbg); else intvdebug_step_out(m_dbg);
+}
+
+/* ---- Breakpoints, Watches, memory search ------------------------------------ */
+
+namespace {
+/* One line on why the machine stopped. */
+QString hex(unsigned v, int digits)
+{
+    return QStringLiteral("%1").arg(v, digits, 16, QLatin1Char('0')).toUpper();
+}
+
+QString stopText(const intvdebug_stop_info &st)
+{
+    switch (st.reason) {
+    case INTVDEBUG_STOP_WATCH_WRITE:
+        return QStringLiteral("wrote $%1 = $%2 (was $%3), now at $%4")
+            .arg(hex(st.addr, 4), hex(st.value & 0xFF, 2), hex(st.old_value & 0xFF, 2), hex(st.pc, 4));
+    case INTVDEBUG_STOP_WATCH_READ:
+        return QStringLiteral("read $%1, now at $%2").arg(hex(st.addr, 4), hex(st.pc, 4));
+    case INTVDEBUG_STOP_BREAKPOINT:
+        return QStringLiteral("breakpoint at $%1").arg(hex(st.pc, 4));
+    }
+    return QString();
+}
+} // namespace
+
+QWidget *DebuggerWindow::buildBreaks()
+{
+    auto *page = new QWidget;
+    auto *layout = new QVBoxLayout(page);
+    auto *form = new QHBoxLayout;
+
+    m_bpType = new QComboBox;
+    m_bpType->addItems({QStringLiteral("Execute"), QStringLiteral("Read"), QStringLiteral("Write"),
+                        QStringLiteral("Access")});
+    m_bpType->setToolTip(QStringLiteral(
+        "Execute stops before an instruction; Read, Write and Access stop after the instruction "
+        "that touched the words (data accesses only, not code fetches)"));
+    m_bpAddr = new QLineEdit;
+    m_bpAddr->setPlaceholderText(QStringLiteral("address, lo-hi, symbol, x, #score, a(3)"));
+    connect(m_bpAddr, &QLineEdit::returnPressed, this, &DebuggerWindow::addBreak);
+    m_bpCond = new QComboBox;
+    m_bpCond->addItems({QStringLiteral("any value"), QStringLiteral("changed"), QStringLiteral("equals"),
+                        QStringLiteral("not equal")});
+    m_bpCond->setToolTip(QStringLiteral("A condition on the value written (Write and Access)"));
+    m_bpValue = new QLineEdit;
+    m_bpValue->setPlaceholderText(QStringLiteral("value (hex)"));
+    m_bpValue->setMaximumWidth(110);
+    auto *add = new QPushButton(QStringLiteral("Add"));
+    connect(add, &QPushButton::clicked, this, &DebuggerWindow::addBreak);
+    form->addWidget(m_bpType);
+    form->addWidget(m_bpAddr, 1);
+    form->addWidget(m_bpCond);
+    form->addWidget(m_bpValue);
+    form->addWidget(add);
+    layout->addLayout(form);
+
+    m_bpList = new QListWidget;
+    QFont f = m_bpList->font();
+    f.setFamily(QStringLiteral("monospace"));
+    f.setStyleHint(QFont::TypeWriter);
+    m_bpList->setFont(f);
+    connect(m_bpList, &QListWidget::itemChanged, this, [this](QListWidgetItem *item) {
+        if (m_bpBuilding)
+            return;
+        intvdebug_bp_enable(m_dbg, item->data(Qt::UserRole).toInt(), item->checkState() == Qt::Checked);
+        m_seenSerial = 0;
+    });
+    layout->addWidget(m_bpList, 1);
+
+    auto *foot = new QHBoxLayout;
+    m_bpStop = new QLabel;
+    m_bpStop->setEnabled(false);
+    foot->addWidget(m_bpStop, 1);
+    auto *remove = new QPushButton(QStringLiteral("Remove"));
+    remove->setToolTip(QStringLiteral("Remove the selected breakpoint"));
+    connect(remove, &QPushButton::clicked, this, [this] {
+        if (QListWidgetItem *it = m_bpList->currentItem()) {
+            intvdebug_bp_remove(m_dbg, it->data(Qt::UserRole).toInt());
+            m_seenSerial = 0;
+        }
+    });
+    auto *clearHits = new QPushButton(QStringLiteral("Clear Hits"));
+    connect(clearHits, &QPushButton::clicked, this, [this] {
+        intvdebug_bp_clear_hits(m_dbg);
+        m_seenSerial = 0;
+    });
+    auto *removeAll = new QPushButton(QStringLiteral("Remove All"));
+    connect(removeAll, &QPushButton::clicked, this, [this] {
+        intvdebug_breakpoint_clear_all(m_dbg);
+        m_seenSerial = 0;
+    });
+    foot->addWidget(remove);
+    foot->addWidget(clearHits);
+    foot->addWidget(removeAll);
+    layout->addLayout(foot);
+    return page;
+}
+
+void DebuggerWindow::addBreak()
+{
+    const int type = m_bpType->currentIndex();
+    const QByteArray text = m_bpAddr->text().toUtf8();
+    uint16_t lo = 0, hi = 0;
+    intvdebug_bp bp;
+    std::memset(&bp, 0, sizeof(bp));
+
+    if (type == 0 ? !intvsym_parse_addr(m_symtab, text.constData(), &lo)
+                  : !intvsym_parse_range(m_symtab, text.constData(), &lo, &hi, nullptr)) {
+        m_status->setText(QStringLiteral("No such symbol, variable or address: %1").arg(m_bpAddr->text()));
+        return;
+    }
+    if (type == 0)
+        hi = lo;
+    bp.type = type == 0 ? INTVDEBUG_BP_EXEC : type == 1 ? INTVDEBUG_BP_READ
+              : type == 2 ? INTVDEBUG_BP_WRITE : (INTVDEBUG_BP_READ | INTVDEBUG_BP_WRITE);
+    bp.lo = lo;
+    bp.hi = hi;
+    bp.cond = m_bpCond->currentIndex();   /* any, changed, =, != in the combo's order */
+    QString v = m_bpValue->text().trimmed();
+    if (v.startsWith(QLatin1Char('$')))
+        v.remove(0, 1);
+    bp.value = uint16_t(v.toUInt(nullptr, 16));
+    bp.mask = lo >= 0x0100 && hi <= 0x01EF ? 0x00FF : 0xFFFF;   /* the scratchpad is 8 bits */
+    if (intvdebug_bp_add(m_dbg, &bp) < 0) {
+        m_status->setText(QStringLiteral("The breakpoint table is full"));
+        return;
+    }
+    m_bpAddr->clear();
+    m_seenSerial = 0;
+}
+
+void DebuggerWindow::refreshBreaks()
+{
+    const unsigned gen = intvdebug_bp_generation(m_dbg);
+    if (gen != m_bpGen) {
+        m_bpGen = gen;
+        intvdebug_bp bps[INTVDEBUG_MAX_BREAKPOINTS];
+        const int n = intvdebug_bp_list(m_dbg, bps, INTVDEBUG_MAX_BREAKPOINTS);
+        const int keep = m_bpList->currentRow();
+        m_bpBuilding = true;
+        m_bpList->clear();
+        for (int i = 0; i < n; i++) {
+            char desc[160];
+            intvbp_describe(&bps[i], m_symtab, desc, sizeof(desc));
+            auto *item = new QListWidgetItem(QStringLiteral("%1    hits %2")
+                                                 .arg(QString::fromUtf8(desc)).arg(bps[i].hits));
+            item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+            item->setCheckState(bps[i].enabled ? Qt::Checked : Qt::Unchecked);
+            item->setData(Qt::UserRole, bps[i].id);
+            m_bpList->addItem(item);
+        }
+        if (keep >= 0 && keep < n)
+            m_bpList->setCurrentRow(keep);
+        m_bpBuilding = false;
+    }
+    intvdebug_stop_info st;
+    const bool paused = intvdebug_is_paused(m_dbg);
+    if (paused && intvdebug_last_stop(m_dbg, &st)) {
+        const QString why = stopText(st);
+        m_bpStop->setText(QStringLiteral("Stopped: %1").arg(why.isEmpty() ? QStringLiteral("paused") : why));
+    } else {
+        m_bpStop->setText(paused ? QStringLiteral("Paused.") : QStringLiteral("Running."));
+    }
+}
+
+QWidget *DebuggerWindow::buildWatches()
+{
+    auto *page = new QWidget;
+    auto *layout = new QVBoxLayout(page);
+    auto *form = new QHBoxLayout;
+    form->addWidget(new QLabel(QStringLiteral("Watch:")));
+    m_wtEntry = new QLineEdit;
+    m_wtEntry->setPlaceholderText(QStringLiteral("address, symbol, x, #score, a(3), lo-hi"));
+    connect(m_wtEntry, &QLineEdit::returnPressed, this, &DebuggerWindow::addWatch);
+    form->addWidget(m_wtEntry, 1);
+    auto *add = new QPushButton(QStringLiteral("Add"));
+    connect(add, &QPushButton::clicked, this, &DebuggerWindow::addWatch);
+    form->addWidget(add);
+    layout->addLayout(form);
+
+    m_wtList = new QListWidget;
+    QFont f = m_wtList->font();
+    f.setFamily(QStringLiteral("monospace"));
+    f.setStyleHint(QFont::TypeWriter);
+    m_wtList->setFont(f);
+    layout->addWidget(m_wtList, 1);
+
+    auto *foot = new QHBoxLayout;
+    foot->addStretch();
+    auto *mem = new QPushButton(QStringLiteral("Show in Memory"));
+    connect(mem, &QPushButton::clicked, this, [this] {
+        uint16_t lo, hi;
+        if (m_wtList->currentRow() >= 0 && intvwatch_range(m_symtab, m_wtList->currentRow(), &lo, &hi)) {
+            m_tabs->setCurrentIndex(kTabMemory);
+            showInMemory(lo, hi);
+        }
+    });
+    auto *brk = new QPushButton(QStringLiteral("Break on Change"));
+    connect(brk, &QPushButton::clicked, this, [this] {
+        uint16_t lo, hi;
+        if (m_wtList->currentRow() < 0 || !intvwatch_range(m_symtab, m_wtList->currentRow(), &lo, &hi))
+            return;
+        intvdebug_bp bp;
+        std::memset(&bp, 0, sizeof(bp));
+        bp.type = INTVDEBUG_BP_WRITE;
+        bp.lo = lo;
+        bp.hi = hi;
+        bp.cond = INTVDEBUG_COND_CHANGED;
+        bp.mask = lo >= 0x0100 && hi <= 0x01EF ? 0x00FF : 0xFFFF;
+        if (intvdebug_bp_add(m_dbg, &bp) >= 0)
+            m_status->setText(QStringLiteral("Breaking when it changes"));
+        m_seenSerial = 0;
+    });
+    auto *remove = new QPushButton(QStringLiteral("Remove"));
+    connect(remove, &QPushButton::clicked, this, [this] {
+        if (m_wtList->currentRow() >= 0) {
+            intvwatch_remove(m_wtList->currentRow());
+            m_seenSerial = 0;
+        }
+    });
+    foot->addWidget(mem);
+    foot->addWidget(brk);
+    foot->addWidget(remove);
+    layout->addLayout(foot);
+    return page;
+}
+
+void DebuggerWindow::addWatch()
+{
+    if (intvwatch_add(m_wtEntry->text().toUtf8().constData()) < 0) {
+        m_status->setText(QStringLiteral("Type an address, symbol or BASIC variable (x, #score, a(3))"));
+        return;
+    }
+    m_wtEntry->clear();
+    m_seenSerial = 0;
+}
+
+void DebuggerWindow::refreshWatches()
+{
+    const int n = intvwatch_count();
+    const int keep = m_wtList->currentRow();
+    m_wtList->clear();
+    for (int i = 0; i < n; i++) {
+        char line[200];
+        intvwatch_format(m_dbg, m_symtab, i, line, sizeof(line));
+        m_wtList->addItem(QString::fromUtf8(line));
+    }
+    if (keep >= 0 && keep < n)
+        m_wtList->setCurrentRow(keep);
+}
+
+QWidget *DebuggerWindow::buildSearchBar()
+{
+    auto *bar = new QWidget;
+    auto *row = new QHBoxLayout(bar);
+    row->setContentsMargins(0, 0, 0, 0);
+    row->addWidget(new QLabel(QStringLiteral("Search:")));
+    m_srchKind = new QComboBox;
+    m_srchKind->addItems({QStringLiteral("Hex words"), QStringLiteral("Text")});
+    m_srchKind->setToolTip(QStringLiteral("Hex words (02A0 0268) or text, one character per word"));
+    row->addWidget(m_srchKind);
+    m_srchEntry = new QLineEdit;
+    connect(m_srchEntry, &QLineEdit::returnPressed, this, [this] { search(false); });
+    row->addWidget(m_srchEntry, 1);
+    auto *next = new QPushButton(QStringLiteral("Find Next"));
+    connect(next, &QPushButton::clicked, this, [this] { search(false); });
+    auto *prev = new QPushButton(QStringLiteral("Find Previous"));
+    connect(prev, &QPushButton::clicked, this, [this] { search(true); });
+    row->addWidget(next);
+    row->addWidget(prev);
+    m_srchNote = new QLabel;
+    m_srchNote->setEnabled(false);
+    row->addWidget(m_srchNote);
+    return bar;
+}
+
+void DebuggerWindow::search(bool backward)
+{
+    uint16_t pat[64], mask, found;
+    int flags;
+    const int n = intvsearch_parse(m_srchKind->currentIndex(), m_srchEntry->text().toUtf8().constData(),
+                                   pat, &mask, &flags);
+    if (!n) {
+        m_srchNote->setText(QStringLiteral("Type hex words (02A0 0268) or some text."));
+        return;
+    }
+    if (!intvdebug_is_paused(m_dbg)) {
+        m_srchNote->setText(QStringLiteral("Pause the machine to search its memory."));
+        return;
+    }
+    const uint16_t from = m_memHl ? (backward ? m_memHlLo : uint16_t(m_memHlLo + 1)) : m_memBase;
+    if (intvsearch_next(m_dbg, pat, n, mask, flags, from, backward ? 1 : 0, &found)) {
+        m_srchNote->setText(QStringLiteral("Found at $%1").arg(hex(found, 4)));
+        showInMemory(found, uint16_t(found + n - 1));
+    } else {
+        m_srchNote->setText(QStringLiteral("Not found."));
+    }
 }
 
 QWidget *DebuggerWindow::buildBasic()
@@ -681,11 +1013,11 @@ void DebuggerWindow::refreshBasic(bool paused)
         for (int i = 1; i <= n; i++) {
             const int addr = intvsrcmap_first_addr(m_srcmap, m_basFile, i);
             const char *src = intvsrcmap_line_text(m_srcmap, m_basFile, i);
-            const bool bp = addr >= 0 && intvdebug_breakpoint_is_set(m_dbg, uint16_t(addr));
+            const int bp = addr >= 0 ? intvdebug_breakpoint_state(m_dbg, uint16_t(addr)) : 0;
             if (bp)
-                bpLines.append(i - 1);
+                bpLines.append(bp == 1 ? i - 1 : -(i - 1) - 1);   /* off: stored as -(line)-1 */
             text += QStringLiteral("%1 %2  %3\n")
-                        .arg(bp ? kBpDot : QStringLiteral(" "))
+                        .arg(dotFor(bp))
                         .arg(i, 5)
                         .arg(QString::fromUtf8(src ? src : ""));
         }
@@ -695,7 +1027,7 @@ void DebuggerWindow::refreshBasic(bool paused)
     {
         QList<QTextEdit::ExtraSelection> sels;
         for (int b : bpLines)
-            sels.append(bpDot(m_basView, b));
+            sels.append(b >= 0 ? bpDot(m_basView, b) : bpDot(m_basView, -b - 1, false));
         pcBar(sels, m_basView, m_basBar, pf == m_basFile && pl >= 1 && pl <= n ? pl - 1 : -1);
         m_basView->setExtraSelections(sels);
     }
@@ -862,17 +1194,25 @@ void DebuggerWindow::refreshFujinet(bool force)
     setText(m_fujiText, t, force || atEnd(m_fujiText));
 }
 
+/* Shows a range in the Memory tab, highlighted, on a row boundary. */
+void DebuggerWindow::showInMemory(uint16_t lo, uint16_t hi)
+{
+    m_memBase = uint16_t(lo & 0xFFF8);
+    m_memHl = true;
+    m_memHlLo = lo;
+    m_memHlHi = hi;
+    m_seenSerial = 0;
+    if (intvdebug_is_paused(m_dbg))
+        refreshMem();
+}
+
 void DebuggerWindow::goToAddr()
 {
-    uint16_t addr;
-    if (intvsym_parse_addr(m_symtab, m_memAddr->text().toUtf8().constData(),
-                           &addr)) {
-        m_memBase = addr;
-        m_seenSerial = 0;
-    } else {
-        m_status->setText(
-            QStringLiteral("No such symbol or address: %1").arg(m_memAddr->text()));
-    }
+    uint16_t lo, hi;
+    if (intvsym_parse_range(m_symtab, m_memAddr->text().toUtf8().constData(), &lo, &hi, nullptr))
+        showInMemory(lo, hi);
+    else
+        m_status->setText(QStringLiteral("No such symbol, variable or address: %1").arg(m_memAddr->text()));
 }
 
 void DebuggerWindow::breakAtAddr()
@@ -1002,16 +1342,17 @@ void DebuggerWindow::refreshDisasm()
         intvsym_annotate_line(m_symtab, &lines[i], symsuffix,
                               sizeof(symsuffix));
         text += QStringLiteral("%1 %2  %3%4\n")
-                    .arg(intvdebug_breakpoint_is_set(m_dbg, lines[i].addr)
-                             ? kBpDot : QStringLiteral(" "))
+                    .arg(dotFor(intvdebug_breakpoint_state(m_dbg, lines[i].addr)))
                     .arg(lines[i].addr, 4, 16, QLatin1Char('0'))
                     .arg(QString::fromUtf8(lines[i].text), -24)
                     .arg(QString::fromUtf8(symsuffix));
     }
     m_disasm->setPlainText(text.toUpper());
-    for (int i = 0; i < n; i++)
-        if (intvdebug_breakpoint_is_set(m_dbg, lines[i].addr))
-            sels.append(bpDot(m_disasm, i));
+    for (int i = 0; i < n; i++) {
+        const int st = intvdebug_breakpoint_state(m_dbg, lines[i].addr);
+        if (st)
+            sels.append(bpDot(m_disasm, i, st == 1));
+    }
     {
         int bar = -1;
         for (int i = 0; i < n; i++)
@@ -1049,6 +1390,7 @@ void DebuggerWindow::refreshMem()
     const int n = intvdebug_read(m_dbg, m_memBase, words,
                                  kMemWordsPerRow * kMemRows);
     QString text;
+    QList<QTextEdit::ExtraSelection> sels;
     const char *lastRegion = nullptr;
     for (int row = 0; row * kMemWordsPerRow < n; row++) {
         const uint16_t rowAddr = uint16_t(m_memBase + row * kMemWordsPerRow);
@@ -1069,6 +1411,24 @@ void DebuggerWindow::refreshMem()
         text += QLatin1Char('\n');
     }
     m_memView->setPlainText(text);
+    if (m_memHl) {   /* the words of a variable, symbol or hit: the accent */
+        for (int row = 0; row * kMemWordsPerRow < n; row++) {
+            const QTextBlock b = m_memView->document()->findBlockByNumber(row);
+            for (int col = 0; col < kMemWordsPerRow && row * kMemWordsPerRow + col < n; col++) {
+                const uint16_t a = uint16_t(m_memBase + row * kMemWordsPerRow + col);
+                if (a < m_memHlLo || a > m_memHlHi)
+                    continue;
+                QTextEdit::ExtraSelection sel;
+                sel.cursor = QTextCursor(m_memView->document());
+                sel.cursor.setPosition(b.position() + 6 + col * 5);
+                sel.cursor.setPosition(b.position() + 6 + col * 5 + 4, QTextCursor::KeepAnchor);
+                sel.format.setBackground(QColor(0x1E, 0x49, 0x12));
+                sel.format.setForeground(Qt::white);
+                sels.append(sel);
+            }
+        }
+    }
+    m_memView->setExtraSelections(sels);
 }
 
 void DebuggerWindow::refreshStic()
@@ -1155,8 +1515,14 @@ void DebuggerWindow::refreshAll()
     m_pauseBtn->setProperty("accent", bool(paused));
     m_pauseBtn->style()->unpolish(m_pauseBtn);
     m_pauseBtn->style()->polish(m_pauseBtn);
-    m_status->setText(paused ? QStringLiteral("Paused")
-                             : QStringLiteral("Running"));
+    {
+        intvdebug_stop_info st;
+        QString why;
+        if (paused && intvdebug_last_stop(m_dbg, &st) && st.reason != INTVDEBUG_STOP_BREAKPOINT)
+            why = stopText(st);
+        m_status->setText(!why.isEmpty() ? QStringLiteral("Paused: %1").arg(why)
+                                         : paused ? QStringLiteral("Paused") : QStringLiteral("Running"));
+    }
 
     if (paused) {
         refreshRegs();
@@ -1174,6 +1540,8 @@ void DebuggerWindow::refreshAll()
      * refreshSymbols's own comment). */
     refreshSymbols();
     refreshBasic(paused);
+    refreshBreaks();
+    refreshWatches();
     if (fujiShowing())
         refreshFujinet(false);
     m_wasPaused = paused;

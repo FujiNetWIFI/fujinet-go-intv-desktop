@@ -55,7 +55,7 @@ cmake -B build -DFRONTEND=none -DWITH_INTV_ROMS=OFF
 cmake -B build -DFRONTEND=gnome   # or kde, macos, windows
 ```
 
-`ctest` runs 29 suites covering the headless jzIntv core, ROM embedding, the
+`ctest` runs 31 suites covering the headless jzIntv core, ROM embedding, the
 frame/audio publish contract, pad and keyboard input mapping (including the
 ECS keyboard/second controller pair and the ECS/Intellivoice/PAL machine
 options), the Windows/evdev/macOS key-code tables, the keypad disc's 16-way
@@ -86,7 +86,7 @@ to have it open those windows on startup. The Windows one exists because
 that frontend is only ever exercised by cross-building and running under
 Wine, where there is no way to drive a menu.
 `INTV_DEBUGGER_TAB` picks the debugger's tab when it opens: a number from 0,
-or the start of a tab's name (`cpu`, `basic`, `memory`, `stic`, `symbols`, `fujinet`).
+or the start of a tab's name (`cpu`, `basic`, `memory`, `breakpoints`, `watches`, `stic`, `symbols`, `fujinet`).
 `INTV_BASIC_IMPORT=<file.bas or folder>` imports IntyBASIC source into the
 debugger's BASIC tab as it opens, and `INTV_BASIC_BREAK=<name.bas>:<line>` sets
 a breakpoint on one of its lines (GNOME, KDE and Windows; macOS is unbuilt like

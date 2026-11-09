@@ -43,7 +43,7 @@ extern "C" {
 typedef struct intvdebug intvdebug;
 
 /* Enough for a UI that toggles them by clicking a disassembly line. */
-#define INTVDEBUG_MAX_BREAKPOINTS 64
+#define INTVDEBUG_MAX_BREAKPOINTS 128
 
 /* The CP-1610's programmer-visible state. r[7] is also the PC (the CPU has
  * no separate PC register -- R7 fills that role), duplicated into pc for
@@ -128,6 +128,17 @@ int intvdebug_read(intvdebug *d, uint16_t addr, uint16_t *dst, int n);
  * Returns n. */
 int intvdebug_write(intvdebug *d, uint16_t addr, const uint16_t *src, int n);
 
+/* ---- search: valid only while paused ---------------------------------------
+ * Finds the runs of words from..to (inclusive) where every word w matches the
+ * pattern word p under `mask`: (w & mask) == (p & mask). A hex search uses
+ * mask 0xFFFF; text is searched as one character per word with mask 0x00FF
+ * (the scratchpad and GROM are 8 bits wide), and INTVDEBUG_SEARCH_NOCASE folds
+ * ASCII letters. Writes the start address of each match into out (up to max)
+ * and returns how many were found, or -1 while the machine is running. */
+#define INTVDEBUG_SEARCH_NOCASE 1
+int intvdebug_search(intvdebug *d, const uint16_t *pattern, int n, uint16_t mask, int flags,
+                     uint16_t from, uint16_t to, uint16_t *out, int max);
+
 typedef struct {
     uint16_t addr;
     int      length;         /* instruction length in words (1-3) */
@@ -145,14 +156,85 @@ typedef struct {
 int intvdebug_disassemble(intvdebug *d, uint16_t addr, int dbd,
                           intvdebug_dasm_line *out, int max);
 
-/* ---- breakpoints -------------------------------------------------------- */
+/* ---- breakpoints and watchpoints ----------------------------------------
+ * One table. An EXEC entry stops before the instruction at lo runs (it is
+ * jzIntv's own breakpoint). A READ or WRITE entry watches the words lo..hi
+ * and stops AFTER the instruction that touched them (PC is then on the next
+ * instruction); intvdebug_last_stop says what was touched. Only the CPU's own
+ * data accesses are seen: an instruction fetch never goes through the bus, so
+ * a READ entry cannot catch code being fetched (use EXEC for that), and the
+ * STIC's and DMA's reads are not counted. Ids are never reused.
+ *
+ * A WRITE entry may carry a condition on the value written; the scratchpad
+ * ($0100-$01EF) is 8 bits wide, so compare with a mask. Safe to call while
+ * running: the bus change is applied by the emulator thread at its next
+ * hook (or at once when paused). */
+#define INTVDEBUG_BP_EXEC  1
+#define INTVDEBUG_BP_READ  2
+#define INTVDEBUG_BP_WRITE 4
+
+enum {
+    INTVDEBUG_COND_ANY = 0,
+    INTVDEBUG_COND_CHANGED,  /* the value written differs from the old one */
+    INTVDEBUG_COND_EQ,       /* (value & mask) == (cond value & mask) */
+    INTVDEBUG_COND_NE
+};
+
+typedef struct {
+    int      id;          /* assigned by intvdebug_bp_add */
+    int      type;        /* INTVDEBUG_BP_* bits; EXEC alone for code */
+    uint16_t lo, hi;      /* hi == lo for EXEC */
+    int      enabled;
+    unsigned hits;
+    int      cond;        /* INTVDEBUG_COND_*, WRITE only */
+    uint16_t value, mask; /* for COND_EQ / COND_NE */
+} intvdebug_bp;
+
+/* Adds an entry (type, lo, hi, cond, value, mask are read; mask 0 = 0xFFFF).
+ * Returns its id, or -1 when the table is full or the spec is empty. */
+int  intvdebug_bp_add(intvdebug *d, const intvdebug_bp *spec);
+int  intvdebug_bp_remove(intvdebug *d, int id);
+int  intvdebug_bp_enable(intvdebug *d, int id, int enabled);
+int  intvdebug_bp_clear_hits(intvdebug *d);
+/* Copies the table (oldest first); returns how many. */
+int  intvdebug_bp_list(intvdebug *d, intvdebug_bp *out, int max);
+/* Bumped by every change to the table or a hit count, for a UI to poll. */
+unsigned intvdebug_bp_generation(const intvdebug *d);
+
+/* The execute-breakpoint shortcuts the CPU and BASIC views use. */
 /* Returns 1 when the breakpoint is now set, 0 when it was cleared, -1 when
  * the table is full. Safe while running. */
 int  intvdebug_breakpoint_toggle(intvdebug *d, uint16_t addr);
+/* 1 when an enabled EXEC breakpoint is at addr. */
 int  intvdebug_breakpoint_is_set(intvdebug *d, uint16_t addr);
+/* 0 none, 1 enabled, 2 disabled: a disabled one is drawn as a hollow dot. */
+int  intvdebug_breakpoint_state(intvdebug *d, uint16_t addr);
+/* Removes every entry, watchpoints included. */
 void intvdebug_breakpoint_clear_all(intvdebug *d);
-/* Copies the set addresses into out (ascending); returns how many. */
+/* Copies the set EXEC addresses into out (ascending); returns how many. */
 int  intvdebug_breakpoint_list(intvdebug *d, uint16_t *out, int max);
+
+/* Why the machine last stopped. */
+enum {
+    INTVDEBUG_STOP_NONE = 0,
+    INTVDEBUG_STOP_PAUSE,
+    INTVDEBUG_STOP_STEP,
+    INTVDEBUG_STOP_BREAKPOINT,  /* an EXEC entry, or a one-shot (step over/out) */
+    INTVDEBUG_STOP_WATCH_READ,
+    INTVDEBUG_STOP_WATCH_WRITE
+};
+
+typedef struct {
+    int      reason;
+    int      bp_id;      /* the entry that fired, 0 if none */
+    uint16_t addr;       /* the word touched (watch), or the PC (breakpoint) */
+    uint16_t value;      /* the value written (WRITE) */
+    uint16_t old_value;  /* the value before it (WRITE, when known) */
+    uint16_t pc;         /* the instruction after the access / the one stopped at */
+    uint64_t serial;     /* intvdebug_stop_serial at the stop */
+} intvdebug_stop_info;
+
+int  intvdebug_last_stop(intvdebug *d, intvdebug_stop_info *out);
 
 /* ---- FujiNet: the mailbox's BoIP bytes, as FujiBus packets ---------------
  * A tap on the staged tree's fn_sock (fn_sock_set_trace) feeds this from

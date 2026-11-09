@@ -73,9 +73,13 @@
 #define PAGE_MEMORY 2
 #define PAGE_BREAKS 3
 #define PAGE_WATCHES 4
-#define PAGE_STIC 5
-#define PAGE_SYMBOLS 6
-#define PAGE_FUJINET 7
+#define PAGE_CART 5
+#define PAGE_TRACE 6
+#define PAGE_HISTORY 7
+#define PAGE_STIC 8
+#define PAGE_SYMBOLS 9
+#define PAGE_FUJINET 10
+#define PAGE_COUNT 11
 
 #define FUJI_TICKS 5 /* the FujiNet tab, every 500ms while it shows */
 
@@ -87,6 +91,9 @@ enum {
     IDC_BP_TOGGLE, IDC_BP_REMOVE, IDC_BP_HITS, IDC_BP_CLEAR, IDC_BP_STOP,
     IDC_WT_ENTRY, IDC_WT_ADD, IDC_WT_LIST, IDC_WT_MEM, IDC_WT_BRK, IDC_WT_REMOVE,
     IDC_SRCH_KIND, IDC_SRCH_ENTRY, IDC_SRCH_NEXT, IDC_SRCH_PREV, IDC_SRCH_NOTE,
+    IDC_CART_TEXT, IDC_POPOUT, IDC_DOCK,
+    IDC_H_REC0, IDC_H_REC1, IDC_H_FILTER0, IDC_H_FILTER1, IDC_H_RANGE0, IDC_H_RANGE1,
+    IDC_H_CLEAR0, IDC_H_CLEAR1, IDC_H_NOTE0, IDC_H_NOTE1, IDC_H_TEXT0, IDC_H_TEXT1,
     IDC_STATUS, IDC_TABS,
     IDC_DISASM, IDC_FLAGS,
     IDC_MEM_ADDR, IDC_MEM_VIEW,
@@ -130,6 +137,21 @@ typedef struct {
     HWND bp_toggle, bp_remove, bp_hits, bp_clear, bp_stop;
     unsigned bp_gen;
     HWND wt_label, wt_entry, wt_add, wt_list, wt_mem, wt_brk, wt_remove;
+
+    /* Cart page; Trace (0, live) and History (1, when stopped) share one ring */
+    HWND cart_text;
+    HWND h_rec[2], h_filter[2], h_range[2], h_clear[2], h_note[2], h_text[2];
+    uint64_t h_seen[2];
+    int h_ticks;
+
+    /* Each page's controls are children of a container of its own, so a page
+     * can be peeled off into a window (SetParent) and put back. */
+    HWND pg[PAGE_COUNT];
+    HWND popped[PAGE_COUNT];     /* the window a page lives in, or NULL */
+    int tab_page[PAGE_COUNT];    /* the page at each tab-control index */
+    int ntabs;
+    HWND new_parent;             /* where child() puts the next control */
+    HWND popout_btn;
     int bas_file;       /* index into the map; -1 = nothing shown */
     unsigned bas_gen;   /* intvsrcmap_generation() the view was built from */
     int bas_pc_line;    /* the machine's line in the file shown, 0 = none */
@@ -176,12 +198,12 @@ static const char *const kRegNames[8] = {"R0", "R1", "R2", "R3",
 /* The tabs, in PAGE_* order; INTV_DEBUGGER_TAB picks one by number or by the
  * start of its name (any case), for tests and captures. */
 static const char *const k_tab_names[] = {"CPU", "BASIC", "Memory", "Breakpoints",
-                                          "Watches", "STIC", "Symbols", "FujiNet"};
+                                          "Watches", "Cart", "Trace", "History", "STIC", "Symbols", "FujiNet"};
 #define TAB_COUNT ((int)(sizeof(k_tab_names) / sizeof(k_tab_names[0])))
 
-static int tab_from_env(void)
+static int tab_from_env_var(const char *var)
 {
-    const char *tab = getenv("INTV_DEBUGGER_TAB");
+    const char *tab = getenv(var);
     char *end;
     long n;
     int i;
@@ -195,6 +217,11 @@ static int tab_from_env(void)
         if (_strnicmp(tab, k_tab_names[i], strlen(tab)) == 0)
             return i;
     return -1;
+}
+
+static int tab_from_env(void)
+{
+    return tab_from_env_var("INTV_DEBUGGER_TAB");
 }
 
 /* RGBA8888 (red first) -> BGRX (blue first), the byte order GDI's 32bpp
@@ -526,6 +553,8 @@ static LRESULT CALLBACK lines_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
  * other subclass procs, same as disasm_subclass above -- needs to call
  * both when a symbol row is clicked. */
 static void show_page(debugger *d, int page);
+static void goto_page(debugger *d, int page);
+static void layout(debugger *d);
 static void refresh_mem(debugger *d);
 static void refresh_fujinet(debugger *d, int force);
 static void refresh_all(debugger *d);
@@ -552,8 +581,7 @@ static LRESULT CALLBACK sym_list_subclass(HWND hwnd, UINT msg, WPARAM wp,
             if (sscanf(buf, "%4X", &addr) == 1 && addr <= 0xFFFF) {
                 g_dbg->mem_base = (uint16_t)addr;
                 g_dbg->seen_serial = 0;
-                SendMessageA(g_dbg->tabs, TCM_SETCURSEL, PAGE_CPU, 0);
-                show_page(g_dbg, PAGE_CPU);
+                goto_page(g_dbg, PAGE_CPU);
                 if (intvdebug_is_paused(g_dbg->dbg))
                     refresh_mem(g_dbg);
             }
@@ -568,7 +596,7 @@ static HWND child(debugger *d, const char *cls, const char *text, DWORD style,
                   int id)
 {
     HWND h = CreateWindowExA(
-        0, cls, text, WS_CHILD | style, 0, 0, 10, 10, d->hwnd,
+        0, cls, text, WS_CHILD | style, 0, 0, 10, 10, d->new_parent ? d->new_parent : d->hwnd,
         (HMENU)(INT_PTR)id,
         (HINSTANCE)GetWindowLongPtrA(d->hwnd, GWLP_HINSTANCE), NULL);
     SendMessageA(h, WM_SETFONT, (WPARAM)d->mono, TRUE);
@@ -620,6 +648,13 @@ static void build_controls(debugger *d)
     for (i = 0; i < TAB_COUNT; i++) {
         item.pszText = (char *)k_tab_names[i];
         SendMessageA(d->tabs, TCM_INSERTITEMA, i, (LPARAM)&item);
+        d->tab_page[i] = i;
+    }
+    d->ntabs = TAB_COUNT;
+    for (i = 0; i < PAGE_COUNT; i++) {   /* a container per page: its controls are its children */
+        d->pg[i] = CreateWindowExA(0, "IntvDbgPage", "", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 10, 10,
+                                   d->hwnd, NULL, (HINSTANCE)GetWindowLongPtrA(d->hwnd, GWLP_HINSTANCE), NULL);
+        SetWindowLongPtrA(d->pg[i], GWLP_USERDATA, (LONG_PTR)d->hwnd);
     }
 
     d->pause_btn = child(d, "BUTTON", "Pause (F5)",
@@ -637,28 +672,34 @@ static void build_controls(debugger *d)
     d->clear_syms_btn = child(d, "BUTTON", "Clear Symbols",
                               WS_VISIBLE | BS_PUSHBUTTON, IDC_CLEAR_SYMS);
     d->help_btn = child(d, "BUTTON", "Help", WS_VISIBLE | BS_PUSHBUTTON, IDC_HELP_BTN);
+    d->popout_btn = child(d, "BUTTON", "Pop Out", WS_VISIBLE | BS_PUSHBUTTON, IDC_POPOUT);
     d->status = child(d, "STATIC", "Running", WS_VISIBLE | SS_RIGHT,
                      IDC_STATUS);
 
     /* CPU page */
+    d->new_parent = d->pg[PAGE_CPU];
     d->disasm = child(d, "IntvDbgLines", "", WS_VISIBLE | WS_BORDER | WS_VSCROLL,
                       IDC_DISASM);
+    d->new_parent = NULL;   /* the registers sit under every page: the main window's */
     for (i = 0; i < 8; i++) {
         d->reg_label[i] = label(d, kRegNames[i]);
         d->reg_edit[i] = field(d, IDC_REG0 + i);
         EnableWindow(d->reg_edit[i], FALSE); /* read-only: see file header */
     }
     d->flags = label(d, "");
+    d->new_parent = d->pg[PAGE_MEMORY];
     d->mem_label = label(d, "Address:");
     d->mem_addr = field(d, IDC_MEM_ADDR);
     SetWindowTextA(d->mem_addr, "0000");
     d->mem_view = child(d, "EDIT", "", WS_VISIBLE | WS_BORDER | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
                                           ES_READONLY | ES_AUTOVSCROLL | ES_NOHIDESEL,
                         IDC_MEM_VIEW);
+    d->new_parent = d->pg[PAGE_CPU];
     d->break_label = label(d, "Break at:");
     d->break_addr = field(d, IDC_BREAK_ADDR);
 
     /* BASIC page */
+    d->new_parent = d->pg[PAGE_BASIC];
     d->bas_file_btn = child(d, "BUTTON", "Import File...",
                             WS_VISIBLE | BS_PUSHBUTTON, IDC_BAS_FILE);
     d->bas_folder_btn = child(d, "BUTTON", "Import Folder...",
@@ -676,6 +717,7 @@ static void build_controls(debugger *d)
     d->bas_file = -1;
 
     /* Memory page: search */
+    d->new_parent = d->pg[PAGE_MEMORY];
     d->srch_label = label(d, "Search:");
     d->srch_kind = child(d, "COMBOBOX", "", WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_HASSTRINGS,
                          IDC_SRCH_KIND);
@@ -688,6 +730,7 @@ static void build_controls(debugger *d)
     d->srch_note = label(d, "");
 
     /* Breakpoints page */
+    d->new_parent = d->pg[PAGE_BREAKS];
     d->bp_type = child(d, "COMBOBOX", "", WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_HASSTRINGS,
                        IDC_BP_TYPE);
     SendMessageA(d->bp_type, CB_ADDSTRING, 0, (LPARAM)"Execute");
@@ -714,6 +757,7 @@ static void build_controls(debugger *d)
     d->bp_stop = child(d, "STATIC", "", WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS, IDC_BP_STOP);
 
     /* Watches page */
+    d->new_parent = d->pg[PAGE_WATCHES];
     d->wt_label = label(d, "Watch:");
     d->wt_entry = field(d, IDC_WT_ENTRY);
     d->wt_add = child(d, "BUTTON", "Add", WS_VISIBLE | BS_PUSHBUTTON, IDC_WT_ADD);
@@ -723,7 +767,30 @@ static void build_controls(debugger *d)
     d->wt_brk = child(d, "BUTTON", "Break on Change", WS_VISIBLE | BS_PUSHBUTTON, IDC_WT_BRK);
     d->wt_remove = child(d, "BUTTON", "Remove", WS_VISIBLE | BS_PUSHBUTTON, IDC_WT_REMOVE);
 
+    /* Cart page */
+    d->new_parent = d->pg[PAGE_CART];
+    d->cart_text = mono_view(d, IDC_CART_TEXT);
+
+    /* Trace (live) and History (when stopped) pages */
+    for (i = 0; i < 2; i++) {
+        d->new_parent = d->pg[PAGE_TRACE + i];
+        d->h_rec[i] = child(d, "BUTTON", "Record", WS_VISIBLE | BS_AUTOCHECKBOX | BS_PUSHLIKE, IDC_H_REC0 + i);
+        d->h_filter[i] = child(d, "COMBOBOX", "", WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | CBS_DROPDOWNLIST |
+                                                      CBS_HASSTRINGS, IDC_H_FILTER0 + i);
+        SendMessageA(d->h_filter[i], CB_ADDSTRING, 0, (LPARAM)"All instructions");
+        SendMessageA(d->h_filter[i], CB_ADDSTRING, 0, (LPARAM)"Branches only");
+        SendMessageA(d->h_filter[i], CB_ADDSTRING, 0, (LPARAM)"In range");
+        SendMessageA(d->h_filter[i], CB_SETCURSEL, 0, 0);
+        d->h_range[i] = field(d, IDC_H_RANGE0 + i);
+        d->h_clear[i] = child(d, "BUTTON", "Clear", WS_VISIBLE | BS_PUSHBUTTON, IDC_H_CLEAR0 + i);
+        d->h_note[i] = child(d, "STATIC", "", WS_VISIBLE | SS_RIGHT | SS_ENDELLIPSIS, IDC_H_NOTE0 + i);
+        d->h_text[i] = mono_view(d, IDC_H_TEXT0 + i);
+        SendMessageA(d->h_text[i], EM_SETLIMITTEXT, 0, 0); /* past 32K */
+        d->h_seen[i] = (uint64_t)-1;
+    }
+
     /* STIC page */
+    d->new_parent = d->pg[PAGE_STIC];
     d->backtab_label = label(d, "BACKTAB");
     d->backtab_view = pixels(d, IDC_BACKTAB, &d->backtab_pv, d->backtab_bgrx,
                              INTVSTIC_BACKTAB_W, INTVSTIC_BACKTAB_H);
@@ -747,6 +814,7 @@ static void build_controls(debugger *d)
     d->stic_state = mono_view(d, IDC_STIC_STATE);
 
     /* Symbols page */
+    d->new_parent = d->pg[PAGE_SYMBOLS];
     d->sym_filter_label = label(d, "Filter:");
     d->sym_filter = field(d, IDC_SYM_FILTER);
     d->sym_count = label(d, "");
@@ -755,6 +823,7 @@ static void build_controls(debugger *d)
                                                  (LONG_PTR)sym_list_subclass);
 
     /* FujiNet page */
+    d->new_parent = d->pg[PAGE_FUJINET];
     d->fuji_title = label(d, "FujiBus packets (SLIP-decoded)");
     d->fuji_note = label(d, "");
     d->fuji_clear = child(d, "BUTTON", "Clear", WS_VISIBLE | BS_PUSHBUTTON,
@@ -769,6 +838,7 @@ static void build_controls(debugger *d)
      * of it would still paint its white body over any that had not repainted
      * (the BASIC page's file list vanished). Bottom of the z-order, and with
      * WS_CLIPSIBLINGS it never paints over a sibling. */
+    d->new_parent = NULL;
     SetWindowPos(d->tabs, HWND_BOTTOM, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
@@ -781,83 +851,171 @@ static void build_controls(debugger *d)
 /* Help's contexts (intvhelp.h), one per tab */
 static const char *const k_tab_contexts[] = {
     "debugger/cpu", "debugger/basic", "debugger/memory", "debugger/breakpoints",
-    "debugger/watches", "debugger/stic", "debugger/symbols", "debugger/fujinet",
+    "debugger/watches", "debugger/cart", "debugger/trace", "debugger/history", "debugger/stic",
+    "debugger/symbols", "debugger/fujinet",
 };
+
+/* On screen: the page the tab control shows, or one living in a window of its own. */
+static int page_visible(debugger *d, int page)
+{
+    return d->popped[page] != NULL || d->page == page;
+}
 
 static void show_page(debugger *d, int page)
 {
-    int i;
+    int p;
     d->page = page;
     /* Help, F1 and Ctrl+Shift+H open the tab's section */
     if (page >= 0 && page < (int)(sizeof k_tab_contexts / sizeof k_tab_contexts[0]))
         intv_help_set_context(d->hwnd, k_tab_contexts[page], 1);
-    ShowWindow(d->disasm, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
-    for (i = 0; i < 8; i++) { /* the registers sit under every page */
-        ShowWindow(d->reg_label[i], SW_SHOW);
-        ShowWindow(d->reg_edit[i], SW_SHOW);
-    }
-    ShowWindow(d->flags, SW_SHOW);
-    ShowWindow(d->mem_label, page == PAGE_MEMORY ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->mem_addr, page == PAGE_MEMORY ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->mem_view, page == PAGE_MEMORY ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->break_label, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->break_addr, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
-
-    {
-        const int m = page == PAGE_MEMORY ? SW_SHOW : SW_HIDE;
-        const int b = page == PAGE_BREAKS ? SW_SHOW : SW_HIDE;
-        const int w = page == PAGE_WATCHES ? SW_SHOW : SW_HIDE;
-        ShowWindow(d->srch_label, m); ShowWindow(d->srch_kind, m); ShowWindow(d->srch_entry, m);
-        ShowWindow(d->srch_next, m); ShowWindow(d->srch_prev, m); ShowWindow(d->srch_note, m);
-        ShowWindow(d->bp_type, b); ShowWindow(d->bp_addr, b); ShowWindow(d->bp_cond, b);
-        ShowWindow(d->bp_value, b); ShowWindow(d->bp_add, b); ShowWindow(d->bp_list, b);
-        ShowWindow(d->bp_toggle, b); ShowWindow(d->bp_remove, b); ShowWindow(d->bp_hits, b);
-        ShowWindow(d->bp_clear, b); ShowWindow(d->bp_stop, b);
-        ShowWindow(d->wt_label, w); ShowWindow(d->wt_entry, w); ShowWindow(d->wt_add, w);
-        ShowWindow(d->wt_list, w); ShowWindow(d->wt_mem, w); ShowWindow(d->wt_brk, w);
-        ShowWindow(d->wt_remove, w);
-    }
-    ShowWindow(d->bas_file_btn, page == PAGE_BASIC ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->bas_folder_btn, page == PAGE_BASIC ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->bas_map_btn, page == PAGE_BASIC ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->bas_files, page == PAGE_BASIC ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->bas_note, page == PAGE_BASIC ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->bas_view, page == PAGE_BASIC ? SW_SHOW : SW_HIDE);
-
-    ShowWindow(d->backtab_label, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->backtab_view, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->mob_label, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
-    for (i = 0; i < INTVSTIC_MOB_COUNT; i++)
-        ShowWindow(d->mob_view[i], page == PAGE_STIC ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->mob_info, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->cards_label, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->cards_view, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->cards_prev, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->cards_next, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->cards_range, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->pal_label, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->pal_view, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->state_label, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->stic_state, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
-
-    ShowWindow(d->sym_filter_label, page == PAGE_SYMBOLS ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->sym_filter, page == PAGE_SYMBOLS ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->sym_count, page == PAGE_SYMBOLS ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->sym_list, page == PAGE_SYMBOLS ? SW_SHOW : SW_HIDE);
-
-    ShowWindow(d->fuji_title, page == PAGE_FUJINET ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->fuji_note, page == PAGE_FUJINET ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->fuji_clear, page == PAGE_FUJINET ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->fuji_text, page == PAGE_FUJINET ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->fuji_state_title, page == PAGE_FUJINET ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->fuji_state, page == PAGE_FUJINET ? SW_SHOW : SW_HIDE);
+    for (p = 0; p < PAGE_COUNT; p++)   /* a page's controls follow its container */
+        ShowWindow(d->pg[p], d->popped[p] || p == page ? SW_SHOW : SW_HIDE);
     if (page == PAGE_FUJINET)
         refresh_fujinet(d, 0);
 }
 
+/* The tab control's index for a page, or -1 when it is in a window of its own. */
+static int tab_index(debugger *d, int page)
+{
+    int i;
+    for (i = 0; i < d->ntabs; i++)
+        if (d->tab_page[i] == page)
+            return i;
+    return -1;
+}
+
+static void goto_page(debugger *d, int page)
+{
+    const int i = tab_index(d, page);
+    if (d->popped[page]) {
+        SetForegroundWindow(d->popped[page]);
+        return;
+    }
+    if (i >= 0) {
+        SendMessageA(d->tabs, TCM_SETCURSEL, (WPARAM)i, 0);
+        show_page(d, page);
+    }
+}
+
+/* ---- peeling a page off into a window of its own, and putting it back ----------- */
+
+static void dock_page(debugger *d, int page)
+{
+    TCITEMA item;
+    HWND pop = d->popped[page];
+    int pos = 0, p, i;
+
+    if (!pop)
+        return;
+    d->popped[page] = NULL;
+    SetParent(d->pg[page], d->hwnd);
+    for (p = 0; p < page; p++)   /* back where it was in the order */
+        if (!d->popped[p])
+            pos++;
+    for (i = d->ntabs; i > pos; i--)
+        d->tab_page[i] = d->tab_page[i - 1];
+    d->tab_page[pos] = page;
+    d->ntabs++;
+    memset(&item, 0, sizeof(item));
+    item.mask = TCIF_TEXT;
+    item.pszText = (char *)k_tab_names[page];
+    SendMessageA(d->tabs, TCM_INSERTITEMA, (WPARAM)pos, (LPARAM)&item);
+    DestroyWindow(pop);
+    SendMessageA(d->tabs, TCM_SETCURSEL, (WPARAM)pos, 0);
+    show_page(d, page);
+    layout(d);
+    d->seen_serial = 0;
+}
+
+static void pop_out(debugger *d, int page)
+{
+    HWND pop;
+    HINSTANCE inst = (HINSTANCE)GetWindowLongPtrA(d->hwnd, GWLP_HINSTANCE);
+    char title[96];
+    int idx, i, next;
+
+    if (page < 0 || page >= PAGE_COUNT || d->popped[page] || d->ntabs <= 1)
+        return;   /* one tab always stays */
+    idx = tab_index(d, page);
+    if (idx < 0)
+        return;
+    SendMessageA(d->tabs, TCM_DELETEITEM, (WPARAM)idx, 0);
+    for (i = idx; i < d->ntabs - 1; i++)
+        d->tab_page[i] = d->tab_page[i + 1];
+    d->ntabs--;
+
+    snprintf(title, sizeof(title), "Intellivision Debugger - %s", k_tab_names[page]);
+    pop = CreateWindowExA(0, "IntvDbgPop", title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 820, 580,
+                          d->hwnd, NULL, inst, NULL);
+    SetWindowLongPtrA(pop, GWLP_USERDATA, page);
+    {
+        HWND dock = CreateWindowExA(0, "BUTTON", "Dock", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 4, 4, 70, 26,
+                                    pop, (HMENU)(INT_PTR)IDC_DOCK, inst, NULL);
+        SendMessageA(dock, WM_SETFONT, (WPARAM)d->mono, TRUE);
+    }
+    SetParent(d->pg[page], pop);
+    d->popped[page] = pop;
+    next = idx < d->ntabs ? idx : d->ntabs - 1;
+    SendMessageA(d->tabs, TCM_SETCURSEL, (WPARAM)next, 0);
+    show_page(d, d->tab_page[next]);
+    layout(d);
+    ShowWindow(pop, SW_SHOW);
+    d->seen_serial = 0;
+}
+
+/* A page container: its controls' notifications go to the debugger window. */
+static LRESULT CALLBACK page_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    HWND main = (HWND)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+    case WM_COMMAND:
+    case WM_NOTIFY:
+    case WM_DRAWITEM:
+    case WM_DBG_LINE:
+    case WM_DBG_ACCEPT:
+        return main ? SendMessageA(main, msg, wp, lp) : 0;
+    case WM_ERASEBKGND: {
+        RECT c;
+        GetClientRect(hwnd, &c);
+        FillRect((HDC)wp, &c, GetSysColorBrush(COLOR_WINDOW));
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN:
+        SetBkColor((HDC)wp, GetSysColor(COLOR_WINDOW));
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+/* The window a peeled-off page lives in. */
+static LRESULT CALLBACK pop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    const int page = (int)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+    case WM_SIZE:
+        if (g_dbg)
+            layout(g_dbg);
+        return 0;
+    case WM_COMMAND:
+        if (g_dbg && LOWORD(wp) == IDC_DOCK)
+            dock_page(g_dbg, page);
+        return 0;
+    case WM_CLOSE:
+        if (g_dbg)
+            dock_page(g_dbg, page);
+        else
+            DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
 static void layout(debugger *d)
 {
-    RECT client, page;
+    RECT client, page, pr[PAGE_COUNT];
     int y, i;
 
     GetClientRect(d->hwnd, &client);
@@ -871,8 +1029,9 @@ static void layout(debugger *d)
     MoveWindow(d->load_syms_btn, 604, y, 120, 26, TRUE);
     MoveWindow(d->clear_syms_btn, 728, y, 110, 26, TRUE);
     MoveWindow(d->help_btn, 842, y, 70, 26, TRUE);
+    MoveWindow(d->popout_btn, 916, y, 80, 26, TRUE);
     {
-        const int sx = client.right - 210 > 920 ? client.right - 210 : 920;
+        const int sx = client.right - 210 > 1004 ? client.right - 210 : 1004;
         MoveWindow(d->status, sx, y + 4, client.right - sx - 10 > 40 ? client.right - sx - 10 : 40, 20, TRUE);
     }
     y += 32;
@@ -882,14 +1041,34 @@ static void layout(debugger *d)
     page.top = y;
     page.bottom = client.bottom - 60;   /* the registers strip is below */
     SendMessageA(d->tabs, TCM_ADJUSTRECT, FALSE, (LPARAM)&page);
+    {   /* each page's own rectangle, relative to its container */
+        int p;
+        for (p = 0; p < PAGE_COUNT; p++) {
+            if (d->popped[p]) {
+                RECT pc;
+                GetClientRect(d->popped[p], &pc);
+                MoveWindow(d->pg[p], 0, 34, pc.right, pc.bottom > 34 ? pc.bottom - 34 : 1, TRUE);
+                pr[p].left = pr[p].top = 0;
+                pr[p].right = pc.right;
+                pr[p].bottom = pc.bottom > 34 ? pc.bottom - 34 : 1;
+            } else {
+                MoveWindow(d->pg[p], page.left, page.top, page.right - page.left, page.bottom - page.top, TRUE);
+                pr[p].left = pr[p].top = 0;
+                pr[p].right = page.right - page.left;
+                pr[p].bottom = page.bottom - page.top;
+            }
+        }
+    }
 
     /* CPU page: the disassembly, and a "Break at" row under it */
+    page = pr[PAGE_CPU];
     MoveWindow(d->disasm, page.left, page.top, page.right - page.left - 8,
               page.bottom - page.top - 30, TRUE);
     MoveWindow(d->break_label, page.left, page.bottom - 24, 70, 18, TRUE);
     MoveWindow(d->break_addr, page.left + 74, page.bottom - 26, 220, 22, TRUE);
 
     /* Memory page */
+    page = pr[PAGE_MEMORY];
     MoveWindow(d->mem_label, page.left, page.top + 2, 70, 18, TRUE);
     MoveWindow(d->mem_addr, page.left + 74, page.top, 260, 22, TRUE);
     MoveWindow(d->srch_label, page.left, page.top + 34, 70, 18, TRUE);
@@ -903,7 +1082,8 @@ static void layout(debugger *d)
 
     /* Breakpoints page */
     {
-        const int R = page.right - 8, top = page.top;
+        const int R = pr[PAGE_BREAKS].right - 8, top = 0;
+        page = pr[PAGE_BREAKS];
         MoveWindow(d->bp_type, page.left, top, 90, 200, TRUE);
         MoveWindow(d->bp_add, R - 60, top - 2, 60, 26, TRUE);
         MoveWindow(d->bp_value, R - 60 - 4 - 90, top, 90, 22, TRUE);
@@ -919,7 +1099,8 @@ static void layout(debugger *d)
 
     /* Watches page */
     {
-        const int R = page.right - 8, top = page.top;
+        const int R = pr[PAGE_WATCHES].right - 8, top = 0;
+        page = pr[PAGE_WATCHES];
         MoveWindow(d->wt_label, page.left, top + 4, 60, 18, TRUE);
         MoveWindow(d->wt_entry, page.left + 64, top, R - 60 - 4 - (page.left + 64), 22, TRUE);
         MoveWindow(d->wt_add, R - 60, top - 2, 60, 26, TRUE);
@@ -942,7 +1123,8 @@ static void layout(debugger *d)
 
     /* BASIC page */
     {
-        int by = page.top;
+        int by = pr[PAGE_BASIC].top;
+        page = pr[PAGE_BASIC];
         MoveWindow(d->bas_file_btn, page.left, by, 110, 26, TRUE);
         MoveWindow(d->bas_folder_btn, page.left + 114, by, 120, 26, TRUE);
         MoveWindow(d->bas_map_btn, page.left + 238, by, 100, 26, TRUE);
@@ -956,7 +1138,8 @@ static void layout(debugger *d)
 
     /* STIC page */
     {
-        int sx = page.left, sy = page.top;
+        int sx = 0, sy = 0;
+        page = pr[PAGE_STIC];
         MoveWindow(d->backtab_label, sx, sy, 200, 18, TRUE);
         MoveWindow(d->backtab_view, sx, sy + 20, INTVSTIC_BACKTAB_W * 2,
                   INTVSTIC_BACKTAB_H * 2, TRUE);
@@ -990,7 +1173,8 @@ static void layout(debugger *d)
 
     /* Symbols page */
     {
-        int sy = page.top;
+        int sy = 0;
+        page = pr[PAGE_SYMBOLS];
         MoveWindow(d->sym_filter_label, page.left, sy, 50, 22, TRUE);
         MoveWindow(d->sym_filter, page.left + 54, sy, 220, 22, TRUE);
         MoveWindow(d->sym_count, page.left + 282, sy, 200, 22, TRUE);
@@ -1002,7 +1186,8 @@ static void layout(debugger *d)
     /* FujiNet page: the packets left (a note and Clear over them), the
      * mailbox right */
     {
-        int fy = page.top;
+        int fy = 0;
+        page = pr[PAGE_FUJINET];
         int rw = (page.right - page.left) / 3 > 320
                      ? 320 : (page.right - page.left) / 3;
         int lw = page.right - page.left - rw - 12;
@@ -1016,6 +1201,20 @@ static void layout(debugger *d)
         fy += 30;
         MoveWindow(d->fuji_text, page.left, fy, lw, page.bottom - fy - 4,
                   TRUE);
+    }
+
+    /* Cart page */
+    MoveWindow(d->cart_text, 0, 0, pr[PAGE_CART].right - 8, pr[PAGE_CART].bottom - 4, TRUE);
+
+    /* Trace and History pages */
+    for (i = 0; i < 2; i++) {
+        const RECT r = pr[PAGE_TRACE + i];
+        MoveWindow(d->h_rec[i], 0, 0, 90, 26, TRUE);
+        MoveWindow(d->h_filter[i], 96, 2, 140, 200, TRUE);
+        MoveWindow(d->h_range[i], 242, 2, 200, 22, TRUE);
+        MoveWindow(d->h_clear[i], 448, 0, 70, 26, TRUE);
+        MoveWindow(d->h_note[i], 526, 6, r.right - 526 - 8 > 40 ? r.right - 526 - 8 : 40, 18, TRUE);
+        MoveWindow(d->h_text[i], 0, 32, r.right - 8, r.bottom - 36, TRUE);
     }
 }
 
@@ -1578,7 +1777,8 @@ static void basic_pick(debugger *d, int kind)
 /* On the BASIC page the three steppers go by BASIC line. */
 static void do_step(debugger *d, int how)
 {
-    const int by_line = d->page == PAGE_BASIC;
+    const int by_line = d->page == PAGE_BASIC ||
+                        (d->popped[PAGE_BASIC] && GetActiveWindow() == d->popped[PAGE_BASIC]);
     switch (how) {
     case IDC_STEP:
         if (by_line) intvdebug_step_line(d->dbg); else intvdebug_step(d->dbg);
@@ -1751,6 +1951,94 @@ static void selected_watch_range(debugger *d, uint16_t *lo, uint16_t *hi, int *o
     *ok = sel >= 0 && intvwatch_range(d->symtab, sel, lo, hi);
 }
 
+/* ---- Cart, Trace and History pages ------------------------------------------- */
+
+static void refresh_cart(debugger *d)
+{
+    intvdebug_cart cart;
+    intvdebug_region reg[64];
+    char text[4096];
+    int len = 0, n, i;
+
+    intvdebug_cart_info(d->dbg, &cart);
+    len += snprintf(text + len, sizeof(text) - (size_t)len, "Cartridge\r\n  File     %s\r\n",
+                    cart.path[0] ? cart.path : "(none)");
+    if (cart.name[0])
+        len += snprintf(text + len, sizeof(text) - (size_t)len, "  Title    %s%s%.0d\r\n", cart.name,
+                        cart.year ? ", " : "", cart.year);
+    len += snprintf(text + len, sizeof(text) - (size_t)len,
+                    "  FujiNet  %s\r\n  ECS      %s\r\n  JLP      %s\r\n\r\nMemory map\r\n",
+                    cart.fujinet_mailbox ? "mailbox mapped at $9C00" : "no mailbox", cart.ecs ? "present" : "no",
+                    cart.jlp ? "present" : "no");
+    n = intvdebug_memory_map(d->dbg, reg, 64);
+    if (!n)
+        len += snprintf(text + len, sizeof(text) - (size_t)len, "  Pause the machine to read its memory map.\r\n");
+    for (i = 0; i < n && len < (int)sizeof(text) - 96; i++)
+        len += snprintf(text + len, sizeof(text) - (size_t)len, "  %04X-%04X  %c%c  %s\r\n", reg[i].lo, reg[i].hi,
+                        reg[i].readable ? 'r' : '-', reg[i].writable ? 'w' : '-', reg[i].name);
+    {
+        char cur[4096];
+        GetWindowTextA(d->cart_text, cur, sizeof(cur));
+        if (strcmp(cur, text) != 0) /* unchanged keeps a selection */
+            set_text_at(d->cart_text, text, 0);
+    }
+}
+
+#define HIST_SHOWN 400   /* lines on the page */
+
+static void hist_refresh(debugger *d, int idx, int force)
+{
+    static intvdebug_hist buf[4000];
+    static char text[HIST_SHOWN * 240];
+    const int live = idx == 0;
+    const int paused = intvdebug_is_paused(d->dbg);
+    const int on = intvdebug_history_enabled(d->dbg);
+    const uint64_t count = intvdebug_history_count(d->dbg);
+    uint16_t lo = 0, hi = 0xFFFF;
+    int filter = 0, n, i, shown = 0, hit[HIST_SHOWN];
+    size_t len = 0;
+    char note[96];
+
+    SendMessageA(d->h_rec[0], BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);   /* both Record buttons follow the engine */
+    SendMessageA(d->h_rec[1], BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
+    InvalidateRect(d->h_rec[0], NULL, FALSE);
+    InvalidateRect(d->h_rec[1], NULL, FALSE);
+
+    if (!force && count == d->h_seen[idx] && (live || paused))
+        return;
+    d->h_seen[idx] = count;
+    if (!live && !paused) {
+        SetWindowTextA(d->h_note[idx], "Pause the machine to read its history.");
+        return;
+    }
+    switch ((int)SendMessageA(d->h_filter[idx], CB_GETCURSEL, 0, 0)) {
+    case 1: filter = INTVDEBUG_HIST_BRANCHES; break;
+    case 2: {
+        char r[64];
+        GetWindowTextA(d->h_range[idx], r, sizeof(r));
+        if (intvsym_parse_range(d->symtab, r, &lo, &hi, NULL))
+            filter = INTVDEBUG_HIST_RANGE;
+        break;
+    }
+    }
+    n = intvdebug_history_copy(d->dbg, buf, 4000);
+    for (i = n - 1; i >= 0 && shown < HIST_SHOWN; i--)   /* the newest matches, scanning back */
+        if (intvdebug_history_match(&buf[i], filter, lo, hi))
+            hit[shown++] = i;
+    text[0] = '\0';
+    if (!on && n == 0)
+        snprintf(text, sizeof(text), "History is off. Press Record, then let the machine run.");
+    for (i = shown - 1; i >= 0 && len + 260 < sizeof(text); i--) {   /* oldest first */
+        char line[256];
+        intvdebug_history_format(&buf[hit[i]], line, sizeof(line));
+        len += (size_t)snprintf(text + len, sizeof(text) - len, "%s\r\n", line);
+    }
+    set_text_at(d->h_text[idx], text, 1);
+    snprintf(note, sizeof(note), "%s%llu instructions recorded, last %d shown", on ? "Recording. " : "",
+             (unsigned long long)count, shown);
+    SetWindowTextA(d->h_note[idx], note);
+}
+
 static void refresh_all(debugger *d)
 {
     int paused = intvdebug_is_paused(d->dbg);
@@ -1789,7 +2077,10 @@ static void refresh_all(debugger *d)
     refresh_basic(d, paused);
     refresh_breaks(d);
     refresh_watches(d);
-    if (d->page == PAGE_FUJINET)
+    refresh_cart(d);
+    hist_refresh(d, 0, 0);
+    hist_refresh(d, 1, 0);
+    if (page_visible(d, PAGE_FUJINET))
         refresh_fujinet(d, 0);
     d->was_paused = paused;
 }
@@ -1810,8 +2101,14 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         if (nm->code == NM_CUSTOMDRAW && nm->hwndFrom == d->pause_btn) /* Continue wears the accent */
             return intv_accent_customdraw((const NMCUSTOMDRAW *)lp, intvdebug_is_paused(d->dbg));
-        if (nm->hwndFrom == d->tabs && nm->code == TCN_SELCHANGE)
-            show_page(d, (int)SendMessageA(d->tabs, TCM_GETCURSEL, 0, 0));
+        if ((nm->hwndFrom == d->h_rec[0] || nm->hwndFrom == d->h_rec[1]) && nm->code == NM_CUSTOMDRAW) /* Record: the accent while on */
+            return intv_accent_customdraw((const NMCUSTOMDRAW *)lp,
+                                          SendMessageA(nm->hwndFrom, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        if (nm->hwndFrom == d->tabs && nm->code == TCN_SELCHANGE) {
+            const int idx = (int)SendMessageA(d->tabs, TCM_GETCURSEL, 0, 0);
+            if (idx >= 0 && idx < d->ntabs)
+                show_page(d, d->tab_page[idx]);
+        }
         return 0;
     }
     case WM_TIMER:
@@ -1821,7 +2118,10 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 intvdebug_is_paused(d->dbg) != d->was_paused) {
                 d->seen_serial = serial;
                 refresh_all(d);
-            } else if (d->page == PAGE_FUJINET &&
+            } else if (page_visible(d, PAGE_TRACE) && ++d->h_ticks >= 4) {
+                d->h_ticks = 0;   /* the live view moves while the machine runs */
+                hist_refresh(d, 0, 0);
+            } else if (page_visible(d, PAGE_FUJINET) &&
                        ++d->fuji_ticks >= FUJI_TICKS) {
                 /* the one view that moves while the machine runs */
                 refresh_fujinet(d, 0);
@@ -1847,7 +2147,10 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DBG_ACCEPT:
         if (!d)
             return 0;
-        if (wp == IDC_BP_ADDR || wp == IDC_BP_VALUE) {
+        if (wp == IDC_H_RANGE0 || wp == IDC_H_RANGE1) {
+            d->h_seen[0] = d->h_seen[1] = (uint64_t)-1;
+            d->seen_serial = 0;
+        } else if (wp == IDC_BP_ADDR || wp == IDC_BP_VALUE) {
             add_break(d);
         } else if (wp == IDC_WT_ENTRY) {
             add_watch(d);
@@ -1905,6 +2208,25 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_BAS_MAP:
             basic_pick(d, LOWORD(wp));
             return 0;
+        case IDC_POPOUT: pop_out(d, d->page); return 0;
+        case IDC_H_REC0:
+        case IDC_H_REC1:
+            intvdebug_history_enable(d->dbg, SendMessageA((HWND)lp, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            d->seen_serial = 0;
+            return 0;
+        case IDC_H_CLEAR0:
+        case IDC_H_CLEAR1:
+            intvdebug_history_clear(d->dbg);
+            d->h_seen[0] = d->h_seen[1] = (uint64_t)-1;
+            d->seen_serial = 0;
+            return 0;
+        case IDC_H_FILTER0:
+        case IDC_H_FILTER1:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                d->h_seen[0] = d->h_seen[1] = (uint64_t)-1;
+                d->seen_serial = 0;
+            }
+            return 0;
         case IDC_BP_ADD: add_break(d); return 0;
         case IDC_WT_ADD: add_watch(d); return 0;
         case IDC_SRCH_NEXT: do_search(d, 0); return 0;
@@ -1940,8 +2262,7 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             int ok;
             selected_watch_range(d, &lo, &hi, &ok);
             if (ok) {
-                SendMessageA(d->tabs, TCM_SETCURSEL, PAGE_MEMORY, 0);
-                show_page(d, PAGE_MEMORY);
+                goto_page(d, PAGE_MEMORY);
                 show_in_memory(d, lo, hi);
             }
             return 0;
@@ -2063,7 +2384,14 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_DESTROY:
         if (d) {
+            int pp;
             KillTimer(hwnd, TIMER_REFRESH);
+            for (pp = 0; pp < PAGE_COUNT; pp++)   /* a peeled-off page's window goes with the debugger */
+                if (d->popped[pp]) {
+                    HWND w2 = d->popped[pp];
+                    d->popped[pp] = NULL;
+                    DestroyWindow(w2);
+                }
             /* Releasing costs the machine nothing further (see
              * intvdebug.h) and leaving it engaged+paused would look like
              * the emulator had hung. */
@@ -2088,9 +2416,15 @@ int intv_debugger_pretranslate(MSG *msg)
 {
     if (!g_dbg)
         return 0;
-    if (msg->hwnd != g_dbg->hwnd && GetParent(msg->hwnd) != g_dbg->hwnd &&
-        GetAncestor(msg->hwnd, GA_ROOT) != g_dbg->hwnd)
-        return 0;
+    {
+        HWND root = GetAncestor(msg->hwnd, GA_ROOT);
+        int mine = msg->hwnd == g_dbg->hwnd || GetParent(msg->hwnd) == g_dbg->hwnd || root == g_dbg->hwnd, pp;
+        for (pp = 0; !mine && pp < PAGE_COUNT; pp++)   /* a peeled-off page's window too */
+            if (g_dbg->popped[pp] && (root == g_dbg->popped[pp] || msg->hwnd == g_dbg->popped[pp]))
+                mine = 1;
+        if (!mine)
+            return 0;
+    }
     if (msg->message != WM_KEYDOWN)
         return 0;
     switch (msg->wParam) {
@@ -2130,6 +2464,21 @@ void intv_debugger_show(HWND parent, intvsession *session)
         RegisterClassA(&wc);
 
         memset(&pc, 0, sizeof(pc));
+        pc.lpfnWndProc = page_proc;
+        pc.hInstance = inst;
+        pc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        pc.lpszClassName = "IntvDbgPage";
+        RegisterClassA(&pc);
+
+        memset(&pc, 0, sizeof(pc));
+        pc.lpfnWndProc = pop_proc;
+        pc.hInstance = inst;
+        pc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        pc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        pc.lpszClassName = "IntvDbgPop";
+        RegisterClassA(&pc);
+
+        memset(&pc, 0, sizeof(pc));
         pc.lpfnWndProc = lines_proc;
         pc.hInstance = inst;
         pc.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -2159,7 +2508,7 @@ void intv_debugger_show(HWND parent, intvsession *session)
 
     d->hwnd = CreateWindowExA(0, "IntvDebuggerWindow",
                               "Intellivision Debugger", WS_OVERLAPPEDWINDOW,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 1080, 780, parent,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 1180, 780, parent,
                               NULL, inst, NULL);
     SetWindowLongPtrA(d->hwnd, GWLP_USERDATA, (LONG_PTR)d);
     g_dbg = d;
@@ -2181,6 +2530,10 @@ void intv_debugger_show(HWND parent, intvsession *session)
         if (tab >= 0)
             SendMessageA(d->tabs, TCM_SETCURSEL, (WPARAM)tab, 0);
         show_page(d, tab >= 0 ? tab : PAGE_CPU);
+        if (getenv("INTV_HISTORY"))   /* record from the start, for captures */
+            intvdebug_history_enable(d->dbg, 1);
+        if (tab_from_env_var("INTV_POPOUT") >= 0)   /* peel a tab off at the start, for captures */
+            pop_out(d, tab_from_env_var("INTV_POPOUT"));
     }
 
     /* For captures and tests, like INTV_DEBUGGER_TAB: INTV_BASIC_IMPORT=<.bas

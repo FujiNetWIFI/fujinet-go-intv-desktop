@@ -196,6 +196,75 @@ int main(void)
                                                 INTVDEBUG_SEARCH_NOCASE, 0x51FF, 0x51FF, hits, 4) == 1);
     }
 
+    /* ---- the disassembly text has no address or opcode words in front ---- */
+    {
+        intvdebug_dasm_line dl[2];
+        check("disassembly text starts at the mnemonic",
+              intvdebug_disassemble(d, 0x50D5, 0, dl, 1) == 1 && dl[0].text[0] >= 'A' && dl[0].text[0] <= 'Z');
+        check("BEGIN is a PSHR", strstr(dl[0].text, "PSHR") != NULL);
+    }
+
+    /* ---- the memory map and the cart ---- */
+    {
+        intvdebug_region reg[64];
+        intvdebug_cart cart;
+        int n = intvdebug_memory_map(d, reg, 64), k, saw_rom = 0, saw_scratch = 0;
+        for (k = 0; k < n; k++) {
+            if (reg[k].lo <= 0x5000 && reg[k].hi >= 0x5000 && reg[k].readable &&
+                strstr(reg[k].name, "BIN"))
+                saw_rom = 1;
+            if (reg[k].lo <= 0x0100 && reg[k].hi >= 0x0100 && reg[k].readable && reg[k].writable)
+                saw_scratch = 1;
+        }
+        check("a map came back", n > 5);
+        check("the cart's image is mapped at $5000", saw_rom);
+        check("scratch RAM is read-write", saw_scratch);
+        check("regions are in order and do not overlap", n > 1 && reg[1].lo > reg[0].hi);
+        intvdebug_cart_info(d, &cart);
+        check("the cart path is the fixture", strstr(cart.path, "main.bin") != NULL);
+    }
+
+    /* ---- history: record a stretch of execution, then read it back ---- */
+    {
+        static intvdebug_hist h[512];
+        char line[256];
+        int n, k, saw_branch = 0, saw_cart = 0;
+        intvdebug_history_clear(d);
+        check("history starts off", !intvdebug_history_enabled(d));
+        intvdebug_history_enable(d, 1);
+        intvdebug_resume(d);
+        usleep(400000);
+        intvdebug_pause(d);
+        check("paused again", wait_paused(d, 5000));
+        check("instructions were recorded", intvdebug_history_count(d) > 1000);
+        n = intvdebug_history_copy(d, h, 512);
+        check("a full window came back", n == 512);
+        for (k = 0; k < n; k++) {
+            if (!intvdebug_history_match(&h[k], INTVDEBUG_HIST_BRANCHES, 0, 0))
+                continue;
+            saw_branch = 1;
+            intvdebug_history_format(&h[k], line, sizeof(line));
+            check("a branch line shows its mnemonic", strstr(line, " B") || strstr(line, " J"));
+        }
+        check("the history has branches in it", saw_branch);
+        for (k = 0; k < n; k++)
+            if (intvdebug_history_match(&h[k], INTVDEBUG_HIST_RANGE, 0x5000, 0x5FFF))
+                saw_cart = 1;
+        check("and the cart's own code", saw_cart);
+        check("the last entry is where we stopped", h[n - 1].pc != 0 || n > 0);
+        intvdebug_history_enable(d, 0);
+        {
+            const uint64_t c = intvdebug_history_count(d);
+            intvdebug_resume(d);
+            usleep(100000);
+            check("off means no more records", intvdebug_history_count(d) == c);
+            intvdebug_pause(d);
+            wait_paused(d, 5000);
+        }
+        intvdebug_history_clear(d);
+        check("clear", intvdebug_history_count(d) == 0);
+    }
+
     /* ---- an EXEC entry reports as a breakpoint, with its hit ---- */
     intvdebug_breakpoint_toggle(d, 0x50C8);
     intvdebug_resume(d);

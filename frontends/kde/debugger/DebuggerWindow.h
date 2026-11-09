@@ -52,6 +52,14 @@ private:
     void breakAtAddr();
     void refreshSymbols();
     QWidget *buildBasic();
+    QWidget *buildCart();
+    QWidget *buildHist(int idx);
+    void refreshCart();
+    void refreshHist(int idx, bool force);
+    void popOut(int tab);
+    void dock(int tab);
+    int currentTab() const;
+    bool tabVisible(int tab) const;
     QWidget *buildBreaks();
     QWidget *buildWatches();
     QWidget *buildSearchBar();
@@ -135,6 +143,22 @@ private:
     /* Watches tab */
     QLineEdit *m_wtEntry;
     QListWidget *m_wtList;
+
+    /* Cart tab; Trace (0, live) and History (1, when stopped) share one ring */
+    QPlainTextEdit *m_cartText;
+    QPushButton *m_hRec[2];
+    QComboBox *m_hFilter[2];
+    QLineEdit *m_hRange[2];
+    QPlainTextEdit *m_hText[2];
+    QLabel *m_hNote[2];
+    uint64_t m_hSeen[2] = {~0ull, ~0ull};
+    int m_hTicks = 0;
+    bool m_hSync = false;
+
+    /* Tabs peeled off into windows of their own */
+    QWidget *m_pages[16] = {};
+    QWidget *m_popped[16] = {};
+    bool m_closing = false;
 
     QTabWidget *m_tabs;
     QWidget *m_fujiPage;

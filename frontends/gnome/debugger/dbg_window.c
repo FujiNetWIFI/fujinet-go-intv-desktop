@@ -48,7 +48,11 @@
 #define CARD_ROWS_PER_PAGE 8 /* 128 cards/page at CARDS_PER_ROW=16 */
 #define FUJI_REFRESH_US 500000 /* the FujiNet tab, while it shows */
 
-enum { TAB_CPU, TAB_BASIC, TAB_MEMORY, TAB_BREAKS, TAB_WATCHES, TAB_STIC, TAB_SYMBOLS, TAB_FUJINET };
+enum { TAB_CPU, TAB_BASIC, TAB_MEMORY, TAB_BREAKS, TAB_WATCHES, TAB_CART, TAB_TRACE, TAB_HISTORY,
+       TAB_STIC, TAB_SYMBOLS, TAB_FUJINET, TAB_COUNT };
+
+/* The notebook's pages, in order. */
+static const char *const k_tab_names[] = { "CPU", "BASIC", "Memory", "Breakpoints", "Watches", "Cart", "Trace", "History", "STIC", "Symbols", "FujiNet" };
 
 /* A breakpoint in a gutter: a red dot. */
 #define BP_DOT "<span foreground=\"#e01b24\">\xe2\x97\x8f</span>"
@@ -118,6 +122,23 @@ typedef struct {
     /* Watches tab */
     GtkEntry *wt_entry;
     GtkListBox *wt_list;
+
+    /* Cart tab */
+    GtkTextView *cart_text;
+
+    /* Trace (0, live) and History (1, when stopped) pages share one ring */
+    GtkToggleButton *h_rec[2];
+    GtkDropDown *h_filter[2];
+    GtkEntry *h_range[2];
+    GtkTextView *h_text[2];
+    GtkLabel *h_note[2];
+    uint64_t h_seen[2];
+    gint64 h_at;
+    gboolean h_sync;
+
+    /* Tabs that have been peeled off into windows of their own */
+    GtkWidget *pages[TAB_COUNT];
+    GtkWindow *detached[TAB_COUNT];
 
     GtkNotebook *notebook;
     GtkWidget *fuji_page;
@@ -519,11 +540,36 @@ static void refresh_stic(DbgWin *w)
                              -1);
 }
 
+/* Tabs can be moved into windows of their own, so a page's place in the
+ * notebook is not its identity: each carries its original index. */
+static int page_tab(GtkWidget *page)
+{
+    return GPOINTER_TO_INT(g_object_get_data(G_OBJECT(page), "tab-index")) - 1;
+}
+
+static int current_tab(DbgWin *w)
+{
+    GtkWidget *page = gtk_notebook_get_nth_page(w->notebook, gtk_notebook_get_current_page(w->notebook));
+    return page ? page_tab(page) : -1;
+}
+
+/* On screen: the notebook's page, or a window of its own. */
+static gboolean tab_visible(DbgWin *w, int tab)
+{
+    return current_tab(w) == tab || w->detached[tab] != NULL;
+}
+
+static void show_tab(DbgWin *w, int tab)
+{
+    if (w->detached[tab])
+        gtk_window_present(w->detached[tab]);
+    else
+        gtk_notebook_set_current_page(w->notebook, gtk_notebook_page_num(w->notebook, w->pages[tab]));
+}
+
 static gboolean fuji_showing(DbgWin *w)
 {
-    return gtk_notebook_get_nth_page(
-               w->notebook, gtk_notebook_get_current_page(w->notebook)) ==
-           w->fuji_page;
+    return tab_visible(w, TAB_FUJINET);
 }
 
 static void refresh_fujinet(DbgWin *w, gboolean force)
@@ -582,7 +628,8 @@ static void refresh_fujinet(DbgWin *w, gboolean force)
 
 static gboolean basic_tab_active(DbgWin *w)
 {
-    return w->tabs && gtk_notebook_get_current_page(w->tabs) == TAB_BASIC;
+    return w->tabs && (current_tab(w) == TAB_BASIC ||
+                       (w->detached[TAB_BASIC] && gtk_window_is_active(w->detached[TAB_BASIC])));
 }
 
 /* A line's gutter: '>' the machine is here, '*' a breakpoint on its code. */
@@ -950,7 +997,7 @@ static void on_wt_memory(GtkButton *b, gpointer user_data)
     DbgWin *w = user_data;
     uint16_t lo, hi;
     if (intvwatch_range(w->symtab, GPOINTER_TO_INT(g_object_get_data(G_OBJECT(b), "wt-idx")), &lo, &hi)) {
-        gtk_notebook_set_current_page(w->tabs, TAB_MEMORY);
+        show_tab(w, TAB_MEMORY);
         show_in_memory(w, lo, hi);
     }
 }
@@ -1065,6 +1112,205 @@ static void on_search_entry_activate(GtkEntry *entry, gpointer user_data)
     on_search(GTK_BUTTON(fwd), w);
 }
 
+/* ---- Cart, Trace and History tabs ------------------------------------------- */
+
+static void cart_refresh(DbgWin *w)
+{
+    intvdebug_cart cart;
+    intvdebug_region reg[64];
+    GString *t = g_string_new(NULL);
+    int n, i;
+
+    intvdebug_cart_info(w->dbg, &cart);
+    g_string_append(t, "Cartridge\n");
+    g_string_append_printf(t, "  File     %s\n", cart.path[0] ? cart.path : "(none)");
+    if (cart.name[0])
+        g_string_append_printf(t, "  Title    %s%s%s\n", cart.name, cart.year ? ", " : "",
+                               cart.year ? g_strdup_printf("%d", cart.year) : "");
+    g_string_append_printf(t, "  FujiNet  %s\n", cart.fujinet_mailbox ? "mailbox mapped at $9C00" : "no mailbox");
+    g_string_append_printf(t, "  ECS      %s\n", cart.ecs ? "present" : "no");
+    g_string_append_printf(t, "  JLP      %s\n", cart.jlp ? "present" : "no");
+    g_string_append(t, "\nMemory map\n");
+    n = intvdebug_memory_map(w->dbg, reg, 64);
+    if (!n)
+        g_string_append(t, "  Pause the machine to read its memory map.\n");
+    for (i = 0; i < n; i++)
+        g_string_append_printf(t, "  %04X-%04X  %c%c  %s\n", reg[i].lo, reg[i].hi,
+                               reg[i].readable ? 'r' : '-', reg[i].writable ? 'w' : '-', reg[i].name);
+    set_text_at(w->cart_text, t->str, FALSE);
+    g_string_free(t, TRUE);
+}
+
+#define HIST_SHOWN 400   /* lines on the page */
+
+static void hist_refresh(DbgWin *w, int idx, gboolean force)
+{
+    static intvdebug_hist buf[4000];
+    const gboolean live = idx == 0;
+    const gboolean paused = intvdebug_is_paused(w->dbg);
+    const gboolean on = intvdebug_history_enabled(w->dbg);
+    const uint64_t count = intvdebug_history_count(w->dbg);
+    uint16_t lo = 0, hi = 0xFFFF;
+    int filter = 0, n, i, shown = 0, first;
+    g_autofree char *note = NULL;
+    GString *t;
+    int hit[HIST_SHOWN];
+
+    w->h_sync = TRUE;   /* the two Record buttons follow the engine */
+    gtk_toggle_button_set_active(w->h_rec[0], on);
+    gtk_toggle_button_set_active(w->h_rec[1], on);
+    w->h_sync = FALSE;
+
+    if (!force && count == w->h_seen[idx] && (live || paused))
+        return;
+    w->h_seen[idx] = count;
+    if (!live && !paused) {
+        gtk_label_set_text(w->h_note[idx], "Pause the machine to read its history.");
+        return;
+    }
+    switch (gtk_drop_down_get_selected(w->h_filter[idx])) {
+    case 1: filter = INTVDEBUG_HIST_BRANCHES; break;
+    case 2:
+        if (intvsym_parse_range(w->symtab, gtk_editable_get_text(GTK_EDITABLE(w->h_range[idx])), &lo, &hi, NULL))
+            filter = INTVDEBUG_HIST_RANGE;
+        break;
+    }
+    n = intvdebug_history_copy(w->dbg, buf, 4000);
+    first = 0;
+    for (i = n - 1; i >= 0 && shown < HIST_SHOWN; i--)   /* the newest matches, scanning back */
+        if (intvdebug_history_match(&buf[i], filter, lo, hi))
+            hit[shown++] = i;
+    (void)first;
+    t = g_string_new(NULL);
+    if (!on && n == 0)
+        g_string_append(t, "History is off. Press Record, then let the machine run.");
+    for (i = shown - 1; i >= 0; i--) {   /* oldest first */
+        char line[256];
+        intvdebug_history_format(&buf[hit[i]], line, sizeof(line));
+        g_string_append(t, line);
+        g_string_append_c(t, '\n');
+    }
+    set_text_at(w->h_text[idx], t->str, TRUE);
+    g_string_free(t, TRUE);
+    note = g_strdup_printf("%s%" G_GUINT64_FORMAT " instructions recorded, last %d shown",
+                           on ? "Recording. " : "", count, shown);
+    gtk_label_set_text(w->h_note[idx], note);
+}
+
+static void on_hist_rec(GtkToggleButton *b, gpointer u)
+{
+    DbgWin *w = u;
+    if (w->h_sync)
+        return;
+    intvdebug_history_enable(w->dbg, gtk_toggle_button_get_active(b));
+    invalidate(w);
+}
+
+static void on_hist_clear(GtkButton *b, gpointer u)
+{
+    DbgWin *w = u;
+    (void)b;
+    intvdebug_history_clear(w->dbg);
+    w->h_seen[0] = w->h_seen[1] = (uint64_t)-1;
+    invalidate(w);
+}
+
+static void on_hist_changed(GObject *o, GParamSpec *p, gpointer u)
+{
+    DbgWin *w = u;
+    (void)o; (void)p;
+    w->h_seen[0] = w->h_seen[1] = (uint64_t)-1;
+    invalidate(w);
+}
+
+/* ---- moving tabs into windows of their own ---------------------------------- */
+
+static gboolean on_key(GtkEventControllerKey *c, guint keyval, guint keycode,
+                       GdkModifierType state, gpointer user_data);
+
+static void dock_tab(DbgWin *w, int tab, gboolean destroy)
+{
+    GtkWindow *win = w->detached[tab];
+    GtkWidget *page = w->pages[tab], *vbox;
+    int pos = 0, t;
+
+    if (!win)
+        return;
+    vbox = g_object_get_data(G_OBJECT(win), "vbox");
+    g_object_ref(page);
+    gtk_box_remove(GTK_BOX(vbox), page);
+    w->detached[tab] = NULL;
+    for (t = 0; t < tab; t++)   /* back where it was in the order */
+        if (!w->detached[t])
+            pos++;
+    gtk_notebook_insert_page(w->notebook, page, gtk_label_new(k_tab_names[tab]), pos);
+    g_object_unref(page);
+    gtk_notebook_set_current_page(w->notebook, pos);
+    if (destroy)
+        gtk_window_destroy(win);
+    invalidate(w);
+}
+
+static void on_dock_button(GtkButton *b, gpointer u)
+{
+    DbgWin *w = u;
+    dock_tab(w, GPOINTER_TO_INT(g_object_get_data(G_OBJECT(b), "tab")), TRUE);
+}
+
+static gboolean on_detached_close(GtkWindow *win, gpointer u)
+{
+    DbgWin *w = u;
+    dock_tab(w, GPOINTER_TO_INT(g_object_get_data(G_OBJECT(win), "tab")), FALSE);
+    return FALSE;   /* let it close */
+}
+
+static void pop_out_tab(DbgWin *w, int tab)
+{
+    GtkWidget *page, *vbox, *header, *dock;
+    GtkWindow *win;
+    GtkEventController *keys;
+    g_autofree char *title = NULL;
+
+    if (tab < 0 || w->detached[tab] || gtk_notebook_get_n_pages(w->notebook) <= 1)
+        return;   /* one tab always stays */
+    page = w->pages[tab];
+    g_object_ref(page);
+    gtk_notebook_remove_page(w->notebook, gtk_notebook_page_num(w->notebook, page));
+
+    win = GTK_WINDOW(adw_window_new());
+    title = g_strdup_printf("Intellivision Debugger \xe2\x80\x93 %s", k_tab_names[tab]);
+    gtk_window_set_title(win, title);
+    gtk_window_set_default_size(win, 760, 520);
+    header = adw_header_bar_new();
+    dock = gtk_button_new_with_label("Dock");
+    gtk_widget_set_tooltip_text(dock, "Put this tab back in the debugger");
+    g_object_set_data(G_OBJECT(dock), "tab", GINT_TO_POINTER(tab));
+    g_signal_connect(dock, "clicked", G_CALLBACK(on_dock_button), w);
+    adw_header_bar_pack_start(ADW_HEADER_BAR(header), dock);
+    vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_box_append(GTK_BOX(vbox), header);
+    gtk_box_append(GTK_BOX(vbox), page);
+    gtk_widget_set_vexpand(page, TRUE);
+    adw_window_set_content(ADW_WINDOW(win), vbox);
+    g_object_unref(page);
+    g_object_set_data(G_OBJECT(win), "vbox", vbox);
+    g_object_set_data(G_OBJECT(win), "tab", GINT_TO_POINTER(tab));
+    keys = gtk_event_controller_key_new();
+    g_signal_connect(keys, "key-pressed", G_CALLBACK(on_key), w);
+    gtk_widget_add_controller(GTK_WIDGET(win), keys);
+    g_signal_connect(win, "close-request", G_CALLBACK(on_detached_close), w);
+    w->detached[tab] = win;
+    gtk_window_present(win);
+    invalidate(w);
+}
+
+static void on_pop_out(GtkButton *b, gpointer u)
+{
+    DbgWin *w = u;
+    (void)b;
+    pop_out_tab(w, current_tab(w));
+}
+
 static void refresh_all(DbgWin *w)
 {
     int paused = intvdebug_is_paused(w->dbg);
@@ -1105,6 +1351,9 @@ static void refresh_all(DbgWin *w)
     refresh_symbols(w);
     bp_refresh(w);
     wt_rebuild(w);
+    cart_refresh(w);
+    hist_refresh(w, 0, FALSE);
+    hist_refresh(w, 1, FALSE);
     if (fuji_showing(w))
         refresh_fujinet(w, FALSE);
     w->was_paused = paused;
@@ -1135,6 +1384,10 @@ static gboolean tick_cb(GtkWidget *widget, GdkFrameClock *clock,
     }
     if (w->bas_scroll_line)
         basic_try_scroll(w);
+    if (tab_visible(w, TAB_TRACE) && g_get_monotonic_time() - w->h_at >= 400000) {
+        w->h_at = g_get_monotonic_time();   /* the live view moves while the machine runs */
+        hist_refresh(w, 0, FALSE);
+    }
     /* Paused with nothing pending: stop (this removes the callback). */
     if (intvdebug_is_paused(w->dbg) && w->kick <= 0) {
         w->tick_id = 0;
@@ -1483,19 +1736,22 @@ static void on_fuji_clear(GtkButton *b, gpointer u)
 /* Help's contexts (intvhelp.h), one per tab */
 static const char *const k_tab_contexts[] = {
     "debugger/cpu", "debugger/basic", "debugger/memory", "debugger/breakpoints",
-    "debugger/watches", "debugger/stic", "debugger/symbols", "debugger/fujinet",
+    "debugger/watches", "debugger/cart", "debugger/trace", "debugger/history", "debugger/stic",
+    "debugger/symbols", "debugger/fujinet",
 };
 
 static gboolean on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num,
                                gpointer user_data)
 {
     DbgWin *w = user_data;
+    const int tab = page_tab(page);
     (void)nb;
-    if (num < G_N_ELEMENTS(k_tab_contexts))
-        intv_help_set_context(w->win, k_tab_contexts[num]);
+    (void)num;
+    if (tab >= 0 && tab < (int)G_N_ELEMENTS(k_tab_contexts))
+        intv_help_set_context(w->win, k_tab_contexts[tab]);
     if (page == w->fuji_page)
         refresh_fujinet(w, FALSE);
-    if (num == TAB_BASIC)
+    if (tab == TAB_BASIC)
         kick(w);   /* the list has no height until it shows: scroll then */
     return FALSE;
 }
@@ -1549,6 +1805,16 @@ static gboolean on_closed(GtkWindow *window, gpointer user_data)
     /* Teardown re-selects notebook pages; nothing may call back into w. */
     if (w->tabs)
         g_signal_handlers_disconnect_by_data(w->tabs, w);
+    {
+        int t;   /* a peeled-off tab's window goes with the debugger */
+        for (t = 0; t < TAB_COUNT; t++)
+            if (w->detached[t]) {
+                GtkWindow *dw = w->detached[t];
+                g_signal_handlers_disconnect_by_data(dw, w);
+                w->detached[t] = NULL;
+                gtk_window_destroy(dw);
+            }
+    }
 
     if (w->tick_id) {
         gtk_widget_remove_tick_callback(GTK_WIDGET(w->win), w->tick_id);
@@ -1809,9 +2075,58 @@ static GtkWidget *build_watches(DbgWin *w)
     return box;
 }
 
+static GtkWidget *build_cart(DbgWin *w)
+{
+    GtkWidget *scroll = mono_view(&w->cart_text);
+    gtk_widget_set_margin_top(scroll, 6);
+    gtk_widget_set_margin_bottom(scroll, 6);
+    gtk_widget_set_margin_start(scroll, 6);
+    gtk_widget_set_margin_end(scroll, 6);
+    return scroll;
+}
+
+static GtkWidget *build_hist(DbgWin *w, int idx)
+{
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *scroll = mono_view(&w->h_text[idx]);
+    GtkWidget *clear = gtk_button_new_with_mnemonic("_Clear");
+    static const char *const filters[] = { "All instructions", "Branches only", "In range", NULL };
+
+    w->h_rec[idx] = GTK_TOGGLE_BUTTON(gtk_toggle_button_new_with_label("Record"));
+    gtk_widget_add_css_class(GTK_WIDGET(w->h_rec[idx]), "intv-toggle");
+    gtk_widget_set_tooltip_text(GTK_WIDGET(w->h_rec[idx]),
+                                "Record every instruction the CPU runs (the machine runs a little slower)");
+    g_signal_connect(w->h_rec[idx], "toggled", G_CALLBACK(on_hist_rec), w);
+    w->h_filter[idx] = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(filters));
+    g_signal_connect(w->h_filter[idx], "notify::selected", G_CALLBACK(on_hist_changed), w);
+    w->h_range[idx] = GTK_ENTRY(gtk_entry_new());
+    gtk_entry_set_placeholder_text(w->h_range[idx], "range: lo-hi or a symbol");
+    g_signal_connect(w->h_range[idx], "activate", G_CALLBACK(on_hist_changed), w);
+    g_signal_connect(clear, "clicked", G_CALLBACK(on_hist_clear), w);
+    w->h_note[idx] = GTK_LABEL(gtk_label_new(""));
+    gtk_widget_add_css_class(GTK_WIDGET(w->h_note[idx]), "dim-label");
+    gtk_widget_set_hexpand(GTK_WIDGET(w->h_note[idx]), TRUE);
+    gtk_label_set_xalign(w->h_note[idx], 1.0f);
+    gtk_text_view_set_wrap_mode(w->h_text[idx], GTK_WRAP_NONE);
+    w->h_seen[idx] = (uint64_t)-1;
+
+    gtk_box_append(GTK_BOX(bar), GTK_WIDGET(w->h_rec[idx]));
+    gtk_box_append(GTK_BOX(bar), GTK_WIDGET(w->h_filter[idx]));
+    gtk_box_append(GTK_BOX(bar), GTK_WIDGET(w->h_range[idx]));
+    gtk_box_append(GTK_BOX(bar), clear);
+    gtk_box_append(GTK_BOX(bar), GTK_WIDGET(w->h_note[idx]));
+    gtk_widget_set_margin_top(box, 6);
+    gtk_widget_set_margin_bottom(box, 6);
+    gtk_widget_set_margin_start(box, 6);
+    gtk_widget_set_margin_end(box, 6);
+    gtk_box_append(GTK_BOX(box), bar);
+    gtk_box_append(GTK_BOX(box), scroll);
+    return box;
+}
+
 /* The notebook's pages, in order; INTV_DEBUGGER_TAB picks one by number or
  * by the start of its name (any case), for tests and captures. */
-static const char *const k_tab_names[] = { "CPU", "BASIC", "Memory", "Breakpoints", "Watches", "STIC", "Symbols", "FujiNet" };
 
 static int tab_from_env(void)
 {
@@ -1906,6 +2221,10 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
                    tool_button("Clear S_ymbols",
                                "Drop loaded symbols, keeping the built-ins",
                                G_CALLBACK(on_clear_symbols), w));
+    gtk_box_append(GTK_BOX(bar),
+                   tool_button("Pop _Out",
+                               "Move the tab that shows into a window of its own; Dock puts it back",
+                               G_CALLBACK(on_pop_out), w));
 
     w->disasm = GTK_LIST_BOX(gtk_list_box_new());
     gtk_list_box_set_selection_mode(w->disasm, GTK_SELECTION_NONE);
@@ -2044,6 +2363,12 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
                              gtk_label_new(k_tab_names[TAB_BREAKS]));
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_watches(w),
                              gtk_label_new(k_tab_names[TAB_WATCHES]));
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_cart(w),
+                             gtk_label_new(k_tab_names[TAB_CART]));
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_hist(w, 0),
+                             gtk_label_new(k_tab_names[TAB_TRACE]));
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_hist(w, 1),
+                             gtk_label_new(k_tab_names[TAB_HISTORY]));
     {
         GtkWidget *outer_scroll = gtk_scrolled_window_new();
         gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(outer_scroll),
@@ -2087,6 +2412,14 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), w->fuji_page,
                              gtk_label_new(k_tab_names[TAB_FUJINET]));
     w->tabs = GTK_NOTEBOOK(notebook);
+    {
+        int i;   /* each page keeps its identity when it is moved around */
+        for (i = 0; i < TAB_COUNT; i++) {
+            GtkWidget *pg = gtk_notebook_get_nth_page(GTK_NOTEBOOK(notebook), i);
+            g_object_set_data(G_OBJECT(pg), "tab-index", GINT_TO_POINTER(i + 1));
+            w->pages[i] = pg;
+        }
+    }
     g_signal_connect(notebook, "switch-page", G_CALLBACK(on_switch_page), w);
     {
         int cur = gtk_notebook_get_current_page(GTK_NOTEBOOK(notebook));
@@ -2151,6 +2484,8 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
         if (mg && *mg && intvsym_parse_range(w->symtab, mg, &lo, &hi, NULL))
             show_in_memory(w, lo, hi);
     }
+    if (g_getenv("INTV_HISTORY"))   /* record from the start, for captures */
+        intvdebug_history_enable(w->dbg, 1);
 
     /* Engaging switches the CPU hook to the path that honours breakpoints
      * (see intvdebug.h). Pausing immediately is what a user opening a

@@ -49,6 +49,13 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.18.0" date="2026-11-09">
+      <description>
+        <p>
+          Debugger: a Cart tab with the cartridge's details and the memory map; Trace and History tabs that record every instruction the CPU runs, live while it runs or as the lead-up to a stop, with branch and range filters; and Pop Out, which moves any tab into a window of its own (Dock puts it back). The disassembly no longer repeats each instruction's address and opcode words.
+        </p>
+      </description>
+    </release>
     <release version="0.17.0" date="2026-11-09">
       <description>
         <p>

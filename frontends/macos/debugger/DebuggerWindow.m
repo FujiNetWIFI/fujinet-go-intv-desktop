@@ -74,8 +74,10 @@ static DebuggerWindow *g_debugger;
 
 /* The tabs, in order; INTV_DEBUGGER_TAB picks one by number or by the start
  * of its name (any case), for tests and captures. */
-static const char *const kTabNames[] = {"CPU", "BASIC", "Memory", "Breakpoints", "Watches", "STIC", "Symbols", "FujiNet"};
+static const char *const kTabNames[] = {"CPU", "BASIC", "Memory", "Breakpoints", "Watches", "Cart", "Trace", "History", "STIC", "Symbols", "FujiNet"};
 #define TAB_COUNT ((int)(sizeof(kTabNames) / sizeof(kTabNames[0])))
+enum { MT_CPU, MT_BASIC, MT_MEMORY, MT_BREAKS, MT_WATCHES, MT_CART, MT_TRACE, MT_HISTORY, MT_STIC, MT_SYMBOLS,
+       MT_FUJINET };
 
 static int tabFromEnv(void)
 {
@@ -218,6 +220,19 @@ static int tabFromEnv(void)
     NSTextField *_srchEntry;
     NSTextField *_srchNote;
 
+    /* Cart tab; Trace (0, live) and History (1, when stopped) share one ring */
+    NSTextView *_cartText;
+    NSButton *_hRec[2];
+    NSPopUpButton *_hFilter[2];
+    NSTextField *_hRange[2], *_hNote[2];
+    NSTextView *_hText[2];
+    uint64_t _hSeen[2];
+    int _hTicks;
+
+    /* Tabs peeled off into windows of their own */
+    NSTabViewItem *_items[16];
+    NSWindow *_popped[16];
+
     /* Breakpoints tab */
     NSPopUpButton *_bpType, *_bpCond;
     NSTextField *_bpAddr, *_bpValue, *_bpStop;
@@ -356,6 +371,8 @@ static void setAttrText(NSTextView *view, NSAttributedString *text)
         intvdebug_pause(g_debugger->_dbg);
     }
     [g_debugger->_window makeKeyAndOrderFront:nil];
+    for (int t = 0; t < TAB_COUNT; t++)
+        [g_debugger->_popped[t] orderFront:nil];
 }
 
 - (instancetype)initWithSession:(intvsession *)session
@@ -371,6 +388,7 @@ static void setAttrText(NSTextView *view, NSAttributedString *text)
     _symFilterText = @"";
     _scratch = calloc(1, STIC_SCRATCH_BYTES);
     _fujiCount = -1;
+    _hSeen[0] = _hSeen[1] = (uint64_t)-1;
     [self buildWindow];
 
     /* For captures and tests, like INTV_DEBUGGER_TAB: INTV_BASIC_IMPORT=<.bas
@@ -393,6 +411,9 @@ static void setAttrText(NSTextView *view, NSAttributedString *text)
             }
         }
     }
+
+    if (getenv("INTV_HISTORY"))   /* record from the start, for captures */
+        intvdebug_history_enable(_dbg, 1);
 
     /* Engaging switches the CPU hook to the path that honours breakpoints
      * (see intvdebug.h). Pausing immediately is what a user opening a
@@ -419,6 +440,9 @@ static void setAttrText(NSTextView *view, NSAttributedString *text)
         _seenSerial = serial;
         _wasPaused = paused;
         [self refreshAll:paused];
+    } else if (_window.visible && [self tabVisible:MT_TRACE] && ++_hTicks >= 4) {
+        _hTicks = 0;   /* the live view moves while the machine runs */
+        [self refreshHist:0 force:NO];
     } else if (_window.visible && [self fujiShowing] &&
                ++_fujiTicks >= FUJI_TICKS) {
         /* the one view that moves while the machine runs */
@@ -862,9 +886,11 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
 
     NSButton *helpBtn = IntvHelpButton(nil);
     [helpBtn setRefusesFirstResponder:YES];
+    NSButton *popOutBtn = [self button:@"Pop Out" action:@selector(popOutCurrent:)];
+    popOutBtn.toolTip = @"Move the tab that shows into a window of its own; Dock puts it back";
     NSStackView *toolbar = [NSStackView stackViewWithViews:@[
         _runBtn, stepBtn, stepOverBtn, stepOutBtn, clearBpBtn, loadSymsBtn,
-        clearSymsBtn, _status, helpBtn
+        clearSymsBtn, popOutBtn, _status, helpBtn
     ]];
     toolbar.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     toolbar.spacing = 8;
@@ -885,25 +911,43 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     NSTabViewItem *wtTab = [[NSTabViewItem alloc] initWithIdentifier:@"watches"];
     wtTab.label = @(kTabNames[4]);
     wtTab.view = [self buildWatchesTab];
+    NSTabViewItem *cartTab = [[NSTabViewItem alloc] initWithIdentifier:@"cart"];
+    cartTab.label = @(kTabNames[5]);
+    cartTab.view = [self buildCartTab];
+    NSTabViewItem *traceTab = [[NSTabViewItem alloc] initWithIdentifier:@"trace"];
+    traceTab.label = @(kTabNames[6]);
+    traceTab.view = [self buildHistTab:0];
+    NSTabViewItem *histTab = [[NSTabViewItem alloc] initWithIdentifier:@"history"];
+    histTab.label = @(kTabNames[7]);
+    histTab.view = [self buildHistTab:1];
     NSTabViewItem *sticTab =
         [[NSTabViewItem alloc] initWithIdentifier:@"stic"];
-    sticTab.label = @(kTabNames[5]);
+    sticTab.label = @(kTabNames[8]);
     sticTab.view = [self buildSticTab];
     NSTabViewItem *symTab =
         [[NSTabViewItem alloc] initWithIdentifier:@"symbols"];
-    symTab.label = @(kTabNames[6]);
+    symTab.label = @(kTabNames[9]);
     symTab.view = [self buildSymbolsTab];
     _fujiItem = [[NSTabViewItem alloc] initWithIdentifier:@"fujinet"];
-    _fujiItem.label = @(kTabNames[7]);
+    _fujiItem.label = @(kTabNames[10]);
     _fujiItem.view = [self buildFujinetTab];
     [tabs addTabViewItem:cpuTab];
     [tabs addTabViewItem:_basicItem];
     [tabs addTabViewItem:memTab];
     [tabs addTabViewItem:bpTab];
     [tabs addTabViewItem:wtTab];
+    [tabs addTabViewItem:cartTab];
+    [tabs addTabViewItem:traceTab];
+    [tabs addTabViewItem:histTab];
     [tabs addTabViewItem:sticTab];
     [tabs addTabViewItem:symTab];
     [tabs addTabViewItem:_fujiItem];
+    {
+        NSTabViewItem *all[] = { cpuTab, _basicItem, memTab, bpTab, wtTab, cartTab, traceTab, histTab,
+                                 sticTab, symTab, _fujiItem };
+        for (int i = 0; i < TAB_COUNT; i++)   /* each keeps its place when moved around */
+            _items[i] = all[i];
+    }
     _tabs = tabs;
     tabs.delegate = self;
     if (tabFromEnv() >= 0)
@@ -947,7 +991,7 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
 /* On the BASIC tab the three steppers go by BASIC line. */
 - (BOOL)basicShowing
 {
-    return _tabs.selectedTabViewItem == _basicItem;
+    return _tabs.selectedTabViewItem == _basicItem || _popped[MT_BASIC].isKeyWindow;
 }
 
 - (void)step:(id)sender
@@ -1137,9 +1181,15 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
  * instruction-hooked path forever with the window merely hidden. */
 - (BOOL)windowShouldClose:(NSWindow *)sender
 {
-    (void)sender;
+    for (int t = 0; t < TAB_COUNT; t++)
+        if (sender == _popped[t]) {   /* closing a peeled-off tab's window docks it */
+            [self dockTab:t];
+            return NO;
+        }
     intvdebug_set_engaged(_dbg, 0);
     [_window orderOut:nil];
+    for (int t = 0; t < TAB_COUNT; t++)
+        [_popped[t] orderOut:nil];
     return NO;
 }
 
@@ -1654,6 +1704,216 @@ static PickTextView *makePickView(NSScrollView **scrollOut)
 - (void)searchNext:(id)sender { (void)sender; [self searchBackward:NO]; }
 - (void)searchPrev:(id)sender { (void)sender; [self searchBackward:YES]; }
 
+/* ---- Cart, Trace and History tabs, and peeling tabs off ------------------------- */
+
+/* On screen: the tab view's selected page, or a window of its own. */
+- (BOOL)tabVisible:(int)tab
+{
+    return _popped[tab] != nil || _tabs.selectedTabViewItem == _items[tab];
+}
+
+- (NSView *)buildCartTab
+{
+    NSScrollView *scroll;
+    _cartText = monoView(&scroll);
+    NSStackView *root = [NSStackView stackViewWithViews:@[ scroll ]];
+    root.orientation = NSUserInterfaceLayoutOrientationVertical;
+    root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
+    [scroll.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    return root;
+}
+
+- (void)refreshCart
+{
+    intvdebug_cart cart;
+    intvdebug_region reg[64];
+    NSMutableString *t = [NSMutableString string];
+
+    intvdebug_cart_info(_dbg, &cart);
+    [t appendString:@"Cartridge\n"];
+    [t appendFormat:@"  File     %s\n", cart.path[0] ? cart.path : "(none)"];
+    if (cart.name[0])
+        [t appendFormat:@"  Title    %s%@\n", cart.name, cart.year ? [NSString stringWithFormat:@", %d", cart.year] : @""];
+    [t appendFormat:@"  FujiNet  %s\n", cart.fujinet_mailbox ? "mailbox mapped at $9C00" : "no mailbox"];
+    [t appendFormat:@"  ECS      %s\n", cart.ecs ? "present" : "no"];
+    [t appendFormat:@"  JLP      %s\n", cart.jlp ? "present" : "no"];
+    [t appendString:@"\nMemory map\n"];
+    const int n = intvdebug_memory_map(_dbg, reg, 64);
+    if (!n)
+        [t appendString:@"  Pause the machine to read its memory map.\n"];
+    for (int i = 0; i < n; i++)
+        [t appendFormat:@"  %04X-%04X  %c%c  %s\n", reg[i].lo, reg[i].hi, reg[i].readable ? 'r' : '-',
+                        reg[i].writable ? 'w' : '-', reg[i].name];
+    setText(_cartText, t, NO);
+}
+
+- (NSView *)buildHistTab:(int)idx
+{
+    _hRec[idx] = [self button:@"Record" action:@selector(histRec:)];
+    [_hRec[idx] setButtonType:NSButtonTypePushOnPushOff];
+    _hRec[idx].toolTip = @"Record every instruction the CPU runs (the machine runs a little slower)";
+    _hFilter[idx] = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    [_hFilter[idx] addItemsWithTitles:@[ @"All instructions", @"Branches only", @"In range" ]];
+    _hFilter[idx].target = self;
+    _hFilter[idx].action = @selector(histChanged:);
+    _hRange[idx] = [[NSTextField alloc] init];
+    _hRange[idx].placeholderString = @"range: lo-hi or a symbol";
+    _hRange[idx].target = self;
+    _hRange[idx].action = @selector(histChanged:);
+    _hNote[idx] = [self label:@""];
+    _hNote[idx].textColor = NSColor.secondaryLabelColor;
+    NSStackView *bar = [NSStackView stackViewWithViews:@[
+        _hRec[idx], _hFilter[idx], _hRange[idx], [self button:@"Clear" action:@selector(histClear:)], _hNote[idx]
+    ]];
+    bar.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    NSScrollView *scroll;
+    _hText[idx] = monoView(&scroll);
+    NSStackView *root = [NSStackView stackViewWithViews:@[ bar, scroll ]];
+    root.orientation = NSUserInterfaceLayoutOrientationVertical;
+    root.alignment = NSLayoutAttributeLeading;
+    root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
+    [bar.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    [scroll.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    return root;
+}
+
+- (void)histRec:(id)sender
+{
+    intvdebug_history_enable(_dbg, ((NSButton *)sender).state == NSControlStateValueOn);
+    _seenSerial = 0;
+}
+
+- (void)histChanged:(id)sender
+{
+    (void)sender;
+    _hSeen[0] = _hSeen[1] = (uint64_t)-1;
+    _seenSerial = 0;
+}
+
+- (void)histClear:(id)sender
+{
+    (void)sender;
+    intvdebug_history_clear(_dbg);
+    _hSeen[0] = _hSeen[1] = (uint64_t)-1;
+    _seenSerial = 0;
+}
+
+- (void)refreshHist:(int)idx force:(BOOL)force
+{
+    static intvdebug_hist buf[4000];
+    const int kShown = 400;
+    const BOOL live = idx == 0;
+    const BOOL paused = intvdebug_is_paused(_dbg);
+    const BOOL on = intvdebug_history_enabled(_dbg);
+    const uint64_t count = intvdebug_history_count(_dbg);
+    uint16_t lo = 0, hi = 0xFFFF;
+    int filter = 0;
+
+    for (int k = 0; k < 2; k++) {   /* both Record buttons follow the engine */
+        _hRec[k].state = on ? NSControlStateValueOn : NSControlStateValueOff;
+        _hRec[k].bezelColor = on ? accentColor() : nil;
+        _hRec[k].contentTintColor = on ? NSColor.whiteColor : nil;
+    }
+    if (!force && count == _hSeen[idx] && (live || paused))
+        return;
+    _hSeen[idx] = count;
+    if (!live && !paused) {
+        _hNote[idx].stringValue = @"Pause the machine to read its history.";
+        return;
+    }
+    switch (_hFilter[idx].indexOfSelectedItem) {
+    case 1: filter = INTVDEBUG_HIST_BRANCHES; break;
+    case 2:
+        if (intvsym_parse_range(_symtab, _hRange[idx].stringValue.UTF8String, &lo, &hi, NULL))
+            filter = INTVDEBUG_HIST_RANGE;
+        break;
+    }
+    const int n = intvdebug_history_copy(_dbg, buf, 4000);
+    int hit[400], shown = 0;
+    for (int i = n - 1; i >= 0 && shown < kShown; i--)   /* the newest matches, scanning back */
+        if (intvdebug_history_match(&buf[i], filter, lo, hi))
+            hit[shown++] = i;
+    NSMutableString *t = [NSMutableString string];
+    if (!on && n == 0)
+        [t appendString:@"History is off. Press Record, then let the machine run."];
+    for (int k = shown - 1; k >= 0; k--) {   /* oldest first */
+        char line[256];
+        intvdebug_history_format(&buf[hit[k]], line, sizeof(line));
+        [t appendFormat:@"%s\n", line];
+    }
+    setText(_hText[idx], t, YES);
+    _hNote[idx].stringValue = [NSString stringWithFormat:@"%@%llu instructions recorded, last %d shown",
+                                                          on ? @"Recording. " : @"", (unsigned long long)count, shown];
+}
+
+- (void)popOutCurrent:(id)sender
+{
+    (void)sender;
+    for (int t = 0; t < TAB_COUNT; t++)
+        if (_tabs.selectedTabViewItem == _items[t]) {
+            [self popOutTab:t];
+            return;
+        }
+}
+
+- (void)popOutTab:(int)tab
+{
+    if (_popped[tab] || _tabs.numberOfTabViewItems <= 1)   /* one tab always stays */
+        return;
+    NSTabViewItem *item = _items[tab];
+    NSView *view = item.view;
+    [_tabs removeTabViewItem:item];
+
+    NSWindow *win = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(0, 0, 820, 580)
+                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable |
+                            NSWindowStyleMaskMiniaturizable
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    win.title = [NSString stringWithFormat:@"Intellivision Debugger – %s", kTabNames[tab]];
+    win.releasedWhenClosed = NO;
+    win.delegate = self;
+    NSButton *dockBtn = [self button:@"Dock" action:@selector(dockButton:)];
+    dockBtn.tag = tab;
+    dockBtn.toolTip = @"Put this tab back in the debugger";
+    NSStackView *root = [NSStackView stackViewWithViews:@[ dockBtn, view ]];
+    root.orientation = NSUserInterfaceLayoutOrientationVertical;
+    root.alignment = NSLayoutAttributeLeading;
+    root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
+    [view.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    win.contentView = root;
+    _popped[tab] = win;
+    [win center];
+    [win makeKeyAndOrderFront:nil];
+    _seenSerial = 0;
+}
+
+- (void)dockButton:(id)sender
+{
+    [self dockTab:(int)((NSButton *)sender).tag];
+}
+
+- (void)dockTab:(int)tab
+{
+    NSWindow *win = _popped[tab];
+    if (!win)
+        return;
+    NSTabViewItem *item = _items[tab];
+    NSView *view = item.view;
+    int pos = 0;
+    _popped[tab] = nil;
+    [view removeFromSuperview];
+    item.view = view;
+    for (int t = 0; t < tab; t++)   /* back where it was in the order */
+        if (!_popped[t])
+            pos++;
+    [_tabs insertTabViewItem:item atIndex:pos];
+    [_tabs selectTabViewItem:item];
+    win.delegate = nil;
+    [win close];
+    _seenSerial = 0;
+}
+
 - (void)refreshAll:(BOOL)paused
 {
     _runBtn.title = paused ? @"Continue (F5)" : @"Pause (F5)";
@@ -1685,13 +1945,16 @@ static PickTextView *makePickView(NSScrollView **scrollOut)
     [self refreshBasic:paused];
     [self refreshBreaks];
     [self refreshWatches];
+    [self refreshCart];
+    [self refreshHist:0 force:NO];
+    [self refreshHist:1 force:NO];
     if ([self fujiShowing])
         [self refreshFujinet:NO];
 }
 
 - (BOOL)fujiShowing
 {
-    return _tabs.selectedTabViewItem == _fujiItem;
+    return [self tabVisible:MT_FUJINET];
 }
 
 - (void)refreshFujinet:(BOOL)force

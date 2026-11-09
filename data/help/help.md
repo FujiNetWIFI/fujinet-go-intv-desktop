@@ -360,7 +360,7 @@ controls that differ from the defaults).
 # Debugger
 
 The Debugger (<kbd>F12</kbd>) stops the console and shows what it is doing.
-It has eight tabs; closing it lets the console go on as it was.
+It has eleven tabs; closing it lets the console go on as it was.
 
 | Button | Does |
 |---|---|
@@ -372,6 +372,7 @@ It has eight tabs; closing it lets the console go on as it was.
 | Break at | A symbol name or hex address, then Enter |
 | Load Symbols | Reads an `as1600 -s` symbol file |
 | Clear Symbols | Drops loaded symbols, keeping the built-ins |
+| Pop Out | Moves the tab that shows into a window of its own; **Dock** in that window puts it back |
 | Help | Opens the topic of the tab that shows |
 
 <!-- context: debugger/cpu -->
@@ -441,6 +442,31 @@ stopped. Type an address, a symbol, an IntyBASIC variable (`x`, `#score`,
 `a(3)`) or a range after **Watch** and press Enter. **Show in Memory** jumps to
 it in the Memory tab, and **Break on Change** adds a Write breakpoint that
 fires when its value changes.
+
+<!-- context: debugger/cart -->
+## Cart
+
+The cartridge that is running (its file, its title if it carries one, and
+whether the FujiNet mailbox, the ECS and the JLP are in play) and the memory
+map: every range the machine answers in, whether it is readable and writable,
+and what answers there (STIC, PSG, the EXEC ROM, your cartridge, the FujiNet
+mailbox). Stop the machine to read the map.
+
+<!-- context: debugger/trace -->
+## Trace
+
+Every instruction the CPU runs, live, as the machine runs. **Record** turns it
+on: from then on each instruction is kept, with its address, the registers
+after it and the flags (the machine runs a little slower while it records).
+**Branches only** shows just the branches, jumps and calls, and **In range**
+the instructions in a range (`lo-hi` or a symbol). **Clear** empties it.
+
+<!-- context: debugger/history -->
+## History
+
+The same record as the Trace tab, shown when the machine stops: what it did
+just before it hit a breakpoint or a watch. It is the instructions leading up
+to the stop, newest at the bottom.
 
 <!-- context: debugger/stic -->
 ## STIC

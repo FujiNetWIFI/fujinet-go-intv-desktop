@@ -64,6 +64,8 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <functional>
+#include <QCloseEvent>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -81,14 +83,15 @@ constexpr int kFujiTicks = 15;      /* the FujiNet tab, 500 ms at 33 ms */
 
 /* The tabs, in order; INTV_DEBUGGER_TAB picks one by number or by the start
  * of its name (any case), for tests and captures. */
-const char *const kTabNames[] = {"CPU", "BASIC", "Memory", "Breakpoints", "Watches", "STIC", "Symbols", "FujiNet"};
-enum { kTabCpu, kTabBasic, kTabMemory, kTabBreaks, kTabWatches, kTabStic, kTabSymbols, kTabFujinet };
+const char *const kTabNames[] = {"CPU", "BASIC", "Memory", "Breakpoints", "Watches", "Cart", "Trace", "History", "STIC", "Symbols", "FujiNet"};
+enum { kTabCpu, kTabBasic, kTabMemory, kTabBreaks, kTabWatches, kTabCart, kTabTrace, kTabHistory,
+       kTabStic, kTabSymbols, kTabFujinet };
 enum { kPickFile, kPickFolder, kPickMap };
 constexpr int kTabCount = int(sizeof(kTabNames) / sizeof(kTabNames[0]));
 
-int tabFromEnv()
+int tabFromEnv(const char *var = "INTV_DEBUGGER_TAB")
 {
-    const char *tab = std::getenv("INTV_DEBUGGER_TAB");
+    const char *tab = std::getenv(var);
     if (!tab || !*tab)
         return -1;
     char *end;
@@ -230,6 +233,8 @@ DebuggerWindow::DebuggerWindow(QWidget *parent, intvsession *session)
     buildUi();
     if (tabFromEnv() >= 0)
         m_tabs->setCurrentIndex(tabFromEnv());
+    if (tabFromEnv("INTV_POPOUT") >= 0)   /* for captures: peel a tab off at the start */
+        popOut(tabFromEnv("INTV_POPOUT"));
 
     /* For captures and tests, like INTV_DEBUGGER_TAB: INTV_BASIC_IMPORT=<.bas
      * file or folder> imports it as Import File / Import Folder would, and
@@ -269,6 +274,8 @@ DebuggerWindow::DebuggerWindow(QWidget *parent, intvsession *session)
         if (mg && *mg && intvsym_parse_range(m_symtab, mg, &lo, &hi, nullptr))
             showInMemory(lo, hi);
     }
+    if (std::getenv("INTV_HISTORY"))   /* record from the start, for captures */
+        intvdebug_history_enable(m_dbg, 1);
 
     /* Engaging switches the CPU hook to the path that honours breakpoints
      * (see intvdebug.h). Pausing immediately is what a user opening a
@@ -283,6 +290,9 @@ DebuggerWindow::DebuggerWindow(QWidget *parent, intvsession *session)
             intvdebug_is_paused(m_dbg) != m_wasPaused) {
             m_seenSerial = serial;
             refreshAll();
+        } else if (tabVisible(kTabTrace) && ++m_hTicks >= 12) {
+            m_hTicks = 0;   /* the live view moves while the machine runs */
+            refreshHist(0, false);
         } else if (fujiShowing() && ++m_fujiTicks >= kFujiTicks) {
             /* the one view that moves while the machine runs */
             refreshFujinet(false);
@@ -306,6 +316,13 @@ void DebuggerWindow::hideEvent(QHideEvent *e)
 
 DebuggerWindow::~DebuggerWindow()
 {
+    m_closing = true;   /* a peeled-off tab's window goes with the debugger */
+    for (QWidget *&win : m_popped)
+        if (win) {
+            QWidget *w = win;
+            win = nullptr;
+            w->close();
+        }
     /* Releasing costs the machine nothing further (see intvdebug.h) and
      * leaving it engaged+paused would look like the emulator had hung. */
     intvdebug_set_engaged(m_dbg, 0);
@@ -361,6 +378,10 @@ void DebuggerWindow::buildUi()
     connect(clearSyms, &QPushButton::clicked, this,
             &DebuggerWindow::clearSymbols);
     tb->addWidget(clearSyms);
+    auto *popOutBtn = new QPushButton(QStringLiteral("Pop Out"));
+    popOutBtn->setToolTip(QStringLiteral("Move the tab that shows into a window of its own; Dock puts it back"));
+    connect(popOutBtn, &QPushButton::clicked, this, [this] { popOut(currentTab()); });
+    tb->addWidget(popOutBtn);
 
     m_status = new QLabel(QStringLiteral("Running"));
     m_status->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
@@ -436,6 +457,9 @@ void DebuggerWindow::buildUi()
     tabs->addTab(memTab, QLatin1String(kTabNames[kTabMemory]));
     tabs->addTab(buildBreaks(), QLatin1String(kTabNames[kTabBreaks]));
     tabs->addTab(buildWatches(), QLatin1String(kTabNames[kTabWatches]));
+    tabs->addTab(buildCart(), QLatin1String(kTabNames[kTabCart]));
+    tabs->addTab(buildHist(0), QLatin1String(kTabNames[kTabTrace]));
+    tabs->addTab(buildHist(1), QLatin1String(kTabNames[kTabHistory]));
 
     /* ---- STIC tab ---- */
     auto *stic = new QWidget;
@@ -536,15 +560,20 @@ void DebuggerWindow::buildUi()
 
     m_fujiPage = buildFujinet();
     tabs->addTab(m_fujiPage, QLatin1String(kTabNames[kTabFujinet]));
+    for (int i = 0; i < kTabCount; i++) {   /* each page keeps its identity */
+        QWidget *pg = tabs->widget(i);
+        pg->setProperty("tab", i);
+        m_pages[i] = pg;
+    }
     /* Help's contexts (intvhelp.h), one per tab */
     {
-        static const char *const kHelpTabs[] = { "cpu", "basic", "memory", "breakpoints", "watches", "stic", "symbols", "fujinet" };
+        static const char *const kHelpTabs[] = { "cpu", "basic", "memory", "breakpoints", "watches", "cart", "trace", "history", "stic", "symbols", "fujinet" };
         auto setHelpContext = [this](int page) {
             if (page >= 0 && page < kTabCount)
                 setProperty("intvHelpContext", QStringLiteral("debugger/%1").arg(QLatin1String(kHelpTabs[page])));
         };
-        setHelpContext(tabs->currentIndex());
-        connect(tabs, &QTabWidget::currentChanged, this, setHelpContext);
+        setHelpContext(currentTab());
+        connect(tabs, &QTabWidget::currentChanged, this, [this, setHelpContext](int) { setHelpContext(currentTab()); });
     }
     connect(tabs, &QTabWidget::currentChanged, this, [this] {
         if (fujiShowing())
@@ -556,9 +585,24 @@ void DebuggerWindow::buildUi()
 
 /* ---- BASIC tab ----------------------------------------------------------- */
 
+/* A page's place in the tab widget is not its identity once tabs can be
+ * moved into windows of their own: each carries its original index. */
+int DebuggerWindow::currentTab() const
+{
+    QWidget *w = m_tabs->currentWidget();
+    return w ? w->property("tab").toInt() : -1;
+}
+
+/* On screen: the tab widget's page, or a window of its own. */
+bool DebuggerWindow::tabVisible(int tab) const
+{
+    return currentTab() == tab || m_popped[tab] != nullptr;
+}
+
 bool DebuggerWindow::basicTab() const
 {
-    return m_tabs->currentIndex() == kTabBasic;
+    return currentTab() == kTabBasic ||
+           (m_popped[kTabBasic] && m_popped[kTabBasic]->isActiveWindow());
 }
 
 /* On the BASIC tab the three steppers go by BASIC line. */
@@ -769,7 +813,10 @@ QWidget *DebuggerWindow::buildWatches()
     connect(mem, &QPushButton::clicked, this, [this] {
         uint16_t lo, hi;
         if (m_wtList->currentRow() >= 0 && intvwatch_range(m_symtab, m_wtList->currentRow(), &lo, &hi)) {
-            m_tabs->setCurrentIndex(kTabMemory);
+            if (m_popped[kTabMemory])
+                m_popped[kTabMemory]->activateWindow();
+            else
+                m_tabs->setCurrentWidget(m_pages[kTabMemory]);
             showInMemory(lo, hi);
         }
     });
@@ -873,6 +920,203 @@ void DebuggerWindow::search(bool backward)
     } else {
         m_srchNote->setText(QStringLiteral("Not found."));
     }
+}
+/* ---- Cart, Trace and History tabs, and peeling tabs off -------------------- */
+
+QWidget *DebuggerWindow::buildCart()
+{
+    m_cartText = monoView();
+    return m_cartText;
+}
+
+void DebuggerWindow::refreshCart()
+{
+    intvdebug_cart cart;
+    intvdebug_region reg[64];
+    QString t;
+
+    intvdebug_cart_info(m_dbg, &cart);
+    t += QStringLiteral("Cartridge\n");
+    t += QStringLiteral("  File     %1\n").arg(cart.path[0] ? QString::fromUtf8(cart.path) : QStringLiteral("(none)"));
+    if (cart.name[0])
+        t += QStringLiteral("  Title    %1%2\n").arg(QString::fromUtf8(cart.name),
+                                                      cart.year ? QStringLiteral(", %1").arg(cart.year) : QString());
+    t += QStringLiteral("  FujiNet  %1\n").arg(cart.fujinet_mailbox ? QStringLiteral("mailbox mapped at $9C00")
+                                                                    : QStringLiteral("no mailbox"));
+    t += QStringLiteral("  ECS      %1\n").arg(cart.ecs ? QStringLiteral("present") : QStringLiteral("no"));
+    t += QStringLiteral("  JLP      %1\n").arg(cart.jlp ? QStringLiteral("present") : QStringLiteral("no"));
+    t += QStringLiteral("\nMemory map\n");
+    const int n = intvdebug_memory_map(m_dbg, reg, 64);
+    if (!n)
+        t += QStringLiteral("  Pause the machine to read its memory map.\n");
+    for (int i = 0; i < n; i++)
+        t += QStringLiteral("  %1-%2  %3%4  %5\n")
+                 .arg(hex(reg[i].lo, 4), hex(reg[i].hi, 4))
+                 .arg(reg[i].readable ? QLatin1Char('r') : QLatin1Char('-'))
+                 .arg(reg[i].writable ? QLatin1Char('w') : QLatin1Char('-'))
+                 .arg(QString::fromUtf8(reg[i].name));
+    setText(m_cartText, t);
+}
+
+QWidget *DebuggerWindow::buildHist(int idx)
+{
+    auto *page = new QWidget;
+    auto *layout = new QVBoxLayout(page);
+    auto *bar = new QHBoxLayout;
+
+    m_hRec[idx] = new QPushButton(QStringLiteral("Record"));
+    m_hRec[idx]->setCheckable(true);   /* the accent while on: the app's :checked style */
+    m_hRec[idx]->setToolTip(QStringLiteral("Record every instruction the CPU runs (the machine runs a little slower)"));
+    connect(m_hRec[idx], &QPushButton::toggled, this, [this](bool on) {
+        if (m_hSync)
+            return;
+        intvdebug_history_enable(m_dbg, on);
+        m_seenSerial = 0;
+    });
+    m_hFilter[idx] = new QComboBox;
+    m_hFilter[idx]->addItems({QStringLiteral("All instructions"), QStringLiteral("Branches only"),
+                              QStringLiteral("In range")});
+    m_hRange[idx] = new QLineEdit;
+    m_hRange[idx]->setPlaceholderText(QStringLiteral("range: lo-hi or a symbol"));
+    auto changed = [this] {
+        m_hSeen[0] = m_hSeen[1] = ~0ull;
+        m_seenSerial = 0;
+    };
+    connect(m_hFilter[idx], QOverload<int>::of(&QComboBox::currentIndexChanged), this, changed);
+    connect(m_hRange[idx], &QLineEdit::returnPressed, this, changed);
+    auto *clear = new QPushButton(QStringLiteral("Clear"));
+    connect(clear, &QPushButton::clicked, this, [this] {
+        intvdebug_history_clear(m_dbg);
+        m_hSeen[0] = m_hSeen[1] = ~0ull;
+        m_seenSerial = 0;
+    });
+    m_hNote[idx] = new QLabel;
+    m_hNote[idx]->setEnabled(false);
+    m_hNote[idx]->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    bar->addWidget(m_hRec[idx]);
+    bar->addWidget(m_hFilter[idx]);
+    bar->addWidget(m_hRange[idx], 1);
+    bar->addWidget(clear);
+    bar->addWidget(m_hNote[idx], 1);
+    layout->addLayout(bar);
+    m_hText[idx] = monoView();
+    layout->addWidget(m_hText[idx], 1);
+    return page;
+}
+
+void DebuggerWindow::refreshHist(int idx, bool force)
+{
+    static intvdebug_hist buf[4000];
+    constexpr int kShown = 400;
+    const bool live = idx == 0;
+    const bool paused = intvdebug_is_paused(m_dbg);
+    const bool on = intvdebug_history_enabled(m_dbg);
+    const uint64_t count = intvdebug_history_count(m_dbg);
+    uint16_t lo = 0, hi = 0xFFFF;
+    int filter = 0;
+
+    m_hSync = true;   /* the two Record buttons follow the engine */
+    m_hRec[0]->setChecked(on);
+    m_hRec[1]->setChecked(on);
+    m_hSync = false;
+
+    if (!force && count == m_hSeen[idx] && (live || paused))
+        return;
+    m_hSeen[idx] = count;
+    if (!live && !paused) {
+        m_hNote[idx]->setText(QStringLiteral("Pause the machine to read its history."));
+        return;
+    }
+    switch (m_hFilter[idx]->currentIndex()) {
+    case 1: filter = INTVDEBUG_HIST_BRANCHES; break;
+    case 2:
+        if (intvsym_parse_range(m_symtab, m_hRange[idx]->text().toUtf8().constData(), &lo, &hi, nullptr))
+            filter = INTVDEBUG_HIST_RANGE;
+        break;
+    }
+    const int n = intvdebug_history_copy(m_dbg, buf, 4000);
+    QList<int> hit;
+    for (int i = n - 1; i >= 0 && hit.size() < kShown; i--)   /* the newest matches, scanning back */
+        if (intvdebug_history_match(&buf[i], filter, lo, hi))
+            hit.append(i);
+    QString t;
+    if (!on && n == 0)
+        t = QStringLiteral("History is off. Press Record, then let the machine run.");
+    for (int k = hit.size() - 1; k >= 0; k--) {   /* oldest first */
+        char line[256];
+        intvdebug_history_format(&buf[hit[k]], line, sizeof(line));
+        t += QString::fromUtf8(line);
+        t += QLatin1Char('\n');
+    }
+    setText(m_hText[idx], t, true);
+    m_hNote[idx]->setText(QStringLiteral("%1%2 instructions recorded, last %3 shown")
+                              .arg(on ? QStringLiteral("Recording. ") : QString()).arg(count).arg(hit.size()));
+}
+
+namespace {
+/* A tab's window: closing it docks the tab again. */
+class PopWindow : public QWidget {
+public:
+    std::function<void()> onClose;
+protected:
+    void closeEvent(QCloseEvent *e) override
+    {
+        if (onClose)
+            onClose();
+        QWidget::closeEvent(e);
+    }
+};
+} // namespace
+
+void DebuggerWindow::popOut(int tab)
+{
+    if (tab < 0 || tab >= kTabCount || m_popped[tab] || m_tabs->count() <= 1)
+        return;   /* one tab always stays */
+    QWidget *page = m_pages[tab];
+    m_tabs->removeTab(m_tabs->indexOf(page));
+
+    auto *win = new PopWindow;
+    win->setAttribute(Qt::WA_DeleteOnClose);
+    win->setWindowTitle(QStringLiteral("Intellivision Debugger – %1").arg(QLatin1String(kTabNames[tab])));
+    auto *layout = new QVBoxLayout(win);
+    auto *bar = new QHBoxLayout;
+    auto *dockBtn = new QPushButton(QStringLiteral("Dock"));
+    dockBtn->setToolTip(QStringLiteral("Put this tab back in the debugger"));
+    bar->addWidget(dockBtn);
+    bar->addStretch();
+    layout->addLayout(bar);
+    layout->addWidget(page, 1);
+    page->show();
+    win->resize(760, 520);
+    m_popped[tab] = win;
+    win->onClose = [this, tab] {
+        if (!m_closing)
+            dock(tab);
+    };
+    connect(dockBtn, &QPushButton::clicked, win, &QWidget::close);
+    new QShortcut(QKeySequence(Qt::Key_F5), win, [this] { pauseContinue(); });
+    new QShortcut(QKeySequence(Qt::Key_F7), win, [this] { doStep(); });
+    new QShortcut(QKeySequence(Qt::Key_F8), win, [this] { doStepOver(); });
+    new QShortcut(QKeySequence(Qt::SHIFT | Qt::Key_F8), win, [this] { doStepOut(); });
+    win->show();
+    m_seenSerial = 0;
+}
+
+void DebuggerWindow::dock(int tab)
+{
+    QWidget *win = m_popped[tab];
+    if (!win)
+        return;
+    QWidget *page = m_pages[tab];
+    m_popped[tab] = nullptr;
+    int pos = 0;
+    for (int t = 0; t < tab; t++)   /* back where it was in the order */
+        if (!m_popped[t])
+            pos++;
+    page->setParent(nullptr);
+    m_tabs->insertTab(pos, page, QLatin1String(kTabNames[tab]));
+    m_tabs->setCurrentIndex(pos);
+    m_seenSerial = 0;
 }
 
 QWidget *DebuggerWindow::buildBasic()
@@ -1147,7 +1391,7 @@ QWidget *DebuggerWindow::buildFujinet()
 
 bool DebuggerWindow::fujiShowing() const
 {
-    return m_tabs->currentWidget() == m_fujiPage;
+    return tabVisible(kTabFujinet);
 }
 
 void DebuggerWindow::refreshFujinet(bool force)
@@ -1542,6 +1786,9 @@ void DebuggerWindow::refreshAll()
     refreshBasic(paused);
     refreshBreaks();
     refreshWatches();
+    refreshCart();
+    refreshHist(0, false);
+    refreshHist(1, false);
     if (fujiShowing())
         refreshFujinet(false);
     m_wasPaused = paused;

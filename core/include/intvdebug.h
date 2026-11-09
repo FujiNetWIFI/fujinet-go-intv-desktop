@@ -236,6 +236,64 @@ typedef struct {
 
 int  intvdebug_last_stop(intvdebug *d, intvdebug_stop_info *out);
 
+/* ---- instruction history and trace -------------------------------------------
+ * With history on, every instruction the CPU runs is recorded into a ring of
+ * the last 65536 (pc, the opcode's words, R0-R7, flags, cycle). It costs a
+ * hook call per instruction instead of one per timeslice, so it is off until
+ * asked for. The history tab shows it while stopped; the trace tab reads the
+ * same ring while the machine runs (a line being written at that instant may
+ * be torn; harmless for display). */
+#define INTVDEBUG_HISTORY_SIZE 65536
+
+enum { INTVDEBUG_EV_NONE = 0, INTVDEBUG_EV_INTERRUPT = 1, INTVDEBUG_EV_BUS = 2 };
+
+typedef struct {
+    uint64_t cycle;
+    uint16_t pc;        /* the instruction's address */
+    uint16_t w[3];      /* its opcode words */
+    uint16_t r[8];      /* registers AFTER it ran */
+    uint16_t flags;     /* bit0 S, 1 C, 2 O, 3 Z, 4 I, 5 D (double-byte-data pending) */
+    uint8_t  event;     /* INTVDEBUG_EV_*: an interrupt or bus grant, not an instruction */
+} intvdebug_hist;
+
+void intvdebug_history_enable(intvdebug *d, int on);
+int  intvdebug_history_enabled(const intvdebug *d);
+void intvdebug_history_clear(intvdebug *d);
+/* Total instructions recorded since it was last cleared (the ring holds the
+ * last INTVDEBUG_HISTORY_SIZE of them). A UI polls this to see new lines. */
+uint64_t intvdebug_history_count(const intvdebug *d);
+/* Copies up to max of the newest entries, oldest first; returns how many. */
+int  intvdebug_history_copy(intvdebug *d, intvdebug_hist *out, int max);
+
+#define INTVDEBUG_HIST_BRANCHES 1   /* only branches, jumps and calls */
+#define INTVDEBUG_HIST_RANGE    2   /* only pc in lo..hi */
+/* One display line for an entry: "50CD  JSR  R5,$50D5   R0 0001 ... S0 C0 O0 Z0 I1". */
+int  intvdebug_history_format(const intvdebug_hist *h, char *dst, int dstsz);
+/* True when the entry passes the filter. */
+int  intvdebug_history_match(const intvdebug_hist *h, int filter, uint16_t lo, uint16_t hi);
+
+/* ---- the cartridge and the memory map: valid only while paused ----------- */
+typedef struct {
+    uint16_t lo, hi;      /* inclusive */
+    uint8_t  readable, writable;
+    char     name[32];    /* what answers there: "System RAM", "EXEC ROM", "STIC" ... */
+} intvdebug_region;
+
+/* The address map as the bus decodes it, runs of 16-word bins with the same
+ * devices merged. Returns how many regions (up to max). */
+int  intvdebug_memory_map(intvdebug *d, intvdebug_region *out, int max);
+
+typedef struct {
+    char path[512];       /* the cartridge image, or "(FujiNet config)" */
+    char name[128];       /* its title if it says (BIN+CFG metadata), else "" */
+    int  year;            /* 0 if unknown */
+    int  fujinet_mailbox; /* the FujiNet mailbox is mapped */
+    int  ecs;             /* ECS present */
+    int  jlp;             /* JLP accelerator / flash */
+} intvdebug_cart;
+
+void intvdebug_cart_info(intvdebug *d, intvdebug_cart *out);
+
 /* ---- FujiNet: the mailbox's BoIP bytes, as FujiBus packets ---------------
  * A tap on the staged tree's fn_sock (fn_sock_set_trace) feeds this from
  * the moment the program starts, engaged or not, so it shows what happened

@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /*
@@ -82,6 +83,12 @@ struct intvdebug {
     intvdebug_stop_info hit;    /* the watchpoint that fired */
     intvdebug_stop_info last;   /* why the machine last stopped */
 
+    /* The instruction history ring (see intvdebug.h). One writer: the
+     * emulator thread. */
+    int      hist_on;
+    intvdebug_hist *hist;       /* INTVDEBUG_HISTORY_SIZE, allocated once, never freed */
+    volatile uint64_t hist_count;
+
     pthread_mutex_t trace_lock; /* the FujiNet trace's alone */
     fujitrace trace;
 };
@@ -119,6 +126,57 @@ intvdebug *intvdebug_get(void)
 static void watch_apply(intvdebug *d);
 static int bp_find_exec(const intvdebug *d, uint16_t addr);
 
+/* Strips what dasm1600 puts in front of the mnemonic: the instruction's own
+ * address and its opcode words ("   $50CD  0004 0150 00D5   JSR  R5,$50D5"). */
+static const char *dasm_body(const char *t)
+{
+    int words = 0, k;
+    while (*t == ' ')
+        t++;
+    if (*t == '$') {
+        while (*t && *t != ' ')
+            t++;
+        while (*t == ' ')
+            t++;
+    }
+    while (words < 3) {
+        for (k = 0; k < 4; k++)
+            if (!((t[k] >= '0' && t[k] <= '9') || (t[k] >= 'A' && t[k] <= 'F') ||
+                  (t[k] >= 'a' && t[k] <= 'f')))
+                break;
+        if (k < 4 || (t[4] != ' ' && t[4] != '\0'))
+            break;
+        t += 4;
+        while (*t == ' ')
+            t++;
+        words++;
+    }
+    return t;
+}
+
+static void hist_record(intvdebug *d)
+{
+    cp1600_t *const cp = &intv.cp1600;
+    const uint64_t n = d->hist_count;
+    intvdebug_hist *h;
+    int i;
+
+    if (!d->hist)
+        return;
+    h = &d->hist[n & (INTVDEBUG_HISTORY_SIZE - 1)];
+    h->pc = (uint16_t)cp->oldpc;
+    for (i = 0; i < 3; i++)
+        h->w[i] = (uint16_t)CP1600_PK(cp, (uint16_t)(h->pc + i));
+    for (i = 0; i < 8; i++)
+        h->r[i] = cp->r[i];
+    h->flags = (uint16_t)((cp->S ? 1 : 0) | (cp->C ? 2 : 0) | (cp->O ? 4 : 0) | (cp->Z ? 8 : 0) |
+                          (cp->I ? 16 : 0) | (cp->D ? 32 : 0));
+    h->cycle = cp->tot_cycle;
+    h->event = (cp->req_ack_state & CP1600_INTAK) ? INTVDEBUG_EV_INTERRUPT
+               : (cp->req_ack_state & CP1600_BUSAK) ? INTVDEBUG_EV_BUS : INTVDEBUG_EV_NONE;
+    d->hist_count = n + 1;
+}
+
 /* Was the instruction that just ran a JSR? Its destination's first word is
  * where a callee starts, before the PSHR R5 that every IntyBASIC procedure
  * opens with has deepened the stack, so depth alone can't tell that word from
@@ -139,6 +197,9 @@ static uint32_t debug_tick(periph_t *req, uint32_t cycles)
     (void)req;
     (void)cycles;
     intvdebug *const d = &g_debug;
+
+    if (d->hist_on)
+        hist_record(d);   /* the instruction that just ran, lock-free */
 
     pthread_mutex_lock(&d->lock);
     if (d->watch_dirty)
@@ -212,14 +273,14 @@ static uint32_t debug_tick(periph_t *req, uint32_t cycles)
     /* Set the run mode for what happens next, decided by whoever woke us
      * (intvdebug_resume clears step_mode, intvdebug_step/step_over/
      * step_out set or clear it as appropriate -- see each). */
-    intv.cp1600.step_count = d->step_mode ? 1 : ~0U;
+    intv.cp1600.step_count = (d->step_mode || d->hist_on) ? 1 : ~0U;
     /* step_count only feeds steps_remaining when that reaches 0. Pausing out
      * of a free run leaves it at ~step_count minus whatever ran, so a Step
      * would run on until the next timeslice (or breakpoint) instead of one
      * instruction. Restart the countdown here, on the emulator thread:
      * 1 = stop after the next instruction, 0 = unlimited (cp1600_run then
      * refills it from step_count). */
-    intv.cp1600.steps_remaining = d->step_mode ? 1 : 0;
+    intv.cp1600.steps_remaining = (d->step_mode || d->hist_on) ? 1 : 0;
     pthread_mutex_unlock(&d->lock);
 
     return 0; /* NEVER CYC_MAX -- that aborts cp1600_run's whole timeslice. */
@@ -233,6 +294,8 @@ void intvdebug_set_engaged(intvdebug *d, int engaged)
     if (engaged) {
         d->engaged = 1;
         cp1600_instr_tick(&intv.cp1600, debug_tick, NULL);
+        if (d->hist_on)
+            intv.cp1600.step_count = 1;
     } else {
         intvdebug_resume(d); /* never leave the emulator thread parked */
         d->engaged = 0;
@@ -504,7 +567,7 @@ int intvdebug_disassemble(intvdebug *d, uint16_t addr, int dbd,
 
         out[produced].addr = addr;
         out[produced].length = len;
-        snprintf(out[produced].text, sizeof(out[produced].text), "%s", buf);
+        snprintf(out[produced].text, sizeof(out[produced].text), "%s", dasm_body(buf));
 
         addr = (uint16_t)(addr + len);
         dbd = 0; /* DBD state is only known at the actual current PC */
@@ -870,6 +933,158 @@ int intvdebug_last_stop(intvdebug *d, intvdebug_stop_info *out)
     *out = d->last;
     pthread_mutex_unlock(&d->bp_lock);
     return out->reason != INTVDEBUG_STOP_NONE;
+}
+
+/* ---- history ---------------------------------------------------------------- */
+
+void intvdebug_history_enable(intvdebug *d, int on)
+{
+    if (on && !d->hist)
+        d->hist = calloc(INTVDEBUG_HISTORY_SIZE, sizeof(intvdebug_hist));
+    if (on && !d->hist)
+        return;
+    d->hist_on = on ? 1 : 0;
+    if (d->engaged) {
+        /* every instruction must reach the hook while it records */
+        intv.cp1600.step_count = (on || d->step_mode) ? 1 : ~0U;
+    }
+}
+
+int intvdebug_history_enabled(const intvdebug *d)
+{
+    return d->hist_on;
+}
+
+void intvdebug_history_clear(intvdebug *d)
+{
+    d->hist_count = 0;
+}
+
+uint64_t intvdebug_history_count(const intvdebug *d)
+{
+    return d->hist_count;
+}
+
+int intvdebug_history_copy(intvdebug *d, intvdebug_hist *out, int max)
+{
+    const uint64_t total = d->hist_count;
+    uint64_t have = total < INTVDEBUG_HISTORY_SIZE ? total : INTVDEBUG_HISTORY_SIZE, first;
+    int n, i;
+
+    if (!d->hist || max < 1)
+        return 0;
+    n = have < (uint64_t)max ? (int)have : max;
+    first = total - (uint64_t)n;
+    for (i = 0; i < n; i++)
+        out[i] = d->hist[(first + (uint64_t)i) & (INTVDEBUG_HISTORY_SIZE - 1)];
+    return n;
+}
+
+static int hist_text(const intvdebug_hist *h, char *dst, int dstsz)
+{
+    char buf[64];
+    dasm1600(buf, h->pc, 0, h->w[0], h->w[1], h->w[2]);
+    snprintf(dst, (size_t)dstsz, "%s", dasm_body(buf));
+    return (int)strlen(dst);
+}
+
+int intvdebug_history_format(const intvdebug_hist *h, char *dst, int dstsz)
+{
+    char text[64];
+    if (h->event == INTVDEBUG_EV_INTERRUPT)
+        return snprintf(dst, (size_t)dstsz, "%04X  (interrupt)", h->pc);
+    if (h->event == INTVDEBUG_EV_BUS)
+        return snprintf(dst, (size_t)dstsz, "%04X  (bus grant)", h->pc);
+    hist_text(h, text, sizeof(text));
+    return snprintf(dst, (size_t)dstsz,
+                    "%04X  %-22s R0 %04X R1 %04X R2 %04X R3 %04X R4 %04X R5 %04X R6 %04X  S%d C%d O%d Z%d I%d",
+                    h->pc, text, h->r[0], h->r[1], h->r[2], h->r[3], h->r[4], h->r[5], h->r[6],
+                    h->flags & 1, (h->flags >> 1) & 1, (h->flags >> 2) & 1, (h->flags >> 3) & 1,
+                    (h->flags >> 4) & 1);
+}
+
+int intvdebug_history_match(const intvdebug_hist *h, int filter, uint16_t lo, uint16_t hi)
+{
+    if ((filter & INTVDEBUG_HIST_RANGE) && (h->pc < lo || h->pc > hi))
+        return 0;
+    if (filter & INTVDEBUG_HIST_BRANCHES) {
+        char text[64];
+        const char *m;
+        if (h->event)
+            return 0;
+        hist_text(h, text, sizeof(text));
+        m = text;
+        /* B, BC, BEXT, J, JR, JSR, ... and the conditional branches */
+        return m[0] == 'B' || m[0] == 'J';
+    }
+    return 1;
+}
+
+/* ---- the memory map and the cartridge ---------------------------------------------- */
+
+int intvdebug_memory_map(intvdebug *d, intvdebug_region *out, int max)
+{
+    periph_bus_t *const bus = intv.intv;
+    const uint32_t bins = bus ? (bus->addr_mask >> bus->decode_shift) + 1 : 0;
+    uint32_t b, start = 0;
+    int n = 0, have = 0;
+    const periph_t *prd = NULL, *pwr = NULL;
+    int prcount = 0, pwcount = 0;
+
+    if (!d->paused || !bus || bins > 4096)
+        return 0;
+    for (b = 0; b <= bins; b++) {
+        const periph_t *rd = NULL, *wr = NULL;
+        int rc = 0, wc = 0, i;
+        if (b < bins) {
+            for (i = 0; i < MAX_PERIPH_BIN && bus->rd[i][b]; i++)
+                if (bus->rd[i][b] != &g_watch) {
+                    if (!rd)
+                        rd = bus->rd[i][b];
+                    rc++;
+                }
+            for (i = 0; i < MAX_PERIPH_BIN && bus->wr[i][b]; i++)
+                if (bus->wr[i][b] != &g_watch) {
+                    if (!wr)
+                        wr = bus->wr[i][b];
+                    wc++;
+                }
+        }
+        /* a run ends when what answers changes (or the map does) */
+        if (have && (b == bins || rd != prd || wr != pwr || rc != prcount || wc != pwcount)) {
+            if ((prd || pwr) && n < max) {
+                const periph_t *p = prd ? prd : pwr;
+                out[n].lo = (uint16_t)(start << bus->decode_shift);
+                out[n].hi = (uint16_t)((b << bus->decode_shift) - 1);
+                out[n].readable = prd != NULL;
+                out[n].writable = pwr != NULL;
+                snprintf(out[n].name, sizeof(out[n].name), "%.31s", p->name);
+                n++;
+            }
+            have = 0;
+        }
+        if (b < bins && !have) {
+            have = 1;
+            start = b;
+            prd = rd;
+            pwr = wr;
+            prcount = rc;
+            pwcount = wc;
+        }
+    }
+    return n;
+}
+
+void intvdebug_cart_info(intvdebug *d, intvdebug_cart *out)
+{
+    (void)d;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->path, sizeof(out->path), "%s", intv.fn_game ? intv.fn_game : "");
+    snprintf(out->name, sizeof(out->name), "%s", intv.cart_name ? intv.cart_name : "");
+    out->year = intv.cart_year;
+    out->fujinet_mailbox = intv.fujinet.mailbox_active ? 1 : 0;
+    out->ecs = intv.ecs_enable > 0 ? 1 : 0;   /* -1 is "automatic", and resolves to off unless the cart asks */
+    out->jlp = intv.jlp.periph.bus != NULL;
 }
 
 /* ---- FujiNet trace ------------------------------------------------------- */

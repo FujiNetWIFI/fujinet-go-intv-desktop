@@ -75,6 +75,7 @@ private:
     QLabel *m_status;
     QPushButton *m_pauseBtn;
     QPlainTextEdit *m_disasm;
+    int m_disasmBar = -1;     /* the block wearing the current-line bar */
 
     QLineEdit *m_regEdit[8]; /* R0-R7 */
     QLabel *m_flags;
@@ -103,6 +104,7 @@ private:
     QPlainTextEdit *m_basView;
     int m_basFile = -1;       /* index into the map; -1 = nothing shown */
     unsigned m_basGen = 0;    /* intvsrcmap_generation() the view was built from */
+    int m_basBar = -1;        /* the block wearing the current-line bar */
     int m_basPcLine = 0;      /* the machine's line in the file shown, 0 = none */
     bool m_basGuard = false;  /* we are moving the cursor, not the user */
 

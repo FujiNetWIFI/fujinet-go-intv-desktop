@@ -48,8 +48,10 @@
 #include <QMessageBox>
 #include <QPixmap>
 #include <QPlainTextEdit>
+#include <QTextEdit>
 #include <QShortcut>
 #include <QPointer>
+#include <QStyle>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScrollBar>
@@ -77,8 +79,8 @@ constexpr int kFujiTicks = 15;      /* the FujiNet tab, 500 ms at 33 ms */
 
 /* The tabs, in order; INTV_DEBUGGER_TAB picks one by number or by the start
  * of its name (any case), for tests and captures. */
-const char *const kTabNames[] = {"CPU", "BASIC", "STIC", "Symbols", "FujiNet"};
-enum { kTabCpu, kTabBasic, kTabStic, kTabSymbols, kTabFujinet };
+const char *const kTabNames[] = {"CPU", "BASIC", "Memory", "STIC", "Symbols", "FujiNet"};
+enum { kTabCpu, kTabBasic, kTabMemory, kTabStic, kTabSymbols, kTabFujinet };
 enum { kPickFile, kPickFolder, kPickMap };
 constexpr int kTabCount = int(sizeof(kTabNames) / sizeof(kTabNames[0]));
 
@@ -144,6 +146,52 @@ void setRgba(QLabel *label, const uint8_t *rgba, int w, int h)
     label->setPixmap(QPixmap::fromImage(
         QImage(rgba, w, h, w * 4, QImage::Format_RGBA8888)));
 }
+
+/* The current line: a bar in the accent (the icon's green) and white text.
+ * The bar is the block's own background: a full-width ExtraSelection would
+ * repaint the gutter's red dot in its own colour. The white text is a
+ * selection over everything but the gutter column. `prev` remembers which
+ * block wears the bar, so a refresh that kept the text can move it. */
+void pcBar(QList<QTextEdit::ExtraSelection> &out, QPlainTextEdit *v, int &prev, int block)
+{
+    QTextDocument *doc = v->document();
+    auto setBg = [doc](int n, const QBrush &brush) {
+        const QTextBlock b = doc->findBlockByNumber(n);
+        if (!b.isValid())
+            return;
+        QTextCursor c(b);
+        QTextBlockFormat f = c.blockFormat();
+        f.setBackground(brush);
+        c.setBlockFormat(f);
+    };
+    if (prev >= 0 && prev != block)
+        setBg(prev, Qt::NoBrush);
+    prev = -1;
+    if (block < 0)
+        return;
+    setBg(block, QColor(0x1E, 0x49, 0x12));
+    prev = block;
+
+    QTextEdit::ExtraSelection text;
+    const QTextBlock b = doc->findBlockByNumber(block);
+    text.cursor = QTextCursor(b);
+    text.cursor.setPosition(b.position() + 1);
+    text.cursor.setPosition(b.position() + b.length() - 1, QTextCursor::KeepAnchor);
+    text.format.setForeground(Qt::white);
+    out.append(text);
+}
+
+/* A breakpoint's gutter dot, red (drawn over the bar when both apply). */
+QTextEdit::ExtraSelection bpDot(QPlainTextEdit *v, int block)
+{
+    QTextEdit::ExtraSelection sel;
+    sel.cursor = QTextCursor(v->document()->findBlockByNumber(block));
+    sel.cursor.movePosition(QTextCursor::NextCharacter, QTextCursor::KeepAnchor);
+    sel.format.setForeground(QColor(0xE0, 0x1B, 0x24));
+    return sel;
+}
+
+const QString kBpDot = QStringLiteral("\u25CF");
 
 QPointer<DebuggerWindow> g_singleton;
 
@@ -297,7 +345,6 @@ void DebuggerWindow::buildUi()
 
     auto *tabs = new QTabWidget;
     m_tabs = tabs;
-    setCentralWidget(tabs);
 
     /* ---- CPU tab ---- */
     auto *cpu = new QWidget;
@@ -320,38 +367,41 @@ void DebuggerWindow::buildUi()
      * the MSX port's msxdebug_set_regs. Matches the GNOME debugger's own
      * scope, which does not offer editable registers either. */
     auto *regBox = new QGroupBox(QStringLiteral("Registers"));
-    auto *regGrid = new QGridLayout(regBox);
+    auto *regRow = new QHBoxLayout(regBox);
     static const char *const kRegNames[8] = {"R0", "R1", "R2", "R3",
                                              "R4", "R5", "R6(SP)", "R7(PC)"};
     for (int i = 0; i < 8; i++) {
-        regGrid->addWidget(new QLabel(QLatin1String(kRegNames[i])), i / 4,
-                           (i % 4) * 2);
+        regRow->addWidget(new QLabel(QLatin1String(kRegNames[i])));
         m_regEdit[i] = new QLineEdit;
         m_regEdit[i]->setReadOnly(true);
         m_regEdit[i]->setMaximumWidth(64);
-        regGrid->addWidget(m_regEdit[i], i / 4, (i % 4) * 2 + 1);
+        regRow->addWidget(m_regEdit[i]);
     }
     m_flags = new QLabel;
-    regGrid->addWidget(m_flags, 2, 0, 1, 8);
+    regRow->addWidget(m_flags);
+    regRow->addStretch();
 
-    auto *right = new QWidget;
-    auto *rightLayout = new QVBoxLayout(right);
-    rightLayout->addWidget(regBox);
+    /* The registers sit under every tab; the memory view has a tab of its own. */
+    auto *central = new QWidget;
+    auto *centralLayout = new QVBoxLayout(central);
+    centralLayout->addWidget(tabs, 1);
+    centralLayout->addWidget(regBox);
+    setCentralWidget(central);
 
-    auto *memBox = new QGroupBox(QStringLiteral("Memory"));
-    auto *memLayout = new QVBoxLayout(memBox);
+    auto *memTab = new QWidget;
+    auto *memLayout = new QVBoxLayout(memTab);
     m_memAddr = new QLineEdit;
     m_memAddr->setText(QStringLiteral("0000"));
+    m_memAddr->setPlaceholderText(QStringLiteral("Address, symbol or BASIC variable"));
     connect(m_memAddr, &QLineEdit::returnPressed, this,
             &DebuggerWindow::goToAddr);
     memLayout->addWidget(m_memAddr);
     m_memView = monoView();
-    memLayout->addWidget(m_memView);
-    rightLayout->addWidget(memBox, 1);
+    memLayout->addWidget(m_memView, 1);
 
-    cpuLayout->addWidget(right);
     tabs->addTab(cpu, QLatin1String(kTabNames[kTabCpu]));
     tabs->addTab(buildBasic(), QLatin1String(kTabNames[kTabBasic]));
+    tabs->addTab(memTab, QLatin1String(kTabNames[kTabMemory]));
 
     /* ---- STIC tab ---- */
     auto *stic = new QWidget;
@@ -454,7 +504,7 @@ void DebuggerWindow::buildUi()
     tabs->addTab(m_fujiPage, QLatin1String(kTabNames[kTabFujinet]));
     /* Help's contexts (intvhelp.h), one per tab */
     {
-        static const char *const kHelpTabs[] = { "cpu", "basic", "stic", "symbols", "fujinet" };
+        static const char *const kHelpTabs[] = { "cpu", "basic", "memory", "stic", "symbols", "fujinet" };
         auto setHelpContext = [this](int page) {
             if (page >= 0 && page < kTabCount)
                 setProperty("intvHelpContext", QStringLiteral("debugger/%1").arg(QLatin1String(kHelpTabs[page])));
@@ -623,22 +673,32 @@ void DebuggerWindow::refreshBasic(bool paused)
     }
 
     QString text;
+    QList<int> bpLines;
+    int n = 0;
     if (m_basFile >= 0) {
-        const int n = intvsrcmap_line_count(m_srcmap, m_basFile);
+        n = intvsrcmap_line_count(m_srcmap, m_basFile);
         text.reserve(n * 48);
         for (int i = 1; i <= n; i++) {
             const int addr = intvsrcmap_first_addr(m_srcmap, m_basFile, i);
             const char *src = intvsrcmap_line_text(m_srcmap, m_basFile, i);
-            text += QStringLiteral("%1%2 %3  %4\n")
-                        .arg(pf == m_basFile && i == pl ? QLatin1Char('>') : QLatin1Char(' '))
-                        .arg(addr >= 0 && intvdebug_breakpoint_is_set(m_dbg, uint16_t(addr))
-                                 ? QLatin1Char('*') : QLatin1Char(' '))
+            const bool bp = addr >= 0 && intvdebug_breakpoint_is_set(m_dbg, uint16_t(addr));
+            if (bp)
+                bpLines.append(i - 1);
+            text += QStringLiteral("%1 %2  %3\n")
+                        .arg(bp ? kBpDot : QStringLiteral(" "))
                         .arg(i, 5)
                         .arg(QString::fromUtf8(src ? src : ""));
         }
     }
     m_basGuard = true;   /* setPlainText moves the cursor: not a click */
     setText(m_basView, text);
+    {
+        QList<QTextEdit::ExtraSelection> sels;
+        for (int b : bpLines)
+            sels.append(bpDot(m_basView, b));
+        pcBar(sels, m_basView, m_basBar, pf == m_basFile && pl >= 1 && pl <= n ? pl - 1 : -1);
+        m_basView->setExtraSelections(sels);
+    }
     m_basGuard = false;
 
     const int line = pf == m_basFile ? pl : 0;
@@ -936,21 +996,30 @@ void DebuggerWindow::refreshDisasm()
 
     const int n = intvdebug_disassemble(m_dbg, r.pc, r.D, lines, kDisasmLines);
     QString text;
+    QList<QTextEdit::ExtraSelection> sels;
     for (int i = 0; i < n; i++) {
         char symsuffix[96];
         intvsym_annotate_line(m_symtab, &lines[i], symsuffix,
                               sizeof(symsuffix));
-        text += QStringLiteral("%1%2 %3  %4%5\n")
-                    .arg(lines[i].addr == r.pc ? QLatin1Char('>')
-                                               : QLatin1Char(' '))
+        text += QStringLiteral("%1 %2  %3%4\n")
                     .arg(intvdebug_breakpoint_is_set(m_dbg, lines[i].addr)
-                             ? QLatin1Char('*')
-                             : QLatin1Char(' '))
+                             ? kBpDot : QStringLiteral(" "))
                     .arg(lines[i].addr, 4, 16, QLatin1Char('0'))
                     .arg(QString::fromUtf8(lines[i].text), -24)
                     .arg(QString::fromUtf8(symsuffix));
     }
     m_disasm->setPlainText(text.toUpper());
+    for (int i = 0; i < n; i++)
+        if (intvdebug_breakpoint_is_set(m_dbg, lines[i].addr))
+            sels.append(bpDot(m_disasm, i));
+    {
+        int bar = -1;
+        for (int i = 0; i < n; i++)
+            if (lines[i].addr == r.pc)
+                bar = i;
+        pcBar(sels, m_disasm, m_disasmBar, bar);
+    }
+    m_disasm->setExtraSelections(sels);
 }
 
 void DebuggerWindow::refreshRegs()
@@ -1082,6 +1151,10 @@ void DebuggerWindow::refreshAll()
     const int paused = intvdebug_is_paused(m_dbg);
     m_pauseBtn->setText(paused ? QStringLiteral("Continue (F5)")
                                : QStringLiteral("Pause (F5)"));
+    /* the action on offer wears the accent: Continue while stopped */
+    m_pauseBtn->setProperty("accent", bool(paused));
+    m_pauseBtn->style()->unpolish(m_pauseBtn);
+    m_pauseBtn->style()->polish(m_pauseBtn);
     m_status->setText(paused ? QStringLiteral("Paused")
                              : QStringLiteral("Running"));
 

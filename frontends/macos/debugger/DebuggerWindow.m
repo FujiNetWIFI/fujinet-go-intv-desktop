@@ -73,7 +73,7 @@ static DebuggerWindow *g_debugger;
 
 /* The tabs, in order; INTV_DEBUGGER_TAB picks one by number or by the start
  * of its name (any case), for tests and captures. */
-static const char *const kTabNames[] = {"CPU", "BASIC", "STIC", "Symbols", "FujiNet"};
+static const char *const kTabNames[] = {"CPU", "BASIC", "Memory", "STIC", "Symbols", "FujiNet"};
 #define TAB_COUNT ((int)(sizeof(kTabNames) / sizeof(kTabNames[0])))
 
 static int tabFromEnv(void)
@@ -256,6 +256,47 @@ static NSImage *imageFromRGBA(const uint8_t *rgba, int w, int h, BOOL hasAlpha)
     return img;
 }
 
+/* The current line is a bar in the accent (the icon's green) with white text;
+ * a breakpoint is a red dot in the gutter's first column. */
+static NSColor *accentColor(void)
+{
+    return [NSColor colorWithSRGBRed:0x1E / 255.0 green:0x49 / 255.0 blue:0x12 / 255.0 alpha:1];
+}
+
+static NSColor *breakpointRed(void)
+{
+    return [NSColor colorWithSRGBRed:0xE0 / 255.0 green:0x1B / 255.0 blue:0x24 / 255.0 alpha:1];
+}
+
+/* Appends one source/disassembly line to `out`: gutter dot, text, newline. */
+static void appendLine(NSMutableAttributedString *out, NSString *body, BOOL pc, BOOL bp)
+{
+    NSFont *font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", bp ? @"\u25CF" : @" ", body];
+    NSMutableAttributedString *a = [[NSMutableAttributedString alloc]
+        initWithString:line
+            attributes:@{ NSFontAttributeName : font, NSForegroundColorAttributeName : NSColor.textColor }];
+    if (pc) {
+        [a addAttribute:NSBackgroundColorAttributeName value:accentColor() range:NSMakeRange(0, line.length)];
+        [a addAttribute:NSForegroundColorAttributeName value:NSColor.whiteColor range:NSMakeRange(1, line.length - 1)];
+    }
+    if (bp)
+        [a addAttribute:NSForegroundColorAttributeName value:breakpointRed() range:NSMakeRange(0, 1)];
+    [out appendAttributedString:a];
+}
+
+/* Replaces a view's styled text where the reader left it. */
+static void setAttrText(NSTextView *view, NSAttributedString *text)
+{
+    NSScrollView *scroll = view.enclosingScrollView;
+    const NSPoint at = scroll ? scroll.contentView.bounds.origin : NSZeroPoint;
+    [view.textStorage setAttributedString:text];
+    if (scroll) {
+        [scroll.contentView scrollToPoint:at];
+        [scroll reflectScrolledClipView:scroll.contentView];
+    }
+}
+
 + (void)showForSession:(intvsession *)session
 {
     if (!g_debugger) {
@@ -424,9 +465,9 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
 {
     NSScrollView *dasmScroll = [[NSScrollView alloc] init];
     dasmScroll.hasVerticalScroller = YES;
-    _disasm = [[DasmTextView alloc] initWithFrame:NSMakeRect(0, 0, 560, 600)];
+    _disasm = [[DasmTextView alloc] initWithFrame:NSMakeRect(0, 0, 900, 600)];
     _disasm.editable = NO;
-    _disasm.richText = NO;
+    _disasm.richText = YES;
     _disasm.font = [NSFont monospacedSystemFontOfSize:11
                                                weight:NSFontWeightRegular];
     _disasm.autoresizingMask = NSViewWidthSizable;
@@ -440,44 +481,42 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     };
     dasmScroll.documentView = _disasm;
 
-    NSScrollView *regsScroll;
-    _regs = monoView(&regsScroll);
-    [regsScroll.widthAnchor constraintEqualToConstant:260].active = YES;
-
-    _memAddr = [[NSTextField alloc] init];
-    _memAddr.placeholderString = @"Memory addr (hex)";
-    _memAddr.target = self;
-    _memAddr.action = @selector(gotoMem:);
-    NSButton *memGo = [self button:@"Go" action:@selector(gotoMem:)];
-    NSStackView *memRow =
-        [NSStackView stackViewWithViews:@[ _memAddr, memGo ]];
-    memRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    NSScrollView *memScroll;
-    _memView = monoView(&memScroll);
-    [memScroll.widthAnchor constraintEqualToConstant:260].active = YES;
-
     _breakAddr = [[NSTextField alloc] init];
     _breakAddr.placeholderString = @"Symbol or hex addr";
     _breakAddr.target = self;
     _breakAddr.action = @selector(breakAt:);
     NSButton *breakGo = [self button:@"Break" action:@selector(breakAt:)];
-    NSStackView *breakRow =
-        [NSStackView stackViewWithViews:@[ _breakAddr, breakGo ]];
+    NSStackView *breakRow = [NSStackView
+        stackViewWithViews:@[ [self label:@"Break at"], _breakAddr, breakGo ]];
     breakRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
 
-    NSStackView *side = [NSStackView stackViewWithViews:@[
-        [self label:@"Registers"], regsScroll, [self label:@"Memory"], memRow,
-        memScroll, [self label:@"Break at"], breakRow
-    ]];
-    side.orientation = NSUserInterfaceLayoutOrientationVertical;
-    side.alignment = NSLayoutAttributeLeading;
-    side.spacing = 6;
+    NSStackView *root = [NSStackView stackViewWithViews:@[ dasmScroll, breakRow ]];
+    root.orientation = NSUserInterfaceLayoutOrientationVertical;
+    root.alignment = NSLayoutAttributeLeading;
+    root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
+    [dasmScroll.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    return root;
+}
 
-    NSSplitView *split = [[NSSplitView alloc] init];
-    split.vertical = YES;
-    [split addArrangedSubview:dasmScroll];
-    [split addArrangedSubview:side];
-    return split;
+/* The memory view, with a tab of its own. */
+- (NSView *)buildMemoryTab
+{
+    _memAddr = [[NSTextField alloc] init];
+    _memAddr.placeholderString = @"Address, symbol or BASIC variable";
+    _memAddr.target = self;
+    _memAddr.action = @selector(gotoMem:);
+    NSButton *memGo = [self button:@"Go" action:@selector(gotoMem:)];
+    NSStackView *memRow = [NSStackView stackViewWithViews:@[ _memAddr, memGo ]];
+    memRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    NSScrollView *memScroll;
+    _memView = monoView(&memScroll);
+    NSStackView *root = [NSStackView stackViewWithViews:@[ memRow, memScroll ]];
+    root.orientation = NSUserInterfaceLayoutOrientationVertical;
+    root.alignment = NSLayoutAttributeLeading;
+    root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
+    [memRow.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    [memScroll.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    return root;
 }
 
 - (NSView *)buildBasicTab
@@ -505,7 +544,7 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     scroll.hasHorizontalScroller = YES;
     _basView = [[BasTextView alloc] initWithFrame:NSMakeRect(0, 0, 900, 600)];
     _basView.editable = NO;
-    _basView.richText = NO;
+    _basView.richText = YES;
     _basView.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
     _basView.minSize = NSMakeSize(0, 0);
     _basView.maxSize = NSMakeSize(FLT_MAX, FLT_MAX);
@@ -774,19 +813,23 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     _basicItem = [[NSTabViewItem alloc] initWithIdentifier:@"basic"];
     _basicItem.label = @(kTabNames[1]);
     _basicItem.view = [self buildBasicTab];
+    NSTabViewItem *memTab = [[NSTabViewItem alloc] initWithIdentifier:@"memory"];
+    memTab.label = @(kTabNames[2]);
+    memTab.view = [self buildMemoryTab];
     NSTabViewItem *sticTab =
         [[NSTabViewItem alloc] initWithIdentifier:@"stic"];
-    sticTab.label = @(kTabNames[2]);
+    sticTab.label = @(kTabNames[3]);
     sticTab.view = [self buildSticTab];
     NSTabViewItem *symTab =
         [[NSTabViewItem alloc] initWithIdentifier:@"symbols"];
-    symTab.label = @(kTabNames[3]);
+    symTab.label = @(kTabNames[4]);
     symTab.view = [self buildSymbolsTab];
     _fujiItem = [[NSTabViewItem alloc] initWithIdentifier:@"fujinet"];
-    _fujiItem.label = @(kTabNames[4]);
+    _fujiItem.label = @(kTabNames[5]);
     _fujiItem.view = [self buildFujinetTab];
     [tabs addTabViewItem:cpuTab];
     [tabs addTabViewItem:_basicItem];
+    [tabs addTabViewItem:memTab];
     [tabs addTabViewItem:sticTab];
     [tabs addTabViewItem:symTab];
     [tabs addTabViewItem:_fujiItem];
@@ -796,7 +839,12 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
         [tabs selectTabViewItemAtIndex:tabFromEnv()];
     [self updateHelpContext];
 
-    NSStackView *root = [NSStackView stackViewWithViews:@[ toolbar, tabs ]];
+    /* The registers sit under every tab. */
+    NSScrollView *regsScroll;
+    _regs = monoView(&regsScroll);
+    [regsScroll.heightAnchor constraintEqualToConstant:44].active = YES;
+
+    NSStackView *root = [NSStackView stackViewWithViews:@[ toolbar, tabs, regsScroll ]];
     root.orientation = NSUserInterfaceLayoutOrientationVertical;
     root.alignment = NSLayoutAttributeLeading;
     root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
@@ -804,6 +852,8 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
                                         constant:-16].active = YES;
     [tabs.widthAnchor constraintEqualToAnchor:root.widthAnchor
                                      constant:-16].active = YES;
+    [regsScroll.widthAnchor constraintEqualToAnchor:root.widthAnchor
+                                           constant:-16].active = YES;
     [tabs.heightAnchor constraintGreaterThanOrEqualToConstant:660].active =
         YES;
 
@@ -1068,23 +1118,22 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
         [_basFiles selectItemAtIndex:pf];
     }
 
-    NSMutableString *text = [NSMutableString string];
+    NSMutableAttributedString *text = [[NSMutableAttributedString alloc] init];
     NSRange pcRange = NSMakeRange(NSNotFound, 0);
     if (_basFile >= 0) {
         const int n = intvsrcmap_line_count(_srcmap, _basFile);
         for (int i = 1; i <= n; i++) {
             const int addr = intvsrcmap_first_addr(_srcmap, _basFile, i);
             const char *src = intvsrcmap_line_text(_srcmap, _basFile, i);
-            NSString *line = [NSString stringWithFormat:@"%c%c%5d  %s\n",
-                              pf == _basFile && i == pl ? '>' : ' ',
-                              addr >= 0 && intvdebug_breakpoint_is_set(_dbg, (uint16_t)addr) ? '*' : ' ',
-                              i, src ? src : ""];
-            if (pf == _basFile && i == pl)
-                pcRange = NSMakeRange(text.length, line.length);
-            [text appendString:line];
+            const BOOL isPc = pf == _basFile && i == pl;
+            const NSUInteger before = text.length;
+            appendLine(text, [NSString stringWithFormat:@"%5d  %s", i, src ? src : ""], isPc,
+                       addr >= 0 && intvdebug_breakpoint_is_set(_dbg, (uint16_t)addr));
+            if (isPc)
+                pcRange = NSMakeRange(before, text.length - before);
         }
     }
-    setText(_basView, text, NO);
+    setAttrText(_basView, text);
 
     const int line = pf == _basFile ? pl : 0;
     if (line != _basPcLine) {
@@ -1190,6 +1239,9 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
 - (void)refreshAll:(BOOL)paused
 {
     _runBtn.title = paused ? @"Continue (F5)" : @"Pause (F5)";
+    /* the action on offer wears the accent: Continue while stopped */
+    _runBtn.bezelColor = paused ? accentColor() : nil;
+    _runBtn.contentTintColor = paused ? NSColor.whiteColor : nil;
     _status.stringValue = paused ? @"Paused" : @"Running";
     if (paused) {
         [self refreshRegs];
@@ -1297,19 +1349,16 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
         return;
 
     int n = intvdebug_disassemble(_dbg, r.pc, r.D, lines, DISASM_LINES);
-    NSMutableString *text = [NSMutableString string];
+    NSMutableAttributedString *text = [[NSMutableAttributedString alloc] init];
     for (int i = 0; i < n; i++) {
         char symsuffix[96];
-        intvsym_annotate_line(_symtab, &lines[i], symsuffix,
-                              sizeof(symsuffix));
-        [text appendFormat:@"%c%c%04X  %-24s%s\n",
-                           lines[i].addr == r.pc ? '>' : ' ',
-                           intvdebug_breakpoint_is_set(_dbg, lines[i].addr)
-                               ? '*'
-                               : ' ',
-                           lines[i].addr, lines[i].text, symsuffix];
+        intvsym_annotate_line(_symtab, &lines[i], symsuffix, sizeof(symsuffix));
+        NSString *body = [NSString stringWithFormat:@"%04X  %-24s%s", lines[i].addr,
+                                                    lines[i].text, symsuffix];
+        appendLine(text, body, lines[i].addr == r.pc,
+                   intvdebug_breakpoint_is_set(_dbg, lines[i].addr));
     }
-    _disasm.string = text;
+    setAttrText(_disasm, text);
 }
 
 - (void)refreshRegs
@@ -1317,14 +1366,11 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     intvdebug_regs r;
     if (!intvdebug_regs_get(_dbg, &r))
         return;
-    static const char *const names[8] = {"R0", "R1", "R2", "R3",
-                                         "R4", "R5", "R6(SP)", "R7(PC)"};
-    NSMutableString *text = [NSMutableString string];
-    for (int i = 0; i < 8; i++)
-        [text appendFormat:@"%-8s%04X\n", names[i], r.r[i]];
-    [text appendFormat:@"\nS%d C%d O%d Z%d I%d D%d", r.S, r.C, r.O, r.Z, r.I,
-                       r.D];
-    _regs.string = text;
+    _regs.string = [NSString
+        stringWithFormat:@"R0 %04X  R1 %04X  R2 %04X  R3 %04X  R4 %04X  R5 %04X  R6(SP) %04X  R7(PC) %04X\n"
+                         @"S%d C%d O%d Z%d I%d  D%d",
+                         r.r[0], r.r[1], r.r[2], r.r[3], r.r[4], r.r[5], r.r[6], r.r[7],
+                         r.S, r.C, r.O, r.Z, r.I, r.D];
 }
 
 - (void)refreshMem

@@ -47,7 +47,10 @@
 #define CARD_ROWS_PER_PAGE 8 /* 128 cards/page at CARDS_PER_ROW=16 */
 #define FUJI_REFRESH_US 500000 /* the FujiNet tab, while it shows */
 
-enum { TAB_CPU, TAB_BASIC, TAB_STIC, TAB_SYMBOLS, TAB_FUJINET };
+enum { TAB_CPU, TAB_BASIC, TAB_MEMORY, TAB_STIC, TAB_SYMBOLS, TAB_FUJINET };
+
+/* A breakpoint in a gutter: a red dot. */
+#define BP_DOT "<span foreground=\"#e01b24\">\xe2\x97\x8f</span>"
 
 typedef struct {
     GtkWindow *win;
@@ -261,9 +264,8 @@ static void refresh_regs(DbgWin *w)
         return;
     }
     text = g_strdup_printf(
-        "R0 %04X   R1 %04X   R2 %04X   R3 %04X\n"
-        "R4 %04X   R5 %04X   R6(SP) %04X   R7(PC) %04X\n\n"
-        "S%d C%d O%d Z%d I%d   D%d",
+        "R0 %04X  R1 %04X  R2 %04X  R3 %04X  R4 %04X  R5 %04X  R6(SP) %04X  R7(PC) %04X\n"
+        "S%d C%d O%d Z%d I%d  D%d",
         r.r[0], r.r[1], r.r[2], r.r[3], r.r[4], r.r[5], r.r[6], r.pc, r.S,
         r.C, r.O, r.Z, r.I, r.D);
     gtk_label_set_text(w->regs, text);
@@ -297,14 +299,19 @@ static void refresh_disasm(DbgWin *w)
         GtkWidget *row = gtk_list_box_row_new();
         GtkWidget *label = gtk_label_new(NULL);
         char symsuffix[96];
+        g_autofree char *body = NULL;
+        g_autofree char *esc = NULL;
         g_autofree char *text = NULL;
 
         intvsym_annotate_line(w->symtab, l, symsuffix, sizeof(symsuffix));
+        body = g_strdup_printf("%04X  %-24s%s", l->addr, l->text, symsuffix);
+        esc = g_markup_escape_text(body, -1);
         text = g_strdup_printf(
-            "%c%c %04X  %-24s%s", (l->addr == r.pc) ? '>' : ' ',
-            intvdebug_breakpoint_is_set(w->dbg, l->addr) ? '*' : ' ',
-            l->addr, l->text, symsuffix);
-        gtk_label_set_text(GTK_LABEL(label), text);
+            "%s %s", intvdebug_breakpoint_is_set(w->dbg, l->addr) ? BP_DOT : " ",
+            esc);
+        gtk_label_set_markup(GTK_LABEL(label), text);
+        if (l->addr == r.pc)   /* the machine is here: a bar in the accent */
+            gtk_widget_add_css_class(row, "intv-pcrow");
         gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
         gtk_widget_add_css_class(label, "monospace");
         gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), label);
@@ -560,9 +567,16 @@ static void basic_set_row(DbgWin *w, int line, const char mark[3])
 {
     GtkLabel *label = g_ptr_array_index(w->bas_labels, line - 1);
     const char *src = intvsrcmap_line_text(w->srcmap, w->bas_file, line);
-    g_autofree char *text =
-        g_strdup_printf("%s %5d  %s", mark, line, src ? src : "");
-    gtk_label_set_text(label, text);
+    g_autofree char *esc = g_markup_escape_text(src ? src : "", -1);
+    g_autofree char *text = g_strdup_printf(
+        "%s %5d  %s", mark[1] == '*' ? BP_DOT : " ", line, esc);
+    GtkWidget *row = gtk_widget_get_parent(GTK_WIDGET(label));
+
+    gtk_label_set_markup(label, text);
+    if (row && mark[0] == '>')   /* the machine's line: a bar in the accent */
+        gtk_widget_add_css_class(row, "intv-pcrow");
+    else if (row)
+        gtk_widget_remove_css_class(row, "intv-pcrow");
     memcpy(w->bas_marks->data + 3 * (line - 1), mark, 3);
 }
 
@@ -741,6 +755,11 @@ static void refresh_all(DbgWin *w)
 {
     int paused = intvdebug_is_paused(w->dbg);
     gtk_button_set_label(w->run_pause, paused ? "_Run" : "_Pause");
+    /* the action on offer wears the accent: Run while stopped */
+    if (paused)
+        gtk_widget_add_css_class(GTK_WIDGET(w->run_pause), "intv-accent");
+    else
+        gtk_widget_remove_css_class(GTK_WIDGET(w->run_pause), "intv-accent");
     gtk_label_set_text(w->status, paused ? "Paused" : "Running");
 
     if (paused) {
@@ -1124,8 +1143,8 @@ static void on_fuji_clear(GtkButton *b, gpointer u)
 
 /* Help's contexts (intvhelp.h), one per tab */
 static const char *const k_tab_contexts[] = {
-    "debugger/cpu", "debugger/basic", "debugger/stic", "debugger/symbols",
-    "debugger/fujinet",
+    "debugger/cpu", "debugger/basic", "debugger/memory", "debugger/stic",
+    "debugger/symbols", "debugger/fujinet",
 };
 
 static gboolean on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num,
@@ -1345,7 +1364,7 @@ static GtkWidget *build_basic(DbgWin *w)
 
 /* The notebook's pages, in order; INTV_DEBUGGER_TAB picks one by number or
  * by the start of its name (any case), for tests and captures. */
-static const char *const k_tab_names[] = { "CPU", "BASIC", "STIC", "Symbols", "FujiNet" };
+static const char *const k_tab_names[] = { "CPU", "BASIC", "Memory", "STIC", "Symbols", "FujiNet" };
 
 static int tab_from_env(void)
 {
@@ -1461,9 +1480,8 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     gtk_widget_set_margin_top(regbox, 6);
     gtk_box_append(GTK_BOX(regbox), labeled("Registers", GTK_WIDGET(w->regs)));
 
-    panes = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_box_append(GTK_BOX(panes), scroller);
-    gtk_box_append(GTK_BOX(panes), regbox);
+    gtk_widget_set_margin_bottom(regbox, 6);
+    panes = scroller;   /* the CPU tab is the disassembly; registers sit below every tab */
 
     mem_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_widget_set_margin_top(mem_bar, 6);
@@ -1491,6 +1509,7 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     gtk_widget_set_margin_end(mem_scroller, 6);
     gtk_widget_set_margin_bottom(mem_scroller, 6);
     gtk_widget_set_hexpand(mem_scroller, TRUE);
+    gtk_widget_set_vexpand(mem_scroller, TRUE);
 
     /* ---- STIC page ---- */
     stic_grid = gtk_grid_new();
@@ -1567,6 +1586,13 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_basic(w),
                              gtk_label_new(k_tab_names[TAB_BASIC]));
     {
+        GtkWidget *mem_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+        gtk_box_append(GTK_BOX(mem_page), mem_bar);
+        gtk_box_append(GTK_BOX(mem_page), mem_scroller);
+        gtk_notebook_append_page(GTK_NOTEBOOK(notebook), mem_page,
+                                 gtk_label_new(k_tab_names[TAB_MEMORY]));
+    }
+    {
         GtkWidget *outer_scroll = gtk_scrolled_window_new();
         gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(outer_scroll),
                                       stic_grid);
@@ -1624,8 +1650,7 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     gtk_widget_set_vexpand(notebook, TRUE);
     gtk_box_append(GTK_BOX(box),
                    gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
-    gtk_box_append(GTK_BOX(box), mem_bar);
-    gtk_box_append(GTK_BOX(box), mem_scroller);
+    gtk_box_append(GTK_BOX(box), regbox);
     adw_window_set_content(ADW_WINDOW(w->win), box);
 
     keys = gtk_event_controller_key_new();

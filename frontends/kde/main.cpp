@@ -32,7 +32,10 @@ int main(int argc, char *argv[])
      * green; ":checked" only, so unchecked buttons keep the platform look. */
     app.setStyleSheet(QStringLiteral(
         "QPushButton:checked { background-color: #1E4912; color: white; }"
-        "QPushButton:checked:hover { background-color: #2C6B1A; }"));
+        "QPushButton:checked:hover { background-color: #2C6B1A; }"
+        /* a button whose action is on offer (the debugger's Run while stopped) */
+        "QPushButton[accent=\"true\"] { background-color: #1E4912; color: white; }"
+        "QPushButton[accent=\"true\"]:hover { background-color: #2C6B1A; }"));
 
     intvsession *session = intvsession_new(nullptr);
     if (!session) {

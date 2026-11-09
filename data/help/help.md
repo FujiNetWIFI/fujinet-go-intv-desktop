@@ -360,7 +360,7 @@ controls that differ from the defaults).
 # Debugger
 
 The Debugger (<kbd>F12</kbd>) stops the console and shows what it is doing.
-It has five tabs; closing it lets the console go on as it was.
+It has six tabs; closing it lets the console go on as it was.
 
 | Button | Does |
 |---|---|
@@ -377,9 +377,16 @@ It has five tabs; closing it lets the console go on as it was.
 <!-- context: debugger/cpu -->
 ## CPU
 
-The CP1610 disassembled with symbols; double-click a line to toggle its
-breakpoint. Beside it are the registers, and below it a memory view: type an
-address or a symbol after **Address:** and press Enter.
+The CP1610 disassembled with symbols. The instruction the machine is on is a
+green bar, and a breakpoint is a red dot in the margin; click a line to toggle
+its breakpoint. The registers are in the strip under every tab.
+
+<!-- context: debugger/memory -->
+## Memory
+
+A hex view of memory: type an address or a symbol after **Address:** and press
+Enter. The rows are labelled with the hardware that answers there (STIC, PSG,
+EXEC ROM and so on).
 
 <!-- context: debugger/basic -->
 ## BASIC
@@ -395,8 +402,8 @@ as1600 -o game -j game.smap -l game.lst -s game.sym game.asm
 ```
 
 If there is no map, **Load Map** reads one; a `.sym` beside it is loaded too.
-The file list picks the source shown. The line the machine is on is marked `>`;
-double-click a line that has code to toggle a breakpoint on it (`*`).
+The file list picks the source shown. The line the machine is on is a green bar;
+click a line that has code to toggle a breakpoint on it (a red dot).
 
 On this tab Step, Step Over and Step Out (<kbd>F7</kbd>, <kbd>F8</kbd>,
 <kbd>Shift+F8</kbd>) go by BASIC line. Step goes into a `GOSUB`, Step Over runs

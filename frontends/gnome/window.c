@@ -70,8 +70,12 @@ void intv_css_install(void)
         "}\n"
         "button.intv-toggle:checked:hover, button.intv-accent:hover {\n"
         "  background: #2A6A19; background-image: none; color: #ffffff;\n"
+        "}\n"
+        /* the debugger's current line: a bar in the accent, white text */
+        "row.intv-pcrow, row.intv-pcrow label {\n"
+        "  background: #%06X; background-image: none; color: #ffffff;\n"
         "}\n",
-        (unsigned)INTVSESSION_ACCENT_RGB);
+        (unsigned)INTVSESSION_ACCENT_RGB, (unsigned)INTVSESSION_ACCENT_RGB);
     provider = gtk_css_provider_new();
     gtk_css_provider_load_from_string(provider, css);
     gtk_style_context_add_provider_for_display(

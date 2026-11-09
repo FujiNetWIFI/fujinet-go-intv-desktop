@@ -49,6 +49,13 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.16.0" date="2026-11-09">
+      <description>
+        <p>
+          Debugger: the current instruction or BASIC line is a green bar, breakpoints are red dots, and Continue wears the accent colour. Memory has its own tab, and the registers sit in a strip under every tab.
+        </p>
+      </description>
+    </release>
     <release version="0.15.0" date="2026-11-09">
       <description>
         <p>

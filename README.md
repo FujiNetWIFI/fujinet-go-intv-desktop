@@ -86,7 +86,7 @@ to have it open those windows on startup. The Windows one exists because
 that frontend is only ever exercised by cross-building and running under
 Wine, where there is no way to drive a menu.
 `INTV_DEBUGGER_TAB` picks the debugger's tab when it opens: a number from 0,
-or the start of a tab's name (`cpu`, `basic`, `stic`, `symbols`, `fujinet`).
+or the start of a tab's name (`cpu`, `basic`, `memory`, `stic`, `symbols`, `fujinet`).
 `INTV_BASIC_IMPORT=<file.bas or folder>` imports IntyBASIC source into the
 debugger's BASIC tab as it opens, and `INTV_BASIC_BREAK=<name.bas>:<line>` sets
 a breakpoint on one of its lines (GNOME, KDE and Windows; macOS is unbuilt like

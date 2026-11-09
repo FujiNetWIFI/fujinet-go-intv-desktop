@@ -52,6 +52,7 @@
 
 #include "intvdebug.h"
 #include "intvstic.h"
+#include "../accent_button.h"
 #include "../help/help_window.h"
 #include "srcmap.h"
 #include "symbols.h"
@@ -62,14 +63,16 @@
 #define CARD_ROWS_PER_PAGE 8 /* 128 cards/page at CARDS_PER_ROW=16 */
 
 #define WM_DBG_ACCEPT (WM_APP + 1) /* wp: control id -- Enter in an edit */
+#define WM_DBG_LINE (WM_APP + 2)   /* wp: control id, lp: the clicked line's value */
 
 #define TIMER_REFRESH 1
 
 #define PAGE_CPU 0
 #define PAGE_BASIC 1
-#define PAGE_STIC 2
-#define PAGE_SYMBOLS 3
-#define PAGE_FUJINET 4
+#define PAGE_MEMORY 2
+#define PAGE_STIC 3
+#define PAGE_SYMBOLS 4
+#define PAGE_FUJINET 5
 
 #define FUJI_TICKS 5 /* the FujiNet tab, every 500ms while it shows */
 
@@ -154,8 +157,8 @@ static const char *const kRegNames[8] = {"R0", "R1", "R2", "R3",
 
 /* The tabs, in PAGE_* order; INTV_DEBUGGER_TAB picks one by number or by the
  * start of its name (any case), for tests and captures. */
-static const char *const k_tab_names[] = {"CPU", "BASIC", "STIC", "Symbols",
-                                          "FujiNet"};
+static const char *const k_tab_names[] = {"CPU", "BASIC", "Memory", "STIC",
+                                          "Symbols", "FujiNet"};
 #define TAB_COUNT ((int)(sizeof(k_tab_names) / sizeof(k_tab_names[0])))
 
 static int tab_from_env(void)
@@ -232,7 +235,6 @@ static LRESULT CALLBACK pixels_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 /* ---- edit/disasm subclassing ----------------------------------------------- */
 
 static WNDPROC g_edit_proc;
-static WNDPROC g_disasm_proc;
 static WNDPROC g_sym_list_proc;
 
 static LRESULT CALLBACK edit_subclass(HWND hwnd, UINT msg, WPARAM wp,
@@ -248,47 +250,250 @@ static LRESULT CALLBACK edit_subclass(HWND hwnd, UINT msg, WPARAM wp,
     return CallWindowProcA(g_edit_proc, hwnd, msg, wp, lp);
 }
 
-static LRESULT CALLBACK disasm_subclass(HWND hwnd, UINT msg, WPARAM wp,
-                                        LPARAM lp)
-{
-    if (msg == WM_LBUTTONDOWN && g_dbg && intvdebug_is_paused(g_dbg->dbg)) {
-        LRESULT pos = SendMessageA(hwnd, EM_CHARFROMPOS, 0, lp);
-        int line = HIWORD(pos);
-        char buf[256];
-        unsigned addr;
-        int n;
+/* ---- line view (the disassembly and the BASIC source) ---------------------
+ * An EDIT control cannot paint a current-line bar or a red dot, so these two
+ * views are a small window class: it keeps the lines it was given (text, a
+ * LV_PC / LV_BP flag set, and a value handed back on a click), paints the
+ * current line as a bar in the accent colour, a breakpoint as a red dot in
+ * the gutter, and scrolls on its own scroll bar. A click posts WM_DBG_LINE
+ * to the parent. */
 
-        *(WORD *)buf = (WORD)(sizeof(buf) - 1);
-        n = (int)SendMessageA(hwnd, EM_GETLINE, (WPARAM)line, (LPARAM)buf);
-        if (n >= 6) {
-            buf[n] = '\0';
-            if (sscanf(buf + 1, "%4X", &addr) == 1 && addr <= 0xFFFF) {
-                intvdebug_breakpoint_toggle(g_dbg->dbg, (uint16_t)addr);
-                g_dbg->seen_serial = 0;
-            }
-        }
-    }
-    return CallWindowProcA(g_disasm_proc, hwnd, msg, wp, lp);
+#define LV_PC 1
+#define LV_BP 2
+#define LV_GUTTER 22
+
+typedef struct {
+    int n, cap, first;
+    char **text;
+    unsigned char *flags;
+    int *aux;
+    HFONT font;
+} lineview;
+
+static lineview *lv_of(HWND h)
+{
+    return (lineview *)GetWindowLongPtrA(h, GWLP_USERDATA);
 }
 
-static WNDPROC g_bas_proc;
-
-/* A click on a BASIC line that has code toggles a breakpoint on it. */
-static LRESULT CALLBACK bas_subclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+static int lv_row_h(HWND h, lineview *lv)
 {
-    if (msg == WM_LBUTTONDOWN && g_dbg && g_dbg->bas_file >= 0) {
-        LRESULT pos = SendMessageA(hwnd, EM_CHARFROMPOS, 0, lp);
-        const int line = HIWORD(pos) + 1;
-        const int addr = intvsrcmap_first_addr(g_dbg->srcmap, g_dbg->bas_file, line);
+    HDC dc = GetDC(h);
+    HGDIOBJ old = SelectObject(dc, lv->font ? lv->font : GetStockObject(DEFAULT_GUI_FONT));
+    TEXTMETRICA tm;
+    int rh = 15;
+    if (GetTextMetricsA(dc, &tm))
+        rh = tm.tmHeight + 2;
+    SelectObject(dc, old);
+    ReleaseDC(h, dc);
+    return rh;
+}
 
-        if (addr >= 0) {
-            intvdebug_breakpoint_toggle(g_dbg->dbg, (uint16_t)addr);
-            g_dbg->seen_serial = 0; /* redraw the marker */
-        } else {
-            SetWindowTextA(g_dbg->status, "No code on that line");
+static int lv_rows(HWND h, lineview *lv)
+{
+    RECT c;
+    int rows;
+    GetClientRect(h, &c);
+    rows = c.bottom / lv_row_h(h, lv);
+    return rows < 1 ? 1 : rows;
+}
+
+static void lv_sync(HWND h, lineview *lv)
+{
+    SCROLLINFO si;
+    const int rows = lv_rows(h, lv);
+    int max_first = lv->n - rows;
+
+    if (max_first < 0)
+        max_first = 0;
+    if (lv->first > max_first)
+        lv->first = max_first;
+    if (lv->first < 0)
+        lv->first = 0;
+    memset(&si, 0, sizeof(si));
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    si.nMin = 0;
+    si.nMax = lv->n > 0 ? lv->n - 1 : 0;
+    si.nPage = (UINT)rows;
+    si.nPos = lv->first;
+    SetScrollInfo(h, SB_VERT, &si, TRUE);
+    InvalidateRect(h, NULL, FALSE);
+}
+
+static void lv_begin(HWND h)
+{
+    lineview *lv = lv_of(h);
+    int i;
+    if (!lv)
+        return;
+    for (i = 0; i < lv->n; i++)
+        free(lv->text[i]);
+    lv->n = 0;
+}
+
+static void lv_add(HWND h, const char *text, int flags, int aux)
+{
+    lineview *lv = lv_of(h);
+    char buf[512];
+    size_t o = 0;
+
+    if (!lv)
+        return;
+    for (; *text && o + 5 < sizeof(buf); text++) { /* tabs -> 4 spaces */
+        if (*text == '\t') {
+            memcpy(buf + o, "    ", 4);
+            o += 4;
+        } else if (*text != '\r' && *text != '\n') {
+            buf[o++] = *text;
         }
     }
-    return CallWindowProcA(g_bas_proc, hwnd, msg, wp, lp);
+    buf[o] = '\0';
+    if (lv->n == lv->cap) {
+        int ncap = lv->cap ? lv->cap * 2 : 64;
+        lv->text = realloc(lv->text, (size_t)ncap * sizeof(char *));
+        lv->flags = realloc(lv->flags, (size_t)ncap);
+        lv->aux = realloc(lv->aux, (size_t)ncap * sizeof(int));
+        lv->cap = ncap;
+    }
+    lv->text[lv->n] = _strdup(buf);
+    lv->flags[lv->n] = (unsigned char)flags;
+    lv->aux[lv->n] = aux;
+    lv->n++;
+}
+
+/* reveal: a line to bring into view (centred if it is not), or -1 */
+static void lv_end(HWND h, int reveal)
+{
+    lineview *lv = lv_of(h);
+    if (!lv)
+        return;
+    if (reveal >= 0) {
+        const int rows = lv_rows(h, lv);
+        if (reveal < lv->first || reveal >= lv->first + rows - 1)
+            lv->first = reveal - rows / 2;
+    }
+    lv_sync(h, lv);
+}
+
+static void lv_top(HWND h)
+{
+    lineview *lv = lv_of(h);
+    if (lv)
+        lv->first = 0;
+}
+
+static LRESULT CALLBACK lines_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    lineview *lv = lv_of(hwnd);
+    int i;
+
+    switch (msg) {
+    case WM_NCCREATE:
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)calloc(1, sizeof(lineview)));
+        break;
+    case WM_NCDESTROY:
+        if (lv) {
+            for (i = 0; i < lv->n; i++)
+                free(lv->text[i]);
+            free(lv->text);
+            free(lv->flags);
+            free(lv->aux);
+            free(lv);
+            SetWindowLongPtrA(hwnd, GWLP_USERDATA, 0);
+        }
+        break;
+    case WM_SETFONT:
+        if (lv) {
+            lv->font = (HFONT)wp;
+            lv_sync(hwnd, lv);
+        }
+        return 0;
+    case WM_GETFONT:
+        return lv ? (LRESULT)lv->font : 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SIZE:
+        if (lv)
+            lv_sync(hwnd, lv);
+        return 0;
+    case WM_VSCROLL:
+        if (lv) {
+            const int rows = lv_rows(hwnd, lv);
+            int pos = lv->first;
+            switch (LOWORD(wp)) {
+            case SB_LINEUP: pos--; break;
+            case SB_LINEDOWN: pos++; break;
+            case SB_PAGEUP: pos -= rows - 1; break;
+            case SB_PAGEDOWN: pos += rows - 1; break;
+            case SB_TOP: pos = 0; break;
+            case SB_BOTTOM: pos = lv->n; break;
+            case SB_THUMBTRACK:
+            case SB_THUMBPOSITION: pos = (int)HIWORD(wp); break;
+            }
+            lv->first = pos;
+            lv_sync(hwnd, lv);
+        }
+        return 0;
+    case WM_MOUSEWHEEL:
+        if (lv) {
+            lv->first -= (short)HIWORD(wp) / WHEEL_DELTA * 3;
+            lv_sync(hwnd, lv);
+        }
+        return 0;
+    case WM_LBUTTONDOWN:
+        SetFocus(hwnd);
+        if (lv) {
+            const int line = lv->first + (short)HIWORD(lp) / lv_row_h(hwnd, lv);
+            if (line >= 0 && line < lv->n)
+                PostMessageA(GetParent(hwnd), WM_DBG_LINE,
+                             (WPARAM)GetDlgCtrlID(hwnd), (LPARAM)lv->aux[line]);
+        }
+        return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT c;
+        static HBRUSH bar, dot;
+        static HPEN dotpen;
+        HGDIOBJ oldfont;
+        TEXTMETRICA tm;
+        int rh = 15, y = 0;
+
+        if (!bar) {
+            bar = CreateSolidBrush(INTV_ACCENT_COLORREF);
+            dot = CreateSolidBrush(RGB(0xE0, 0x1B, 0x24));
+            dotpen = CreatePen(PS_SOLID, 1, RGB(0xE0, 0x1B, 0x24));
+        }
+        GetClientRect(hwnd, &c);
+        FillRect(hdc, &c, GetSysColorBrush(COLOR_WINDOW));
+        oldfont = SelectObject(hdc, lv && lv->font ? lv->font : GetStockObject(DEFAULT_GUI_FONT));
+        if (GetTextMetricsA(hdc, &tm))
+            rh = tm.tmHeight + 2;
+        SetBkMode(hdc, TRANSPARENT);
+        for (i = lv ? lv->first : 0; lv && i < lv->n && y < c.bottom; i++, y += rh) {
+            RECT r;
+            r.left = 0; r.top = y; r.right = c.right; r.bottom = y + rh;
+            if (lv->flags[i] & LV_PC) {
+                FillRect(hdc, &r, bar);
+                SetTextColor(hdc, RGB(255, 255, 255));
+            } else {
+                SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
+            }
+            TextOutA(hdc, LV_GUTTER, y + 1, lv->text[i], (int)strlen(lv->text[i]));
+            if (lv->flags[i] & LV_BP) {
+                HGDIOBJ ob = SelectObject(hdc, dot), op = SelectObject(hdc, dotpen);
+                const int top = y + (rh - 10) / 2;
+                Ellipse(hdc, 6, top, 16, top + 10);
+                SelectObject(hdc, ob);
+                SelectObject(hdc, op);
+            }
+        }
+        SelectObject(hdc, oldfont);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
 /* Forward declarations: show_page/refresh_mem are defined later (layout and
@@ -411,16 +616,15 @@ static void build_controls(debugger *d)
                      IDC_STATUS);
 
     /* CPU page */
-    d->disasm = mono_view(d, IDC_DISASM);
-    g_disasm_proc = (WNDPROC)SetWindowLongPtrA(d->disasm, GWLP_WNDPROC,
-                                               (LONG_PTR)disasm_subclass);
+    d->disasm = child(d, "IntvDbgLines", "", WS_VISIBLE | WS_BORDER | WS_VSCROLL,
+                      IDC_DISASM);
     for (i = 0; i < 8; i++) {
         d->reg_label[i] = label(d, kRegNames[i]);
         d->reg_edit[i] = field(d, IDC_REG0 + i);
         EnableWindow(d->reg_edit[i], FALSE); /* read-only: see file header */
     }
     d->flags = label(d, "");
-    d->mem_label = label(d, "Memory");
+    d->mem_label = label(d, "Address:");
     d->mem_addr = field(d, IDC_MEM_ADDR);
     SetWindowTextA(d->mem_addr, "0000");
     d->mem_view = mono_view(d, IDC_MEM_VIEW);
@@ -440,9 +644,8 @@ static void build_controls(debugger *d)
                          IDC_BAS_FILES);
 
     d->bas_note = label(d, "");
-    d->bas_view = mono_view(d, IDC_BAS_VIEW);
-    g_bas_proc = (WNDPROC)SetWindowLongPtrA(d->bas_view, GWLP_WNDPROC,
-                                            (LONG_PTR)bas_subclass);
+    d->bas_view = child(d, "IntvDbgLines", "", WS_VISIBLE | WS_BORDER | WS_VSCROLL,
+                        IDC_BAS_VIEW);
     d->bas_file = -1;
 
     /* STIC page */
@@ -502,8 +705,8 @@ static void build_controls(debugger *d)
 
 /* Help's contexts (intvhelp.h), one per tab */
 static const char *const k_tab_contexts[] = {
-    "debugger/cpu", "debugger/basic", "debugger/stic", "debugger/symbols",
-    "debugger/fujinet",
+    "debugger/cpu", "debugger/basic", "debugger/memory", "debugger/stic",
+    "debugger/symbols", "debugger/fujinet",
 };
 
 static void show_page(debugger *d, int page)
@@ -514,14 +717,14 @@ static void show_page(debugger *d, int page)
     if (page >= 0 && page < (int)(sizeof k_tab_contexts / sizeof k_tab_contexts[0]))
         intv_help_set_context(d->hwnd, k_tab_contexts[page], 1);
     ShowWindow(d->disasm, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
-    for (i = 0; i < 8; i++) {
-        ShowWindow(d->reg_label[i], page == PAGE_CPU ? SW_SHOW : SW_HIDE);
-        ShowWindow(d->reg_edit[i], page == PAGE_CPU ? SW_SHOW : SW_HIDE);
+    for (i = 0; i < 8; i++) { /* the registers sit under every page */
+        ShowWindow(d->reg_label[i], SW_SHOW);
+        ShowWindow(d->reg_edit[i], SW_SHOW);
     }
-    ShowWindow(d->flags, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->mem_label, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->mem_addr, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
-    ShowWindow(d->mem_view, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->flags, SW_SHOW);
+    ShowWindow(d->mem_label, page == PAGE_MEMORY ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->mem_addr, page == PAGE_MEMORY ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->mem_view, page == PAGE_MEMORY ? SW_SHOW : SW_HIDE);
     ShowWindow(d->break_label, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
     ShowWindow(d->break_addr, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
 
@@ -566,7 +769,7 @@ static void show_page(debugger *d, int page)
 static void layout(debugger *d)
 {
     RECT client, page;
-    int x, y, i;
+    int y, i;
 
     GetClientRect(d->hwnd, &client);
 
@@ -585,46 +788,33 @@ static void layout(debugger *d)
     }
     y += 32;
 
-    MoveWindow(d->tabs, 4, y, client.right - 8, client.bottom - y - 4, TRUE);
+    MoveWindow(d->tabs, 4, y, client.right - 8, client.bottom - y - 4 - 60, TRUE);
     page = client;
     page.top = y;
+    page.bottom = client.bottom - 60;   /* the registers strip is below */
     SendMessageA(d->tabs, TCM_ADJUSTRECT, FALSE, (LPARAM)&page);
 
-    /* CPU page */
-    MoveWindow(d->disasm, page.left, page.top,
-              (page.right - page.left) * 2 / 3, page.bottom - page.top, TRUE);
-    x = page.left + (page.right - page.left) * 2 / 3 + 8;
+    /* CPU page: the disassembly, and a "Break at" row under it */
+    MoveWindow(d->disasm, page.left, page.top, page.right - page.left - 8,
+              page.bottom - page.top - 30, TRUE);
+    MoveWindow(d->break_label, page.left, page.bottom - 24, 70, 18, TRUE);
+    MoveWindow(d->break_addr, page.left + 74, page.bottom - 26, 220, 22, TRUE);
+
+    /* Memory page */
+    MoveWindow(d->mem_label, page.left, page.top + 2, 70, 18, TRUE);
+    MoveWindow(d->mem_addr, page.left + 74, page.top, 260, 22, TRUE);
+    MoveWindow(d->mem_view, page.left, page.top + 28, page.right - page.left - 8,
+              page.bottom - page.top - 32, TRUE);
+
+    /* Registers: a strip under every page */
     {
-        int ry = page.top;
+        const int ry = client.bottom - 56;
         for (i = 0; i < 8; i++) {
-            MoveWindow(d->reg_label[i], x + (i % 2) * 100, ry, 60, 18, TRUE);
-            MoveWindow(d->reg_edit[i], x + (i % 2) * 100 + 60, ry, 60, 20,
-                      TRUE);
-            if (i % 2 == 1)
-                ry += 24;
+            const int rx = 8 + (i % 4) * 128, rr = ry + (i / 4) * 26;
+            MoveWindow(d->reg_label[i], rx, rr + 2, 58, 18, TRUE);
+            MoveWindow(d->reg_edit[i], rx + 58, rr, 62, 22, TRUE);
         }
-        ry += 8;
-        MoveWindow(d->flags, x, ry, 260, 40, TRUE);
-        ry += 48;
-        MoveWindow(d->mem_label, x, ry, 100, 18, TRUE);
-        ry += 20;
-        MoveWindow(d->mem_addr, x, ry, 100, 22, TRUE);
-        ry += 26;
-        {
-            /* Reserve a fixed footer below the memory view for the "Break
-             * at" row rather than a second absolute position from
-             * page.bottom -- keeps this the same style of cumulative-ry
-             * layout as the rest of the function. */
-            const int break_footer = 18 + 4 + 22;
-            int mem_h = page.bottom - ry - 4 - break_footer;
-            if (mem_h < 40)
-                mem_h = 40;
-            MoveWindow(d->mem_view, x, ry, page.right - x - 8, mem_h, TRUE);
-            ry += mem_h + 4;
-            MoveWindow(d->break_label, x, ry, 100, 18, TRUE);
-            ry += 20;
-            MoveWindow(d->break_addr, x, ry, page.right - x - 8, 22, TRUE);
-        }
+        MoveWindow(d->flags, 8 + 4 * 128 + 12, ry + 2, 300, 40, TRUE);
     }
 
     /* BASIC page */
@@ -712,27 +902,27 @@ static void refresh_disasm(debugger *d)
 {
     intvdebug_dasm_line lines[DISASM_LINES];
     intvdebug_regs r;
-    char text[16384];
-    int n, i, len = 0;
+    int n, i;
 
+    lv_begin(d->disasm);
     if (!intvdebug_regs_get(d->dbg, &r)) {
-        SetWindowTextA(d->disasm, "");
+        lv_end(d->disasm, -1);
         return;
     }
     n = intvdebug_disassemble(d->dbg, r.pc, r.D, lines, DISASM_LINES);
-    for (i = 0; i < n && len < (int)sizeof(text) - 128; i++) {
-        char symsuffix[96];
+    for (i = 0; i < n; i++) {
+        char symsuffix[96], text[256];
         intvsym_annotate_line(d->symtab, &lines[i], symsuffix,
                               sizeof(symsuffix));
-        len += snprintf(text + len, sizeof(text) - (size_t)len,
-                       "%c%c%04X  %-24s%s\r\n",
-                       lines[i].addr == r.pc ? '>' : ' ',
-                       intvdebug_breakpoint_is_set(d->dbg, lines[i].addr)
-                           ? '*'
-                           : ' ',
-                       lines[i].addr, lines[i].text, symsuffix);
+        snprintf(text, sizeof(text), "%04X  %-24s%s", lines[i].addr,
+                 lines[i].text, symsuffix);
+        lv_add(d->disasm, text,
+               (lines[i].addr == r.pc ? LV_PC : 0) |
+                   (intvdebug_breakpoint_is_set(d->dbg, lines[i].addr) ? LV_BP : 0),
+               lines[i].addr);
     }
-    SetWindowTextA(d->disasm, text);
+    lv_top(d->disasm);
+    lv_end(d->disasm, -1);
 }
 
 static void refresh_regs(debugger *d)
@@ -1075,6 +1265,7 @@ static void basic_reload(debugger *d)
     }
     SendMessageA(d->bas_files, CB_SETCURSEL, (WPARAM)d->bas_file, 0);
     d->bas_pc_line = 0;
+    lv_top(d->bas_view);
     if (n == 0)
         SetWindowTextA(d->bas_note,
             "Import a .bas file, or a folder of them. The assembler's map "
@@ -1086,8 +1277,6 @@ static void refresh_basic(debugger *d, int paused)
     const unsigned gen = intvsrcmap_generation(d->srcmap);
     intvdebug_regs r;
     int pf = -1, pl = 0;
-    char *text;
-    size_t cap, len = 0;
     int n, i, line;
 
     if (gen != d->bas_gen) {
@@ -1107,45 +1296,26 @@ static void refresh_basic(debugger *d, int paused)
     }
 
     n = d->bas_file >= 0 ? intvsrcmap_line_count(d->srcmap, d->bas_file) : 0;
-    cap = (size_t)n * 256 + 16;
-    text = malloc(cap);
-    if (!text)
-        return;
-    text[0] = '\0';
-    for (i = 1; i <= n && len + 256 < cap; i++) {
+    lv_begin(d->bas_view);
+    for (i = 1; i <= n; i++) {
         const int addr = intvsrcmap_first_addr(d->srcmap, d->bas_file, i);
         const char *src = intvsrcmap_line_text(d->srcmap, d->bas_file, i);
-        len += (size_t)snprintf(text + len, cap - len, "%c%c%5d  %.200s\r\n",
-                                pf == d->bas_file && i == pl ? '>' : ' ',
-                                addr >= 0 && intvdebug_breakpoint_is_set(d->dbg, (uint16_t)addr)
-                                    ? '*' : ' ',
-                                i, src ? src : "");
+        char text[300];
+        snprintf(text, sizeof(text), "%5d  %.250s", i, src ? src : "");
+        lv_add(d->bas_view, text,
+               (pf == d->bas_file && i == pl ? LV_PC : 0) |
+                   (addr >= 0 && intvdebug_breakpoint_is_set(d->dbg, (uint16_t)addr) ? LV_BP : 0),
+               i);
     }
-    {   /* only touch the control when something changed: it keeps the scroll */
-        const int cur = GetWindowTextLengthA(d->bas_view);
-        char *old = (int)len == cur ? malloc((size_t)cur + 1) : NULL;
-        int same = 0;
-        if (old) {
-            GetWindowTextA(d->bas_view, old, cur + 1);
-            same = strcmp(old, text) == 0;
-            free(old);
-        }
-        if (!same)
-            set_text_at(d->bas_view, text, 0);
-    }
-    free(text);
-
     line = pf == d->bas_file ? pl : 0;
-    if (line != d->bas_pc_line) {
-        d->bas_pc_line = line;
-        if (line > 0) { /* bring it into the middle if it isn't in view */
-            const int first = (int)SendMessageA(d->bas_view, EM_GETFIRSTVISIBLELINE, 0, 0);
-            const int rows = edit_rows(d, d->bas_view);
-            if (line - 1 < first || line - 1 >= first + rows - 1) {
-                int want = line - 1 - rows / 2;
-                edit_scroll_to(d->bas_view, want < 0 ? 0 : want);
-            }
+    {
+        int reveal = -1;
+        if (line != d->bas_pc_line) {
+            d->bas_pc_line = line;
+            if (line > 0)
+                reveal = line - 1;
         }
+        lv_end(d->bas_view, reveal);
     }
 }
 
@@ -1291,7 +1461,8 @@ static void refresh_all(debugger *d)
         int i;
         for (i = 0; i < 8; i++) SetWindowTextA(d->reg_edit[i], "");
         SetWindowTextA(d->flags, "");
-        SetWindowTextA(d->disasm, "");
+        lv_begin(d->disasm);
+        lv_end(d->disasm, -1);
         SetWindowTextA(d->mem_view, "");
     }
     /* Independent of run/pause -- the symbol list reflects what's loaded,
@@ -1318,6 +1489,8 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         NMHDR *nm = (NMHDR *)lp;
         if (!d)         /* a notification during teardown */
             return 0;
+        if (nm->code == NM_CUSTOMDRAW && nm->hwndFrom == d->pause_btn) /* Continue wears the accent */
+            return intv_accent_customdraw((const NMCUSTOMDRAW *)lp, intvdebug_is_paused(d->dbg));
         if (nm->hwndFrom == d->tabs && nm->code == TCN_SELCHANGE)
             show_page(d, (int)SendMessageA(d->tabs, TCM_GETCURSEL, 0, 0));
         return 0;
@@ -1333,6 +1506,22 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                        ++d->fuji_ticks >= FUJI_TICKS) {
                 /* the one view that moves while the machine runs */
                 refresh_fujinet(d, 0);
+            }
+        }
+        return 0;
+    case WM_DBG_LINE:
+        if (!d)
+            return 0;
+        if (wp == IDC_DISASM) {
+            intvdebug_breakpoint_toggle(d->dbg, (uint16_t)lp);
+            d->seen_serial = 0;
+        } else if (wp == IDC_BAS_VIEW && d->bas_file >= 0) {
+            const int addr = intvsrcmap_first_addr(d->srcmap, d->bas_file, (int)lp);
+            if (addr >= 0) {
+                intvdebug_breakpoint_toggle(d->dbg, (uint16_t)addr);
+                d->seen_serial = 0;
+            } else {
+                SetWindowTextA(d->status, "No code on that line");
             }
         }
         return 0;
@@ -1398,6 +1587,7 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 if (sel >= 0) {
                     d->bas_file = sel;
                     d->bas_pc_line = 0;
+                    lv_top(d->bas_view);
                     d->seen_serial = 0;
                     refresh_basic(d, intvdebug_is_paused(d->dbg));
                 }
@@ -1547,6 +1737,13 @@ void intv_debugger_show(HWND parent, intvsession *session)
         wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
         wc.lpszClassName = "IntvDebuggerWindow";
         RegisterClassA(&wc);
+
+        memset(&pc, 0, sizeof(pc));
+        pc.lpfnWndProc = lines_proc;
+        pc.hInstance = inst;
+        pc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        pc.lpszClassName = "IntvDbgLines";
+        RegisterClassA(&pc);
 
         memset(&pc, 0, sizeof(pc));
         pc.lpfnWndProc = pixels_proc;

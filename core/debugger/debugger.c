@@ -53,6 +53,9 @@
 #include "fujitrace.h"
 #include "intv_host.h"
 #include "intvdebug.h"
+#include "srcmap.h"
+
+enum { LINE_NONE = 0, LINE_INTO, LINE_OVER, LINE_OUT };
 
 struct intvdebug {
     int engaged;
@@ -61,6 +64,9 @@ struct intvdebug {
     int paused;      /* the emulator thread is blocked inside the hook */
     int step_mode;   /* 1: step_count stays 1 (single-instruction ticks);
                       * 0: step_count is huge (only real breakpoints tick) */
+    int line_mode;   /* LINE_*: a by-BASIC-line step is in flight; step_mode
+                      * is 1 too, and the hook keeps going until a line starts */
+    uint16_t line_r6;/* R6 when that step began */
     uint64_t stop_serial;
 
     uint16_t breakpoints[INTVDEBUG_MAX_BREAKPOINTS];
@@ -98,6 +104,21 @@ intvdebug *intvdebug_get(void)
  * to force every instruction to reach here). Anything else is a no-op
  * return, and free-running costs one extra periph_t-level call per
  * timeslice -- not per instruction. */
+/* Was the instruction that just ran a JSR? Its destination's first word is
+ * where a callee starts, before the PSHR R5 that every IntyBASIC procedure
+ * opens with has deepened the stack, so depth alone can't tell that word from
+ * the caller's own next line. */
+static int prev_was_call(void)
+{
+    cp1600_t *const cp = &intv.cp1600;
+    const uint16_t a = (uint16_t)cp->oldpc;
+    char text[64];
+
+    dasm1600(text, a, 0, CP1600_PK(cp, a), CP1600_PK(cp, (uint16_t)(a + 1)),
+             CP1600_PK(cp, (uint16_t)(a + 2)));
+    return strstr(text, "JSR") != NULL;
+}
+
 static uint32_t debug_tick(periph_t *req, uint32_t cycles)
 {
     (void)req;
@@ -109,6 +130,27 @@ static uint32_t debug_tick(periph_t *req, uint32_t cycles)
         pthread_mutex_unlock(&d->lock);
         return 0;
     }
+
+    /* A by-line step keeps single-stepping silently until the PC lands on
+     * the first word of a BASIC line at an acceptable stack depth (a real
+     * breakpoint still stops it, below). The stack grows upward on the
+     * CP-1610, so a callee runs at a larger R6 than its caller. */
+    if (d->line_mode != LINE_NONE && intv.cp1600.hit_breakpoint == BK_NONE) {
+        const uint16_t sp = intv.cp1600.r[6];
+        int stop = intvsrcmap_is_line_start(intvsrcmap_shared(),
+                                            intv.cp1600.r[7]);
+        if (stop && d->line_mode == LINE_OVER && sp > d->line_r6)
+            stop = 0;
+        if (stop && d->line_mode == LINE_OUT && sp >= d->line_r6)
+            stop = 0;
+        if (stop && d->line_mode == LINE_OVER && prev_was_call())
+            stop = 0;
+        if (!stop) {
+            pthread_mutex_unlock(&d->lock);
+            return 0;
+        }
+    }
+    d->line_mode = LINE_NONE;
 
     d->paused = 1;
     d->stop_serial++;
@@ -126,6 +168,13 @@ static uint32_t debug_tick(periph_t *req, uint32_t cycles)
      * (intvdebug_resume clears step_mode, intvdebug_step/step_over/
      * step_out set or clear it as appropriate -- see each). */
     intv.cp1600.step_count = d->step_mode ? 1 : ~0U;
+    /* step_count only feeds steps_remaining when that reaches 0. Pausing out
+     * of a free run leaves it at ~step_count minus whatever ran, so a Step
+     * would run on until the next timeslice (or breakpoint) instead of one
+     * instruction. Restart the countdown here, on the emulator thread:
+     * 1 = stop after the next instruction, 0 = unlimited (cp1600_run then
+     * refills it from step_count). */
+    intv.cp1600.steps_remaining = d->step_mode ? 1 : 0;
     pthread_mutex_unlock(&d->lock);
 
     return 0; /* NEVER CYC_MAX -- that aborts cp1600_run's whole timeslice. */
@@ -158,6 +207,7 @@ void intvdebug_pause(intvdebug *d)
         return;
     pthread_mutex_lock(&d->lock);
     d->step_mode = 1;
+    d->line_mode = LINE_NONE; /* a pause must stop a by-line step too */
     pthread_mutex_unlock(&d->lock);
     /* Racing a plain int write against the emulator thread's read of
      * step_count is deliberate and harmless here: the worst case is the
@@ -182,8 +232,22 @@ int intvdebug_is_paused(const intvdebug *d)
     return d->paused;
 }
 
+/* Stopping at an address a breakpoint is armed on (a step or a by-line stop
+ * lands there without the breakpoint having fired) must not make the next
+ * run fire it again before executing anything. cp1600_set_breakpt on the
+ * current PC arms it for the instruction after this one instead. Only while
+ * paused. */
+static void step_off_breakpoint(intvdebug *d)
+{
+    const uint16_t pc = intv.cp1600.r[7];
+    if (intvdebug_breakpoint_is_set(d, pc))
+        cp1600_set_breakpt(&intv.cp1600, pc, CP1600_BKPT);
+}
+
 void intvdebug_step(intvdebug *d)
 {
+    if (d->paused)
+        step_off_breakpoint(d);
     pthread_mutex_lock(&d->lock);
     if (d->paused) {
         d->step_mode = 1;
@@ -199,7 +263,10 @@ void intvdebug_step(intvdebug *d)
  * with it. */
 static int is_call_mnemonic(const char *text)
 {
-    return strncmp(text, "JSR", 3) == 0;
+    /* dasm1600's text leads with the address and the instruction's hex
+     * words ("   $50CD  0004 0150 00D5   JSR  R5,$50D5"), so the mnemonic is
+     * not at the start. Nothing else in the line can spell JSR. */
+    return strstr(text, "JSR") != NULL;
 }
 
 void intvdebug_step_over(intvdebug *d)
@@ -208,6 +275,7 @@ void intvdebug_step_over(intvdebug *d)
 
     if (!d->paused)
         return;
+    step_off_breakpoint(d);
     if (intvdebug_disassemble(d, intv.cp1600.r[7], intv.cp1600.D, &line, 1) != 1 ||
         !is_call_mnemonic(line.text)) {
         intvdebug_step(d);
@@ -229,6 +297,7 @@ void intvdebug_step_out(intvdebug *d)
 {
     if (!d->paused)
         return;
+    step_off_breakpoint(d);
 
     /* Best-effort; see intvdebug.h's own comment on why R5 and why this
      * can silently fail to stop rather than stop somewhere wrong. */
@@ -239,6 +308,43 @@ void intvdebug_step_out(intvdebug *d)
     d->paused = 0;
     pthread_cond_broadcast(&d->cond);
     pthread_mutex_unlock(&d->lock);
+}
+
+static void begin_line_step(intvdebug *d, int mode)
+{
+    if (d->paused)
+        step_off_breakpoint(d);
+    pthread_mutex_lock(&d->lock);
+    if (d->paused) {
+        d->line_r6 = intv.cp1600.r[6];
+        /* Stopped on a callee's first word, straight after its JSR: the
+         * PSHR R5 that opens an IntyBASIC procedure hasn't run, so the
+         * stack is one shallower than the body will be. Count the body as
+         * this routine's own level, or Over would skip all of it and Out
+         * would not stop until the caller's caller. */
+        if (mode != LINE_INTO && prev_was_call())
+            d->line_r6++;
+        d->line_mode = mode;
+        d->step_mode = 1;
+        d->paused = 0;
+        pthread_cond_broadcast(&d->cond);
+    }
+    pthread_mutex_unlock(&d->lock);
+}
+
+void intvdebug_step_line(intvdebug *d)
+{
+    begin_line_step(d, LINE_INTO);
+}
+
+void intvdebug_step_line_over(intvdebug *d)
+{
+    begin_line_step(d, LINE_OVER);
+}
+
+void intvdebug_step_line_out(intvdebug *d)
+{
+    begin_line_step(d, LINE_OUT);
 }
 
 uint64_t intvdebug_stop_serial(const intvdebug *d)

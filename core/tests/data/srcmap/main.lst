@@ -1,0 +1,52 @@
+                                	SRCFILE "main.bas",1
+                                	;[2] x = 0
+                                	SRCFILE "main.bas",2
+50C5   01C0                     	CLRR R0
+50C6   0240 010C                	MVO R0,var_X
+                                	;[3] main:
+                                	SRCFILE "main.bas",3
+                                	; MAIN
+0x50C8                          label_MAIN:	;[4]   x = x + 1
+                                	SRCFILE "main.bas",4
+50C8   0280 010C                	MVI var_X,R0
+50CA   0008                     	INCR R0
+50CB   0240 010C                	MVO R0,var_X
+                                	;[5]   GOSUB bump
+                                	SRCFILE "main.bas",5
+50CD   0004 0150 00D5           	CALL label_BUMP
+                                	;[6]   WAIT
+                                	SRCFILE "main.bas",6
+50D0   0004 0150 010E           	CALL _wait
+                                	;[7]   GOTO main
+                                	SRCFILE "main.bas",7
+50D3   0220 000C                	B label_MAIN
+                                	;[8] 
+                                	SRCFILE "main.bas",8
+                                	;[9] INCLUDE "inc.bas"
+                                	SRCFILE "main.bas",9
+                                	;FILE inc.bas
+                                	;[1] REM included by main.bas
+                                	SRCFILE "inc.bas",1
+                                	;[2] bump: PROCEDURE
+                                	SRCFILE "inc.bas",2
+                                	; BUMP
+0x50D5                          label_BUMP:	PROC
+50D5   0275                     	BEGIN
+                                	;[3]   y = x + 2
+                                	SRCFILE "inc.bas",3
+50D6   0280 010C                	MVI var_X,R0
+50D8   02F8 0002                	ADDI #2,R0
+50DA   0240 010D                	MVO R0,var_Y
+                                	;[4]   y = y + 1
+                                	SRCFILE "inc.bas",4
+50DC   0280 010D                	MVI var_Y,R0
+50DE   0008                     	INCR R0
+50DF   0240 010D                	MVO R0,var_Y
+                                	;[5]   END
+                                	SRCFILE "inc.bas",5
+50E1   02B7                     	RETURN
+                                	ENDP
+                                	;ENDFILE
+                                	;FILE main.bas
+                                	;ENDFILE
+                                	SRCFILE "",0

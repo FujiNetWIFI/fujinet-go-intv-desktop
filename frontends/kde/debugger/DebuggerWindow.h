@@ -12,7 +12,9 @@
 #include "intvstic.h"
 
 struct intvsymtab;
+struct intvsrcmap;
 
+class QComboBox;
 class QLabel;
 class QLineEdit;
 class QListWidget;
@@ -49,6 +51,18 @@ private:
     void goToAddr();
     void breakAtAddr();
     void refreshSymbols();
+    QWidget *buildBasic();
+    void refreshBasic(bool paused);
+    void basicReload();
+    void basicShowFile(int file);
+    void basicScrollToPc();
+    void basicPick(int kind);
+    void basicImported(const QString &path, int kind);
+    void basicToggleAtCursor();
+    bool basicTab() const;
+    void doStep();
+    void doStepOver();
+    void doStepOut();
     QWidget *buildFujinet();
     void refreshFujinet(bool force);
     bool fujiShowing() const;
@@ -56,6 +70,7 @@ private:
     intvsession *m_session;
     intvdebug *m_dbg;
     intvsymtab *m_symtab;
+    intvsrcmap *m_srcmap;
 
     QLabel *m_status;
     QPushButton *m_pauseBtn;
@@ -81,6 +96,15 @@ private:
     QPlainTextEdit *m_sticState;
     int m_cardFirst = 0;
     int m_cardTotal = 0;
+
+    /* BASIC tab: the imported IntyBASIC source (core/debugger/srcmap.h) */
+    QLabel *m_basNote;
+    QComboBox *m_basFiles;
+    QPlainTextEdit *m_basView;
+    int m_basFile = -1;       /* index into the map; -1 = nothing shown */
+    unsigned m_basGen = 0;    /* intvsrcmap_generation() the view was built from */
+    int m_basPcLine = 0;      /* the machine's line in the file shown, 0 = none */
+    bool m_basGuard = false;  /* we are moving the cursor, not the user */
 
     QTabWidget *m_tabs;
     QWidget *m_fujiPage;

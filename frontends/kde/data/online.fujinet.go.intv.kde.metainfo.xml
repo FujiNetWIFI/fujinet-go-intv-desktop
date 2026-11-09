@@ -49,6 +49,16 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.15.0" date="2026-11-09">
+      <description>
+        <p>
+          The debugger has a BASIC tab for stepping IntyBASIC source. Import a .bas file (its INCLUDEs come with it) or a whole folder, and Step, Step Over and Step Out go by BASIC line, with breakpoints on lines. Line numbers come from the .smap or .lst that as1600 writes.
+        </p>
+        <p>
+          Also fixed: the first Step after a pause ran a whole frame, a Step from a breakpoint stopped on the same line, and Step Over in the CPU tab did not skip calls.
+        </p>
+      </description>
+    </release>
     <release version="0.14.2" date="2026-11-08">
       <description>
         <p>

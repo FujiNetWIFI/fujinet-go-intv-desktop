@@ -45,6 +45,7 @@
 
 #include <commctrl.h>
 #include <commdlg.h>
+#include <shlobj.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,6 +53,7 @@
 #include "intvdebug.h"
 #include "intvstic.h"
 #include "../help/help_window.h"
+#include "srcmap.h"
 #include "symbols.h"
 
 #define DISASM_LINES 32
@@ -64,15 +66,17 @@
 #define TIMER_REFRESH 1
 
 #define PAGE_CPU 0
-#define PAGE_STIC 1
-#define PAGE_SYMBOLS 2
-#define PAGE_FUJINET 3
+#define PAGE_BASIC 1
+#define PAGE_STIC 2
+#define PAGE_SYMBOLS 3
+#define PAGE_FUJINET 4
 
 #define FUJI_TICKS 5 /* the FujiNet tab, every 500ms while it shows */
 
 enum {
     IDC_PAUSE = 1000, IDC_STEP, IDC_STEP_OVER, IDC_STEP_OUT, IDC_CLEAR_BP,
     IDC_LOAD_SYMS, IDC_CLEAR_SYMS, IDC_HELP_BTN,
+    IDC_BAS_FILE, IDC_BAS_FOLDER, IDC_BAS_MAP, IDC_BAS_FILES, IDC_BAS_VIEW,
     IDC_STATUS, IDC_TABS,
     IDC_DISASM, IDC_FLAGS,
     IDC_MEM_ADDR, IDC_MEM_VIEW,
@@ -103,6 +107,12 @@ typedef struct {
     HWND break_label, break_addr;
     uint16_t mem_base;
 
+    /* BASIC page: the imported IntyBASIC source (core/debugger/srcmap.h) */
+    HWND bas_file_btn, bas_folder_btn, bas_map_btn, bas_files, bas_note, bas_view;
+    int bas_file;       /* index into the map; -1 = nothing shown */
+    unsigned bas_gen;   /* intvsrcmap_generation() the view was built from */
+    int bas_pc_line;    /* the machine's line in the file shown, 0 = none */
+
     HWND backtab_label, backtab_view;
     HWND mob_label, mob_view[INTVSTIC_MOB_COUNT], mob_info;
     HWND cards_label, cards_view, cards_prev, cards_next, cards_range;
@@ -130,6 +140,7 @@ typedef struct {
     intvsession *session;
     intvdebug *dbg;
     intvsymtab *symtab;
+    intvsrcmap *srcmap;
     HFONT mono;
     int mono_h; /* a text line's height in mono, for the logs */
     int page;
@@ -143,7 +154,7 @@ static const char *const kRegNames[8] = {"R0", "R1", "R2", "R3",
 
 /* The tabs, in PAGE_* order; INTV_DEBUGGER_TAB picks one by number or by the
  * start of its name (any case), for tests and captures. */
-static const char *const k_tab_names[] = {"CPU", "STIC", "Symbols",
+static const char *const k_tab_names[] = {"CPU", "BASIC", "STIC", "Symbols",
                                           "FujiNet"};
 #define TAB_COUNT ((int)(sizeof(k_tab_names) / sizeof(k_tab_names[0])))
 
@@ -260,6 +271,26 @@ static LRESULT CALLBACK disasm_subclass(HWND hwnd, UINT msg, WPARAM wp,
     return CallWindowProcA(g_disasm_proc, hwnd, msg, wp, lp);
 }
 
+static WNDPROC g_bas_proc;
+
+/* A click on a BASIC line that has code toggles a breakpoint on it. */
+static LRESULT CALLBACK bas_subclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_LBUTTONDOWN && g_dbg && g_dbg->bas_file >= 0) {
+        LRESULT pos = SendMessageA(hwnd, EM_CHARFROMPOS, 0, lp);
+        const int line = HIWORD(pos) + 1;
+        const int addr = intvsrcmap_first_addr(g_dbg->srcmap, g_dbg->bas_file, line);
+
+        if (addr >= 0) {
+            intvdebug_breakpoint_toggle(g_dbg->dbg, (uint16_t)addr);
+            g_dbg->seen_serial = 0; /* redraw the marker */
+        } else {
+            SetWindowTextA(g_dbg->status, "No code on that line");
+        }
+    }
+    return CallWindowProcA(g_bas_proc, hwnd, msg, wp, lp);
+}
+
 /* Forward declarations: show_page/refresh_mem are defined later (layout and
  * refreshers, respectively), but sym_list_subclass -- grouped here with the
  * other subclass procs, same as disasm_subclass above -- needs to call
@@ -267,6 +298,7 @@ static LRESULT CALLBACK disasm_subclass(HWND hwnd, UINT msg, WPARAM wp,
 static void show_page(debugger *d, int page);
 static void refresh_mem(debugger *d);
 static void refresh_fujinet(debugger *d, int force);
+static void refresh_all(debugger *d);
 
 /* Symbols page list: a click jumps the memory view to the clicked line's
  * address, the first 4 hex characters of each line (refresh_symbols'
@@ -352,7 +384,7 @@ static void build_controls(debugger *d)
     TCITEMA item;
     int i;
 
-    d->tabs = child(d, WC_TABCONTROLA, "", WS_VISIBLE, IDC_TABS);
+    d->tabs = child(d, WC_TABCONTROLA, "", WS_VISIBLE | WS_CLIPSIBLINGS, IDC_TABS);
     memset(&item, 0, sizeof(item));
     item.mask = TCIF_TEXT;
     for (i = 0; i < TAB_COUNT; i++) {
@@ -395,6 +427,24 @@ static void build_controls(debugger *d)
     d->break_label = label(d, "Break at:");
     d->break_addr = field(d, IDC_BREAK_ADDR);
 
+    /* BASIC page */
+    d->bas_file_btn = child(d, "BUTTON", "Import File...",
+                            WS_VISIBLE | BS_PUSHBUTTON, IDC_BAS_FILE);
+    d->bas_folder_btn = child(d, "BUTTON", "Import Folder...",
+                              WS_VISIBLE | BS_PUSHBUTTON, IDC_BAS_FOLDER);
+    d->bas_map_btn = child(d, "BUTTON", "Load Map...",
+                           WS_VISIBLE | BS_PUSHBUTTON, IDC_BAS_MAP);
+    d->bas_files = child(d, "COMBOBOX", "",
+                         WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | CBS_DROPDOWNLIST |
+                             CBS_HASSTRINGS,
+                         IDC_BAS_FILES);
+
+    d->bas_note = label(d, "");
+    d->bas_view = mono_view(d, IDC_BAS_VIEW);
+    g_bas_proc = (WNDPROC)SetWindowLongPtrA(d->bas_view, GWLP_WNDPROC,
+                                            (LONG_PTR)bas_subclass);
+    d->bas_file = -1;
+
     /* STIC page */
     d->backtab_label = label(d, "BACKTAB");
     d->backtab_view = pixels(d, IDC_BACKTAB, &d->backtab_pv, d->backtab_bgrx,
@@ -436,6 +486,13 @@ static void build_controls(debugger *d)
     d->fuji_state_title = label(d, "FujiNet's mailbox");
     d->fuji_state = mono_view(d, IDC_FUJI_STATE);
     d->fuji_count = -1;
+
+    /* The tab was created first, so it is below the page controls; a repaint
+     * of it would still paint its white body over any that had not repainted
+     * (the BASIC page's file list vanished). Bottom of the z-order, and with
+     * WS_CLIPSIBLINGS it never paints over a sibling. */
+    SetWindowPos(d->tabs, HWND_BOTTOM, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 /* ---- layout ------------------------------------------------------------------
@@ -445,7 +502,8 @@ static void build_controls(debugger *d)
 
 /* Help's contexts (intvhelp.h), one per tab */
 static const char *const k_tab_contexts[] = {
-    "debugger/cpu", "debugger/stic", "debugger/symbols", "debugger/fujinet",
+    "debugger/cpu", "debugger/basic", "debugger/stic", "debugger/symbols",
+    "debugger/fujinet",
 };
 
 static void show_page(debugger *d, int page)
@@ -466,6 +524,13 @@ static void show_page(debugger *d, int page)
     ShowWindow(d->mem_view, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
     ShowWindow(d->break_label, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
     ShowWindow(d->break_addr, page == PAGE_CPU ? SW_SHOW : SW_HIDE);
+
+    ShowWindow(d->bas_file_btn, page == PAGE_BASIC ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->bas_folder_btn, page == PAGE_BASIC ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->bas_map_btn, page == PAGE_BASIC ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->bas_files, page == PAGE_BASIC ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->bas_note, page == PAGE_BASIC ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->bas_view, page == PAGE_BASIC ? SW_SHOW : SW_HIDE);
 
     ShowWindow(d->backtab_label, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
     ShowWindow(d->backtab_view, page == PAGE_STIC ? SW_SHOW : SW_HIDE);
@@ -560,6 +625,20 @@ static void layout(debugger *d)
             ry += 20;
             MoveWindow(d->break_addr, x, ry, page.right - x - 8, 22, TRUE);
         }
+    }
+
+    /* BASIC page */
+    {
+        int by = page.top;
+        MoveWindow(d->bas_file_btn, page.left, by, 110, 26, TRUE);
+        MoveWindow(d->bas_folder_btn, page.left + 114, by, 120, 26, TRUE);
+        MoveWindow(d->bas_map_btn, page.left + 238, by, 100, 26, TRUE);
+        MoveWindow(d->bas_files, page.left + 346, by, 260, 220, TRUE);
+        by += 32;
+        MoveWindow(d->bas_note, page.left, by, page.right - page.left - 8, 34, TRUE);
+        by += 38;
+        MoveWindow(d->bas_view, page.left, by, page.right - page.left - 8,
+                  page.bottom - by - 4, TRUE);
     }
 
     /* STIC page */
@@ -968,6 +1047,235 @@ static void refresh_fujinet(debugger *d, int force)
     set_text_at(d->fuji_text, a, follow);
 }
 
+/* ---- the BASIC page ------------------------------------------------------- */
+
+/* The map changed (an import, a Load Map): the file list. */
+static void basic_reload(debugger *d)
+{
+    const int n = intvsrcmap_file_count(d->srcmap);
+    int i;
+
+    SendMessageA(d->bas_files, CB_RESETCONTENT, 0, 0);
+    for (i = 0; i < n; i++)
+        SendMessageA(d->bas_files, CB_ADDSTRING, 0,
+                     (LPARAM)intvsrcmap_file_name(d->srcmap, i));
+    if (d->bas_file >= n)
+        d->bas_file = -1;
+    if (d->bas_file < 0 && n > 0) {
+        int f, l, found = 0;
+        d->bas_file = 0; /* the first file with any code on it */
+        for (f = 0; f < n && !found; f++) {
+            const int lines = intvsrcmap_line_count(d->srcmap, f);
+            for (l = 1; l <= lines && !found; l++)
+                if (intvsrcmap_first_addr(d->srcmap, f, l) >= 0) {
+                    d->bas_file = f;
+                    found = 1;
+                }
+        }
+    }
+    SendMessageA(d->bas_files, CB_SETCURSEL, (WPARAM)d->bas_file, 0);
+    d->bas_pc_line = 0;
+    if (n == 0)
+        SetWindowTextA(d->bas_note,
+            "Import a .bas file, or a folder of them. The assembler's map "
+            "(as1600 -j game.smap) puts each line at its address.");
+}
+
+static void refresh_basic(debugger *d, int paused)
+{
+    const unsigned gen = intvsrcmap_generation(d->srcmap);
+    intvdebug_regs r;
+    int pf = -1, pl = 0;
+    char *text;
+    size_t cap, len = 0;
+    int n, i, line;
+
+    if (gen != d->bas_gen) {
+        d->bas_gen = gen;
+        basic_reload(d);
+    }
+    if (paused && intvdebug_regs_get(d->dbg, &r)) {
+        int f, l;
+        if (intvsrcmap_lookup(d->srcmap, r.pc, &f, &l)) {
+            pf = f;
+            pl = l;
+        }
+    }
+    if (pf >= 0 && pf != d->bas_file) { /* followed into another file */
+        d->bas_file = pf;
+        SendMessageA(d->bas_files, CB_SETCURSEL, (WPARAM)pf, 0);
+    }
+
+    n = d->bas_file >= 0 ? intvsrcmap_line_count(d->srcmap, d->bas_file) : 0;
+    cap = (size_t)n * 256 + 16;
+    text = malloc(cap);
+    if (!text)
+        return;
+    text[0] = '\0';
+    for (i = 1; i <= n && len + 256 < cap; i++) {
+        const int addr = intvsrcmap_first_addr(d->srcmap, d->bas_file, i);
+        const char *src = intvsrcmap_line_text(d->srcmap, d->bas_file, i);
+        len += (size_t)snprintf(text + len, cap - len, "%c%c%5d  %.200s\r\n",
+                                pf == d->bas_file && i == pl ? '>' : ' ',
+                                addr >= 0 && intvdebug_breakpoint_is_set(d->dbg, (uint16_t)addr)
+                                    ? '*' : ' ',
+                                i, src ? src : "");
+    }
+    {   /* only touch the control when something changed: it keeps the scroll */
+        const int cur = GetWindowTextLengthA(d->bas_view);
+        char *old = (int)len == cur ? malloc((size_t)cur + 1) : NULL;
+        int same = 0;
+        if (old) {
+            GetWindowTextA(d->bas_view, old, cur + 1);
+            same = strcmp(old, text) == 0;
+            free(old);
+        }
+        if (!same)
+            set_text_at(d->bas_view, text, 0);
+    }
+    free(text);
+
+    line = pf == d->bas_file ? pl : 0;
+    if (line != d->bas_pc_line) {
+        d->bas_pc_line = line;
+        if (line > 0) { /* bring it into the middle if it isn't in view */
+            const int first = (int)SendMessageA(d->bas_view, EM_GETFIRSTVISIBLELINE, 0, 0);
+            const int rows = edit_rows(d, d->bas_view);
+            if (line - 1 < first || line - 1 >= first + rows - 1) {
+                int want = line - 1 - rows / 2;
+                edit_scroll_to(d->bas_view, want < 0 ? 0 : want);
+            }
+        }
+    }
+}
+
+static void basic_note(debugger *d, int files, const intvsrcmap_import_result *r)
+{
+    char msg[600];
+    const char *base = strrchr(r->map_path, '\\');
+    if (!base) base = strrchr(r->map_path, '/');
+    base = base ? base + 1 : r->map_path;
+    if (r->mapped > 0)
+        snprintf(msg, sizeof(msg), "%d file%s, %d address range%s from %s%s.",
+                 files, files == 1 ? "" : "s", r->mapped, r->mapped == 1 ? "" : "s",
+                 base, r->symbols ? ", with its symbols" : "");
+    else
+        snprintf(msg, sizeof(msg),
+                 "%d file%s loaded, but no .smap or .lst was found beside them. "
+                 "Build with as1600 -j game.smap, then Load Map.",
+                 files, files == 1 ? "" : "s");
+    SetWindowTextA(d->bas_note, msg);
+}
+
+/* Import File / Import Folder, and the INTV_BASIC_IMPORT hook. */
+static void basic_import(debugger *d, const char *path, int folder)
+{
+    intvsrcmap_import_result r;
+    const int n = intvsrcmap_import(d->srcmap, path, d->symtab, &r);
+
+    if (n < 0) {
+        SetWindowTextA(d->bas_note, folder ? "No .bas files in that folder."
+                                           : "Could not read that file.");
+        return;
+    }
+    basic_note(d, n, &r);
+    d->bas_file = -1; /* basic_reload picks the first file with code */
+    d->seen_serial = 0;
+    if (intvdebug_is_paused(d->dbg))
+        refresh_all(d);
+}
+
+static int pick_bas_folder(HWND owner, char *path, DWORD pathsz)
+{
+    BROWSEINFOA bi;
+    PIDLIST_ABSOLUTE pidl;
+    char dir[MAX_PATH] = "";
+
+    memset(&bi, 0, sizeof bi);
+    bi.hwndOwner = owner;
+    bi.lpszTitle = "Import a folder of IntyBASIC source";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    pidl = SHBrowseForFolderA(&bi);
+    if (!pidl)
+        return 0;
+    if (!SHGetPathFromIDListA(pidl, dir))
+        dir[0] = '\0';
+    CoTaskMemFree(pidl);
+    snprintf(path, pathsz, "%s", dir);
+    return path[0] != '\0';
+}
+
+/* kind: IDC_BAS_FILE, IDC_BAS_FOLDER or IDC_BAS_MAP */
+static void basic_pick(debugger *d, int kind)
+{
+    char path[MAX_PATH] = "", last_dir[1024] = "", dir[1024];
+
+    if (d->session) {
+        const char *s = intvsession_get_str(d->session, "bas_dir", "");
+        snprintf(last_dir, sizeof(last_dir), "%s", s);
+    }
+    if (kind == IDC_BAS_FOLDER) {
+        if (!pick_bas_folder(d->hwnd, path, sizeof(path)))
+            return;
+        snprintf(dir, sizeof(dir), "%s", path);
+    } else {
+        OPENFILENAMEA ofn;
+        memset(&ofn, 0, sizeof(ofn));
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = d->hwnd;
+        ofn.lpstrFilter = kind == IDC_BAS_MAP
+            ? "as1600 source maps and listings (*.smap;*.lst)\0*.smap;*.lst\0All files (*.*)\0*.*\0"
+            : "IntyBASIC source (*.bas)\0*.bas\0All files (*.*)\0*.*\0";
+        ofn.lpstrFile = path;
+        ofn.nMaxFile = sizeof(path);
+        ofn.lpstrTitle = kind == IDC_BAS_MAP ? "Load Map" : "Import File";
+        ofn.lpstrInitialDir = last_dir[0] ? last_dir : NULL;
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if (!GetOpenFileNameA(&ofn))
+            return;
+        intvsym_dirname(path, dir, sizeof(dir));
+    }
+    if (d->session && dir[0]) { /* start the next picker where this one ended */
+        intvsession_set_str(d->session, "bas_dir", dir);
+        intvsession_settings_flush(d->session);
+    }
+    if (kind == IDC_BAS_MAP) {
+        const int n = intvsrcmap_load_map(d->srcmap, path);
+        if (n < 0) {
+            SetWindowTextA(d->bas_note, "Could not read that map.");
+        } else {
+            intvsrcmap_import_result r;
+            memset(&r, 0, sizeof(r));
+            r.mapped = n;
+            r.symbols = intvsrcmap_load_sibling_sym(path, d->symtab);
+            snprintf(r.map_path, sizeof(r.map_path), "%s", path);
+            basic_note(d, intvsrcmap_file_count(d->srcmap), &r);
+            d->seen_serial = 0;
+            if (intvdebug_is_paused(d->dbg))
+                refresh_all(d);
+        }
+    } else {
+        basic_import(d, path, kind == IDC_BAS_FOLDER);
+    }
+}
+
+/* On the BASIC page the three steppers go by BASIC line. */
+static void do_step(debugger *d, int how)
+{
+    const int by_line = d->page == PAGE_BASIC;
+    switch (how) {
+    case IDC_STEP:
+        if (by_line) intvdebug_step_line(d->dbg); else intvdebug_step(d->dbg);
+        break;
+    case IDC_STEP_OVER:
+        if (by_line) intvdebug_step_line_over(d->dbg); else intvdebug_step_over(d->dbg);
+        break;
+    default:
+        if (by_line) intvdebug_step_line_out(d->dbg); else intvdebug_step_out(d->dbg);
+        break;
+    }
+}
+
 static void refresh_all(debugger *d)
 {
     int paused = intvdebug_is_paused(d->dbg);
@@ -990,6 +1298,7 @@ static void refresh_all(debugger *d)
      * not machine state, and is cheap to skip when nothing changed (see
      * refresh_symbols's own comment). */
     refresh_symbols(d);
+    refresh_basic(d, paused);
     if (d->page == PAGE_FUJINET)
         refresh_fujinet(d, 0);
     d->was_paused = paused;
@@ -1073,9 +1382,27 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             else
                 intvdebug_pause(d->dbg);
             return 0;
-        case IDC_STEP: intvdebug_step(d->dbg); return 0;
-        case IDC_STEP_OVER: intvdebug_step_over(d->dbg); return 0;
-        case IDC_STEP_OUT: intvdebug_step_out(d->dbg); return 0;
+        case IDC_STEP:
+        case IDC_STEP_OVER:
+        case IDC_STEP_OUT:
+            do_step(d, LOWORD(wp));
+            return 0;
+        case IDC_BAS_FILE:
+        case IDC_BAS_FOLDER:
+        case IDC_BAS_MAP:
+            basic_pick(d, LOWORD(wp));
+            return 0;
+        case IDC_BAS_FILES:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                const int sel = (int)SendMessageA(d->bas_files, CB_GETCURSEL, 0, 0);
+                if (sel >= 0) {
+                    d->bas_file = sel;
+                    d->bas_pc_line = 0;
+                    d->seen_serial = 0;
+                    refresh_basic(d, intvdebug_is_paused(d->dbg));
+                }
+            }
+            return 0;
         case IDC_CLEAR_BP:
             intvdebug_breakpoint_clear_all(d->dbg);
             d->seen_serial = 0;
@@ -1190,13 +1517,10 @@ int intv_debugger_pretranslate(MSG *msg)
         SendMessageA(g_dbg->hwnd, WM_COMMAND, IDC_PAUSE, 0);
         return 1;
     case VK_F7:
-        intvdebug_step(g_dbg->dbg);
+        do_step(g_dbg, IDC_STEP);
         return 1;
     case VK_F8:
-        if (GetKeyState(VK_SHIFT) & 0x8000)
-            intvdebug_step_out(g_dbg->dbg);
-        else
-            intvdebug_step_over(g_dbg->dbg);
+        do_step(g_dbg, GetKeyState(VK_SHIFT) & 0x8000 ? IDC_STEP_OUT : IDC_STEP_OVER);
         return 1;
     default:
         return 0;
@@ -1238,6 +1562,7 @@ void intv_debugger_show(HWND parent, intvsession *session)
     d->session = session;
     d->dbg = intvdebug_get();
     d->symtab = intvsymtab_shared();
+    d->srcmap = intvsrcmap_shared();
     d->mono = CreateFontA(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                           ANSI_CHARSET, OUT_DEFAULT_PRECIS,
                           CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
@@ -1268,6 +1593,28 @@ void intv_debugger_show(HWND parent, intvsession *session)
         if (tab >= 0)
             SendMessageA(d->tabs, TCM_SETCURSEL, (WPARAM)tab, 0);
         show_page(d, tab >= 0 ? tab : PAGE_CPU);
+    }
+
+    /* For captures and tests, like INTV_DEBUGGER_TAB: INTV_BASIC_IMPORT=<.bas
+     * file or folder> imports it as Import File / Import Folder would, and
+     * INTV_BASIC_BREAK=<name.bas>:<line> sets a breakpoint on that line. */
+    {
+        const char *imp = getenv("INTV_BASIC_IMPORT");
+        const char *brk = getenv("INTV_BASIC_BREAK");
+        if (imp && *imp)
+            basic_import(d, imp, 0);
+        if (brk && strchr(brk, ':')) {
+            char name[260];
+            const int line = atoi(strchr(brk, ':') + 1);
+            int f;
+            snprintf(name, sizeof(name), "%.*s", (int)(strchr(brk, ':') - brk), brk);
+            for (f = 0; f < intvsrcmap_file_count(d->srcmap); f++) {
+                const int addr = intvsrcmap_first_addr(d->srcmap, f, line);
+                if (strcmp(intvsrcmap_file_name(d->srcmap, f), name) == 0 && addr >= 0 &&
+                    !intvdebug_breakpoint_is_set(d->dbg, (uint16_t)addr))
+                    intvdebug_breakpoint_toggle(d->dbg, (uint16_t)addr);
+            }
+        }
     }
 
     /* Engaging switches the CPU hook to the path that honours breakpoints

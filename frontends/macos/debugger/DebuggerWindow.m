@@ -47,6 +47,7 @@
 
 #include "intvdebug.h"
 #include "intvstic.h"
+#include "srcmap.h"
 #include "symbols.h"
 
 #define DISASM_LINES 32
@@ -72,7 +73,7 @@ static DebuggerWindow *g_debugger;
 
 /* The tabs, in order; INTV_DEBUGGER_TAB picks one by number or by the start
  * of its name (any case), for tests and captures. */
-static const char *const kTabNames[] = {"CPU", "STIC", "Symbols", "FujiNet"};
+static const char *const kTabNames[] = {"CPU", "BASIC", "STIC", "Symbols", "FujiNet"};
 #define TAB_COUNT ((int)(sizeof(kTabNames) / sizeof(kTabNames[0])))
 
 static int tabFromEnv(void)
@@ -146,6 +147,31 @@ static int tabFromEnv(void)
 }
 @end
 
+/* BASIC tab text view: a click toggles the breakpoint on the clicked source
+ * line. The view shows one file, a line per text line, so the line number is
+ * the clicked line's position. */
+@interface BasTextView : NSTextView
+@property(nonatomic, copy) void (^onToggleLine)(int line);
+@end
+
+@implementation BasTextView
+- (void)mouseDown:(NSEvent *)event
+{
+    NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+    NSUInteger idx = [self characterIndexForInsertionAtPoint:p];
+    NSString *text = self.string;
+    if (idx > text.length)
+        idx = text.length;
+    const NSUInteger start = [text lineRangeForRange:NSMakeRange(idx, 0)].location;
+    int line = 1;
+    for (NSUInteger i = 0; i < start; i++)
+        if ([text characterAtIndex:i] == '\n')
+            line++;
+    if (self.onToggleLine)
+        self.onToggleLine(line);
+}
+@end
+
 @interface DebuggerWindow () <NSWindowDelegate, NSTabViewDelegate>
 - (instancetype)initWithSession:(intvsession *)session;
 @end
@@ -154,7 +180,17 @@ static int tabFromEnv(void)
     intvsession *_session;
     intvdebug *_dbg;
     intvsymtab *_symtab;
+    intvsrcmap *_srcmap;
     NSWindow *_window;
+
+    /* BASIC tab: the imported IntyBASIC source (core/debugger/srcmap.h) */
+    NSTabViewItem *_basicItem;
+    NSTextField *_basNote;
+    NSPopUpButton *_basFiles;
+    BasTextView *_basView;
+    int _basFile;       /* index into the map; -1 = nothing shown */
+    unsigned _basGen;   /* intvsrcmap_generation() the view was built from */
+    int _basPcLine;     /* the machine's line in the file shown, 0 = none */
 
     NSButton *_runBtn;
     NSTextField *_status;
@@ -241,10 +277,33 @@ static NSImage *imageFromRGBA(const uint8_t *rgba, int w, int h, BOOL hasAlpha)
     _session = session;
     _dbg = intvdebug_get();
     _symtab = intvsymtab_shared();
+    _srcmap = intvsrcmap_shared();
+    _basFile = -1;
     _symFilterText = @"";
     _scratch = calloc(1, STIC_SCRATCH_BYTES);
     _fujiCount = -1;
     [self buildWindow];
+
+    /* For captures and tests, like INTV_DEBUGGER_TAB: INTV_BASIC_IMPORT=<.bas
+     * file or folder> imports it as Import File / Import Folder would, and
+     * INTV_BASIC_BREAK=<name.bas>:<line> sets a breakpoint on that line. */
+    {
+        const char *imp = getenv("INTV_BASIC_IMPORT");
+        const char *brk = getenv("INTV_BASIC_BREAK");
+        if (imp && *imp)
+            [self basicImported:[NSString stringWithUTF8String:imp] folder:NO];
+        if (brk && strchr(brk, ':')) {
+            NSString *spec = [NSString stringWithUTF8String:brk];
+            NSString *name = [spec componentsSeparatedByString:@":"].firstObject;
+            const int line = [[spec componentsSeparatedByString:@":"].lastObject intValue];
+            for (int f = 0; f < intvsrcmap_file_count(_srcmap); f++) {
+                const int addr = intvsrcmap_first_addr(_srcmap, f, line);
+                if ([@(intvsrcmap_file_name(_srcmap, f)) isEqualToString:name] && addr >= 0 &&
+                    !intvdebug_breakpoint_is_set(_dbg, (uint16_t)addr))
+                    intvdebug_breakpoint_toggle(_dbg, (uint16_t)addr);
+            }
+        }
+    }
 
     /* Engaging switches the CPU hook to the path that honours breakpoints
      * (see intvdebug.h). Pausing immediately is what a user opening a
@@ -419,6 +478,65 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     [split addArrangedSubview:dasmScroll];
     [split addArrangedSubview:side];
     return split;
+}
+
+- (NSView *)buildBasicTab
+{
+    NSButton *fileBtn = [self button:@"Import File…" action:@selector(basImportFile:)];
+    fileBtn.toolTip = @"Load a .bas file and everything it INCLUDEs";
+    NSButton *folderBtn = [self button:@"Import Folder…" action:@selector(basImportFolder:)];
+    folderBtn.toolTip = @"Load every .bas file under a folder";
+    NSButton *mapBtn = [self button:@"Load Map…" action:@selector(basLoadMap:)];
+    mapBtn.toolTip = @"Load an as1600 -j source map, or a -l listing";
+    _basFiles = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    _basFiles.target = self;
+    _basFiles.action = @selector(basFileChosen:);
+    _basFiles.toolTip = @"The source file shown";
+    NSStackView *bar = [NSStackView stackViewWithViews:@[ fileBtn, folderBtn, mapBtn, _basFiles ]];
+    bar.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    bar.spacing = 8;
+
+    _basNote = [self label:@""];
+    _basNote.textColor = NSColor.secondaryLabelColor;
+    _basNote.lineBreakMode = NSLineBreakByTruncatingTail;
+
+    NSScrollView *scroll = [[NSScrollView alloc] init];
+    scroll.hasVerticalScroller = YES;
+    scroll.hasHorizontalScroller = YES;
+    _basView = [[BasTextView alloc] initWithFrame:NSMakeRect(0, 0, 900, 600)];
+    _basView.editable = NO;
+    _basView.richText = NO;
+    _basView.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    _basView.minSize = NSMakeSize(0, 0);
+    _basView.maxSize = NSMakeSize(FLT_MAX, FLT_MAX);
+    _basView.verticallyResizable = YES;
+    _basView.horizontallyResizable = YES;
+    _basView.textContainer.widthTracksTextView = NO;
+    _basView.textContainer.size = NSMakeSize(FLT_MAX, FLT_MAX);
+    _basView.autoresizingMask = NSViewWidthSizable;
+    __weak DebuggerWindow *weakSelf = self;
+    _basView.onToggleLine = ^(int line) {
+        DebuggerWindow *s = weakSelf;
+        if (!s || s->_basFile < 0)
+            return;
+        const int addr = intvsrcmap_first_addr(s->_srcmap, s->_basFile, line);
+        if (addr < 0) {
+            s->_status.stringValue = @"No code on that line";
+            return;
+        }
+        intvdebug_breakpoint_toggle(s->_dbg, (uint16_t)addr);
+        s->_seenSerial = 0; /* redraw the marker immediately */
+    };
+    scroll.documentView = _basView;
+
+    NSStackView *root = [NSStackView stackViewWithViews:@[ bar, _basNote, scroll ]];
+    root.orientation = NSUserInterfaceLayoutOrientationVertical;
+    root.alignment = NSLayoutAttributeLeading;
+    root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
+    [bar.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    [_basNote.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    [scroll.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    return root;
 }
 
 - (NSView *)buildSticTab
@@ -653,18 +771,22 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     NSTabViewItem *cpuTab = [[NSTabViewItem alloc] initWithIdentifier:@"cpu"];
     cpuTab.label = @(kTabNames[0]);
     cpuTab.view = [self buildCpuTab];
+    _basicItem = [[NSTabViewItem alloc] initWithIdentifier:@"basic"];
+    _basicItem.label = @(kTabNames[1]);
+    _basicItem.view = [self buildBasicTab];
     NSTabViewItem *sticTab =
         [[NSTabViewItem alloc] initWithIdentifier:@"stic"];
-    sticTab.label = @(kTabNames[1]);
+    sticTab.label = @(kTabNames[2]);
     sticTab.view = [self buildSticTab];
     NSTabViewItem *symTab =
         [[NSTabViewItem alloc] initWithIdentifier:@"symbols"];
-    symTab.label = @(kTabNames[2]);
+    symTab.label = @(kTabNames[3]);
     symTab.view = [self buildSymbolsTab];
     _fujiItem = [[NSTabViewItem alloc] initWithIdentifier:@"fujinet"];
-    _fujiItem.label = @(kTabNames[3]);
+    _fujiItem.label = @(kTabNames[4]);
     _fujiItem.view = [self buildFujinetTab];
     [tabs addTabViewItem:cpuTab];
+    [tabs addTabViewItem:_basicItem];
     [tabs addTabViewItem:sticTab];
     [tabs addTabViewItem:symTab];
     [tabs addTabViewItem:_fujiItem];
@@ -701,22 +823,37 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
         intvdebug_pause(_dbg);
 }
 
+/* On the BASIC tab the three steppers go by BASIC line. */
+- (BOOL)basicShowing
+{
+    return _tabs.selectedTabViewItem == _basicItem;
+}
+
 - (void)step:(id)sender
 {
     (void)sender;
-    intvdebug_step(_dbg);
+    if ([self basicShowing])
+        intvdebug_step_line(_dbg);
+    else
+        intvdebug_step(_dbg);
 }
 
 - (void)stepOver:(id)sender
 {
     (void)sender;
-    intvdebug_step_over(_dbg);
+    if ([self basicShowing])
+        intvdebug_step_line_over(_dbg);
+    else
+        intvdebug_step_over(_dbg);
 }
 
 - (void)stepOut:(id)sender
 {
     (void)sender;
-    intvdebug_step_out(_dbg);
+    if ([self basicShowing])
+        intvdebug_step_line_out(_dbg);
+    else
+        intvdebug_step_out(_dbg);
 }
 
 - (void)clearBreakpoints:(id)sender
@@ -876,6 +1013,180 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
 
 /* ---- refreshers --------------------------------------------------------------- */
 
+/* ---- the BASIC tab ------------------------------------------------------- */
+
+/* The map changed (an import, a Load Map): the file list. */
+- (void)basicReload
+{
+    const int n = intvsrcmap_file_count(_srcmap);
+
+    [_basFiles removeAllItems];
+    for (int i = 0; i < n; i++)
+        [_basFiles addItemWithTitle:@(intvsrcmap_file_name(_srcmap, i))];
+    if (_basFile >= n)
+        _basFile = -1;
+    if (_basFile < 0 && n > 0) {
+        BOOL found = NO;
+        _basFile = 0; /* the first file with any code on it */
+        for (int f = 0; f < n && !found; f++) {
+            const int lines = intvsrcmap_line_count(_srcmap, f);
+            for (int l = 1; l <= lines && !found; l++)
+                if (intvsrcmap_first_addr(_srcmap, f, l) >= 0) {
+                    _basFile = f;
+                    found = YES;
+                }
+        }
+    }
+    if (_basFile >= 0)
+        [_basFiles selectItemAtIndex:_basFile];
+    _basPcLine = 0;
+    if (n == 0)
+        _basNote.stringValue =
+            @"Import a .bas file, or a folder of them. The assembler's map "
+            @"(as1600 -j game.smap) puts each line at its address.";
+}
+
+- (void)refreshBasic:(BOOL)paused
+{
+    const unsigned gen = intvsrcmap_generation(_srcmap);
+    int pf = -1, pl = 0;
+    intvdebug_regs r;
+
+    if (gen != _basGen) {
+        _basGen = gen;
+        [self basicReload];
+    }
+    if (paused && intvdebug_regs_get(_dbg, &r)) {
+        int f, l;
+        if (intvsrcmap_lookup(_srcmap, r.pc, &f, &l)) {
+            pf = f;
+            pl = l;
+        }
+    }
+    if (pf >= 0 && pf != _basFile) { /* followed into another file */
+        _basFile = pf;
+        [_basFiles selectItemAtIndex:pf];
+    }
+
+    NSMutableString *text = [NSMutableString string];
+    NSRange pcRange = NSMakeRange(NSNotFound, 0);
+    if (_basFile >= 0) {
+        const int n = intvsrcmap_line_count(_srcmap, _basFile);
+        for (int i = 1; i <= n; i++) {
+            const int addr = intvsrcmap_first_addr(_srcmap, _basFile, i);
+            const char *src = intvsrcmap_line_text(_srcmap, _basFile, i);
+            NSString *line = [NSString stringWithFormat:@"%c%c%5d  %s\n",
+                              pf == _basFile && i == pl ? '>' : ' ',
+                              addr >= 0 && intvdebug_breakpoint_is_set(_dbg, (uint16_t)addr) ? '*' : ' ',
+                              i, src ? src : ""];
+            if (pf == _basFile && i == pl)
+                pcRange = NSMakeRange(text.length, line.length);
+            [text appendString:line];
+        }
+    }
+    setText(_basView, text, NO);
+
+    const int line = pf == _basFile ? pl : 0;
+    if (line != _basPcLine) {
+        _basPcLine = line;
+        if (pcRange.location != NSNotFound)
+            [_basView scrollRangeToVisible:pcRange];
+    }
+}
+
+- (void)basicImported:(NSString *)path folder:(BOOL)folder
+{
+    intvsrcmap_import_result r;
+    const int n = intvsrcmap_import(_srcmap, path.fileSystemRepresentation, _symtab, &r);
+
+    if (n < 0) {
+        _basNote.stringValue = folder ? @"No .bas files in that folder."
+                                      : @"Could not read that file.";
+        return;
+    }
+    [self basicNote:n result:&r];
+    _basFile = -1; /* basicReload picks the first file with code */
+    _seenSerial = 0;
+    if (intvdebug_is_paused(_dbg))
+        [self refreshAll:YES];
+}
+
+- (void)basicNote:(int)files result:(const intvsrcmap_import_result *)r
+{
+    if (r->mapped > 0)
+        _basNote.stringValue = [NSString
+            stringWithFormat:@"%d file%s, %d address range%s from %@%s.", files,
+                             files == 1 ? "" : "s", r->mapped, r->mapped == 1 ? "" : "s",
+                             [@(r->map_path) lastPathComponent],
+                             r->symbols ? ", with its symbols" : ""];
+    else
+        _basNote.stringValue = [NSString
+            stringWithFormat:@"%d file%s loaded, but no .smap or .lst was found beside them. "
+                             @"Build with as1600 -j game.smap, then Load Map.",
+                             files, files == 1 ? "" : "s"];
+}
+
+/* kind: 0 file, 1 folder, 2 map */
+- (void)basicPick:(int)kind
+{
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.allowsMultipleSelection = NO;
+    panel.canChooseFiles = kind != 1;
+    panel.canChooseDirectories = kind == 1;
+    if (kind == 0)
+        panel.allowedFileTypes = @[ @"bas" ];
+    else if (kind == 2)
+        panel.allowedFileTypes = @[ @"smap", @"lst" ];
+    if (_session) {
+        const char *lastDir = intvsession_get_str(_session, "bas_dir", "");
+        if (lastDir[0])
+            panel.directoryURL = [NSURL fileURLWithPath:@(lastDir) isDirectory:YES];
+    }
+    __weak DebuggerWindow *weakSelf = self;
+    [panel beginWithCompletionHandler:^(NSModalResponse result) {
+        DebuggerWindow *s = weakSelf;
+        NSURL *url = panel.URLs.firstObject;
+        if (!s || result != NSModalResponseOK || !url)
+            return;
+        NSString *path = url.path;
+        if (s->_session) { /* start the next panel where this one ended */
+            NSString *dir = kind == 1 ? path : [path stringByDeletingLastPathComponent];
+            intvsession_set_str(s->_session, "bas_dir", dir.fileSystemRepresentation);
+            intvsession_settings_flush(s->_session);
+        }
+        if (kind == 2) {
+            const int n = intvsrcmap_load_map(s->_srcmap, path.fileSystemRepresentation);
+            if (n < 0) {
+                s->_basNote.stringValue = @"Could not read that map.";
+                return;
+            }
+            intvsrcmap_import_result r;
+            memset(&r, 0, sizeof(r));
+            r.mapped = n;
+            r.symbols = intvsrcmap_load_sibling_sym(path.fileSystemRepresentation, s->_symtab);
+            snprintf(r.map_path, sizeof(r.map_path), "%s", path.fileSystemRepresentation);
+            [s basicNote:intvsrcmap_file_count(s->_srcmap) result:&r];
+            s->_seenSerial = 0;
+            if (intvdebug_is_paused(s->_dbg))
+                [s refreshAll:YES];
+        } else {
+            [s basicImported:path folder:kind == 1];
+        }
+    }];
+}
+
+- (void)basImportFile:(id)sender { (void)sender; [self basicPick:0]; }
+- (void)basImportFolder:(id)sender { (void)sender; [self basicPick:1]; }
+- (void)basLoadMap:(id)sender { (void)sender; [self basicPick:2]; }
+
+- (void)basFileChosen:(id)sender
+{
+    (void)sender;
+    _basFile = (int)_basFiles.indexOfSelectedItem;
+    _basPcLine = 0;
+    [self refreshBasic:intvdebug_is_paused(_dbg)];
+}
+
 - (void)refreshAll:(BOOL)paused
 {
     _runBtn.title = paused ? @"Continue (F5)" : @"Pause (F5)";
@@ -894,6 +1205,7 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
      * not machine state, and is cheap to skip when nothing changed (see
      * refreshSymbols's own comment). */
     [self refreshSymbols];
+    [self refreshBasic:paused];
     if ([self fujiShowing])
         [self refreshFujinet:NO];
 }

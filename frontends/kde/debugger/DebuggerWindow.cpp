@@ -37,6 +37,7 @@
 
 #include <QComboBox>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -64,6 +65,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "srcmap.h"
 #include "symbols.h"
 
 namespace {
@@ -75,7 +77,9 @@ constexpr int kFujiTicks = 15;      /* the FujiNet tab, 500 ms at 33 ms */
 
 /* The tabs, in order; INTV_DEBUGGER_TAB picks one by number or by the start
  * of its name (any case), for tests and captures. */
-const char *const kTabNames[] = {"CPU", "STIC", "Symbols", "FujiNet"};
+const char *const kTabNames[] = {"CPU", "BASIC", "STIC", "Symbols", "FujiNet"};
+enum { kTabCpu, kTabBasic, kTabStic, kTabSymbols, kTabFujinet };
+enum { kPickFile, kPickFolder, kPickMap };
 constexpr int kTabCount = int(sizeof(kTabNames) / sizeof(kTabNames[0]));
 
 int tabFromEnv()
@@ -161,6 +165,7 @@ DebuggerWindow::DebuggerWindow(QWidget *parent, intvsession *session)
 {
     m_dbg = intvdebug_get();
     m_symtab = intvsymtab_shared();
+    m_srcmap = intvsrcmap_shared();
     setWindowFlag(Qt::Window);
     setAttribute(Qt::WA_DeleteOnClose);
     setWindowTitle(QStringLiteral("Intellivision Debugger"));
@@ -168,6 +173,23 @@ DebuggerWindow::DebuggerWindow(QWidget *parent, intvsession *session)
     buildUi();
     if (tabFromEnv() >= 0)
         m_tabs->setCurrentIndex(tabFromEnv());
+
+    /* For captures and tests, like INTV_DEBUGGER_TAB: INTV_BASIC_IMPORT=<.bas
+     * file or folder> imports it as Import File / Import Folder would, and
+     * INTV_BASIC_BREAK=<name.bas>:<line> sets a breakpoint on that line. */
+    if (const char *imp = std::getenv("INTV_BASIC_IMPORT"); imp && *imp)
+        basicImported(QString::fromUtf8(imp), kPickFile);
+    if (const char *brk = std::getenv("INTV_BASIC_BREAK"); brk && std::strchr(brk, ':')) {
+        const QString spec = QString::fromUtf8(brk);
+        const QString name = spec.section(QLatin1Char(':'), 0, 0);
+        const int line = spec.section(QLatin1Char(':'), 1).toInt();
+        for (int f = 0; f < intvsrcmap_file_count(m_srcmap); f++) {
+            const int addr = intvsrcmap_first_addr(m_srcmap, f, line);
+            if (QString::fromUtf8(intvsrcmap_file_name(m_srcmap, f)) == name && addr >= 0 &&
+                !intvdebug_breakpoint_is_set(m_dbg, uint16_t(addr)))
+                intvdebug_breakpoint_toggle(m_dbg, uint16_t(addr));
+        }
+    }
 
     /* Engaging switches the CPU hook to the path that honours breakpoints
      * (see intvdebug.h). Pausing immediately is what a user opening a
@@ -223,17 +245,18 @@ void DebuggerWindow::buildUi()
             &DebuggerWindow::pauseContinue);
     tb->addWidget(m_pauseBtn);
 
+    /* On the BASIC tab the three steppers go by BASIC line. */
     auto *step = new QPushButton(QStringLiteral("Step (F7)"));
-    connect(step, &QPushButton::clicked, this,
-            [this] { intvdebug_step(m_dbg); });
+    step->setToolTip(QStringLiteral("One instruction; on the BASIC tab, one BASIC line"));
+    connect(step, &QPushButton::clicked, this, [this] { doStep(); });
     tb->addWidget(step);
     auto *stepOver = new QPushButton(QStringLiteral("Step Over (F8)"));
-    connect(stepOver, &QPushButton::clicked, this,
-            [this] { intvdebug_step_over(m_dbg); });
+    stepOver->setToolTip(QStringLiteral("Over a subroutine call or GOSUB"));
+    connect(stepOver, &QPushButton::clicked, this, [this] { doStepOver(); });
     tb->addWidget(stepOver);
     auto *stepOut = new QPushButton(QStringLiteral("Step Out (Shift+F8)"));
-    connect(stepOut, &QPushButton::clicked, this,
-            [this] { intvdebug_step_out(m_dbg); });
+    stepOut->setToolTip(QStringLiteral("Until this routine returns"));
+    connect(stepOut, &QPushButton::clicked, this, [this] { doStepOut(); });
     tb->addWidget(stepOut);
     auto *clearBp = new QPushButton(QStringLiteral("Clear Breakpoints"));
     connect(clearBp, &QPushButton::clicked, this, [this] {
@@ -268,12 +291,9 @@ void DebuggerWindow::buildUi()
 
     new QShortcut(QKeySequence(Qt::Key_F1), this, [this] { intvHelpFor(this); });
     new QShortcut(QKeySequence(Qt::Key_F5), this, [this] { pauseContinue(); });
-    new QShortcut(QKeySequence(Qt::Key_F7), this,
-                  [this] { intvdebug_step(m_dbg); });
-    new QShortcut(QKeySequence(Qt::Key_F8), this,
-                  [this] { intvdebug_step_over(m_dbg); });
-    new QShortcut(QKeySequence(Qt::SHIFT | Qt::Key_F8), this,
-                  [this] { intvdebug_step_out(m_dbg); });
+    new QShortcut(QKeySequence(Qt::Key_F7), this, [this] { doStep(); });
+    new QShortcut(QKeySequence(Qt::Key_F8), this, [this] { doStepOver(); });
+    new QShortcut(QKeySequence(Qt::SHIFT | Qt::Key_F8), this, [this] { doStepOut(); });
 
     auto *tabs = new QTabWidget;
     m_tabs = tabs;
@@ -330,7 +350,8 @@ void DebuggerWindow::buildUi()
     rightLayout->addWidget(memBox, 1);
 
     cpuLayout->addWidget(right);
-    tabs->addTab(cpu, QLatin1String(kTabNames[0]));
+    tabs->addTab(cpu, QLatin1String(kTabNames[kTabCpu]));
+    tabs->addTab(buildBasic(), QLatin1String(kTabNames[kTabBasic]));
 
     /* ---- STIC tab ---- */
     auto *stic = new QWidget;
@@ -397,7 +418,7 @@ void DebuggerWindow::buildUi()
     auto *sticScroll = new QScrollArea;
     sticScroll->setWidgetResizable(true);
     sticScroll->setWidget(stic);
-    tabs->addTab(sticScroll, QLatin1String(kTabNames[1]));
+    tabs->addTab(sticScroll, QLatin1String(kTabNames[kTabStic]));
 
     /* ---- Symbols tab ---- */
     auto *symTab = new QWidget;
@@ -427,15 +448,15 @@ void DebuggerWindow::buildUi()
             });
     symLayout->addWidget(m_symList, 1);
 
-    tabs->addTab(symTab, QLatin1String(kTabNames[2]));
+    tabs->addTab(symTab, QLatin1String(kTabNames[kTabSymbols]));
 
     m_fujiPage = buildFujinet();
-    tabs->addTab(m_fujiPage, QLatin1String(kTabNames[3]));
+    tabs->addTab(m_fujiPage, QLatin1String(kTabNames[kTabFujinet]));
     /* Help's contexts (intvhelp.h), one per tab */
     {
-        static const char *const kHelpTabs[] = { "cpu", "stic", "symbols", "fujinet" };
+        static const char *const kHelpTabs[] = { "cpu", "basic", "stic", "symbols", "fujinet" };
         auto setHelpContext = [this](int page) {
-            if (page >= 0 && page < 4)
+            if (page >= 0 && page < kTabCount)
                 setProperty("intvHelpContext", QStringLiteral("debugger/%1").arg(QLatin1String(kHelpTabs[page])));
         };
         setHelpContext(tabs->currentIndex());
@@ -444,7 +465,259 @@ void DebuggerWindow::buildUi()
     connect(tabs, &QTabWidget::currentChanged, this, [this] {
         if (fujiShowing())
             refreshFujinet(false);
+        if (basicTab())
+            basicScrollToPc();   /* the view has no size until it shows */
     });
+}
+
+/* ---- BASIC tab ----------------------------------------------------------- */
+
+bool DebuggerWindow::basicTab() const
+{
+    return m_tabs->currentIndex() == kTabBasic;
+}
+
+/* On the BASIC tab the three steppers go by BASIC line. */
+void DebuggerWindow::doStep()
+{
+    if (basicTab()) intvdebug_step_line(m_dbg); else intvdebug_step(m_dbg);
+}
+
+void DebuggerWindow::doStepOver()
+{
+    if (basicTab()) intvdebug_step_line_over(m_dbg); else intvdebug_step_over(m_dbg);
+}
+
+void DebuggerWindow::doStepOut()
+{
+    if (basicTab()) intvdebug_step_line_out(m_dbg); else intvdebug_step_out(m_dbg);
+}
+
+QWidget *DebuggerWindow::buildBasic()
+{
+    auto *page = new QWidget;
+    auto *layout = new QVBoxLayout(page);
+    auto *bar = new QHBoxLayout;
+
+    auto addButton = [&](const QString &label, const QString &tip, int kind) {
+        auto *b = new QPushButton(label);
+        b->setToolTip(tip);
+        connect(b, &QPushButton::clicked, this, [this, kind] { basicPick(kind); });
+        bar->addWidget(b);
+    };
+    addButton(QStringLiteral("Import File…"),
+              QStringLiteral("Load a .bas file and everything it INCLUDEs"), kPickFile);
+    addButton(QStringLiteral("Import Folder…"),
+              QStringLiteral("Load every .bas file under a folder"), kPickFolder);
+    addButton(QStringLiteral("Load Map…"),
+              QStringLiteral("Load an as1600 -j source map, or a -l listing"), kPickMap);
+
+    m_basFiles = new QComboBox;
+    m_basFiles->setToolTip(QStringLiteral("The source file shown"));
+    m_basFiles->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    connect(m_basFiles, QOverload<int>::of(&QComboBox::activated), this,
+            [this](int i) { basicShowFile(i); });
+    bar->addWidget(m_basFiles);
+    bar->addStretch();
+    layout->addLayout(bar);
+
+    m_basNote = new QLabel;
+    m_basNote->setWordWrap(true);
+    m_basNote->setEnabled(false);   /* the dim, secondary text colour */
+    layout->addWidget(m_basNote);
+
+    m_basView = monoView();
+    connect(m_basView, &QPlainTextEdit::cursorPositionChanged, this,
+            [this] { basicToggleAtCursor(); });
+    layout->addWidget(m_basView, 1);
+    return page;
+}
+
+/* Clicking a line that has code toggles a breakpoint on it, as on the CPU
+ * tab. Only a real click counts: we move the cursor ourselves too. */
+void DebuggerWindow::basicToggleAtCursor()
+{
+    if (m_basGuard || m_basFile < 0 || !m_basView->hasFocus())
+        return;
+    const int line = m_basView->textCursor().blockNumber() + 1;
+    const int addr = intvsrcmap_first_addr(m_srcmap, m_basFile, line);
+    if (addr < 0) {
+        m_status->setText(QStringLiteral("No code on that line"));
+        return;
+    }
+    intvdebug_breakpoint_toggle(m_dbg, uint16_t(addr));
+    m_seenSerial = 0;   /* redraw the marker immediately */
+}
+
+void DebuggerWindow::basicScrollToPc()
+{
+    if (m_basPcLine < 1)
+        return;
+    const QTextBlock block = m_basView->document()->findBlockByNumber(m_basPcLine - 1);
+    if (!block.isValid())
+        return;
+    m_basGuard = true;
+    m_basView->setTextCursor(QTextCursor(block));
+    const QRect r = m_basView->cursorRect();
+    if (r.top() < 0 || r.bottom() > m_basView->viewport()->height())
+        m_basView->centerCursor();
+    m_basGuard = false;
+}
+
+/* The map changed (an import, a Load Map): the file list. */
+void DebuggerWindow::basicReload()
+{
+    const int n = intvsrcmap_file_count(m_srcmap);
+    m_basFiles->clear();
+    for (int i = 0; i < n; i++)
+        m_basFiles->addItem(QString::fromUtf8(intvsrcmap_file_name(m_srcmap, i)));
+    if (m_basFile >= n)
+        m_basFile = -1;
+    if (m_basFile < 0 && n > 0) {
+        m_basFile = 0;   /* the first file with any code on it */
+        bool found = false;
+        for (int i = 0; i < n && !found; i++) {
+            const int lines = intvsrcmap_line_count(m_srcmap, i);
+            for (int l = 1; l <= lines && !found; l++)
+                if (intvsrcmap_first_addr(m_srcmap, i, l) >= 0) {
+                    m_basFile = i;
+                    found = true;
+                }
+        }
+    }
+    m_basFiles->setCurrentIndex(m_basFile);
+    m_basPcLine = 0;
+    if (n == 0)
+        m_basNote->setText(QStringLiteral(
+            "Import a .bas file, or a folder of them. The assembler's map "
+            "(as1600 -j game.smap) puts each line at its address."));
+}
+
+void DebuggerWindow::basicShowFile(int file)
+{
+    m_basFile = file;
+    m_basPcLine = 0;
+    refreshBasic(intvdebug_is_paused(m_dbg));
+}
+
+void DebuggerWindow::refreshBasic(bool paused)
+{
+    const unsigned gen = intvsrcmap_generation(m_srcmap);
+    int pf = -1, pl = 0;
+    intvdebug_regs r;
+
+    if (gen != m_basGen) {
+        m_basGen = gen;
+        basicReload();
+    }
+    if (paused && intvdebug_regs_get(m_dbg, &r)) {
+        int f, l;
+        if (intvsrcmap_lookup(m_srcmap, r.pc, &f, &l)) {
+            pf = f;
+            pl = l;
+        }
+    }
+    if (pf >= 0 && pf != m_basFile) {   /* followed into another file */
+        m_basFile = pf;
+        m_basFiles->setCurrentIndex(pf);
+    }
+
+    QString text;
+    if (m_basFile >= 0) {
+        const int n = intvsrcmap_line_count(m_srcmap, m_basFile);
+        text.reserve(n * 48);
+        for (int i = 1; i <= n; i++) {
+            const int addr = intvsrcmap_first_addr(m_srcmap, m_basFile, i);
+            const char *src = intvsrcmap_line_text(m_srcmap, m_basFile, i);
+            text += QStringLiteral("%1%2 %3  %4\n")
+                        .arg(pf == m_basFile && i == pl ? QLatin1Char('>') : QLatin1Char(' '))
+                        .arg(addr >= 0 && intvdebug_breakpoint_is_set(m_dbg, uint16_t(addr))
+                                 ? QLatin1Char('*') : QLatin1Char(' '))
+                        .arg(i, 5)
+                        .arg(QString::fromUtf8(src ? src : ""));
+        }
+    }
+    m_basGuard = true;   /* setPlainText moves the cursor: not a click */
+    setText(m_basView, text);
+    m_basGuard = false;
+
+    const int line = pf == m_basFile ? pl : 0;
+    if (line != m_basPcLine) {
+        m_basPcLine = line;
+        basicScrollToPc();
+    }
+}
+
+void DebuggerWindow::basicImported(const QString &path, int kind)
+{
+    intvsrcmap_import_result r;
+    const int n = intvsrcmap_import(m_srcmap, path.toUtf8().constData(), m_symtab, &r);
+    QString msg;
+
+    if (n < 0) {
+        msg = kind == kPickFolder ? QStringLiteral("No .bas files in that folder.")
+                                  : QStringLiteral("Could not read that file.");
+    } else if (r.mapped > 0) {
+        msg = QStringLiteral("%1 file%2, %3 address range%4 from %5%6.")
+                  .arg(r.files).arg(r.files == 1 ? QString() : QStringLiteral("s"))
+                  .arg(r.mapped).arg(r.mapped == 1 ? QString() : QStringLiteral("s"))
+                  .arg(QFileInfo(QString::fromUtf8(r.map_path)).fileName())
+                  .arg(r.symbols ? QStringLiteral(", with its symbols") : QString());
+    } else {
+        msg = QStringLiteral("%1 file%2 loaded, but no .smap or .lst was found beside them. "
+                             "Build with as1600 -j game.smap, then Load Map.")
+                  .arg(r.files).arg(r.files == 1 ? QString() : QStringLiteral("s"));
+    }
+    m_basNote->setText(msg);
+    if (n >= 0) {
+        m_basFile = -1;   /* basicReload picks the first file with code */
+        m_seenSerial = 0;
+        if (intvdebug_is_paused(m_dbg))
+            refreshAll();
+    }
+}
+
+void DebuggerWindow::basicPick(int kind)
+{
+    const QString lastDir = m_session
+                                ? QString::fromUtf8(intvsession_get_str(m_session, "bas_dir", ""))
+                                : QString();
+    QString path;
+    if (kind == kPickFolder)
+        path = QFileDialog::getExistingDirectory(this, QStringLiteral("Import Folder"), lastDir);
+    else if (kind == kPickMap)
+        path = QFileDialog::getOpenFileName(
+            this, QStringLiteral("Load Map"), lastDir,
+            QStringLiteral("as1600 source maps and listings (*.smap *.lst);;All files (*)"));
+    else
+        path = QFileDialog::getOpenFileName(
+            this, QStringLiteral("Import File"), lastDir,
+            QStringLiteral("IntyBASIC source (*.bas);;All files (*)"));
+    if (path.isEmpty())
+        return;
+
+    if (m_session) {   /* start the next picker where this one ended */
+        const QString dir = kind == kPickFolder ? path : QFileInfo(path).absolutePath();
+        intvsession_set_str(m_session, "bas_dir", dir.toUtf8().constData());
+        intvsession_settings_flush(m_session);
+    }
+    if (kind == kPickMap) {
+        const int n = intvsrcmap_load_map(m_srcmap, path.toUtf8().constData());
+        if (n < 0) {
+            m_basNote->setText(QStringLiteral("Could not read that map."));
+            return;
+        }
+        const int syms = intvsrcmap_load_sibling_sym(path.toUtf8().constData(), m_symtab);
+        m_basNote->setText(QStringLiteral("%1 address range%2 from %3%4.")
+                               .arg(n).arg(n == 1 ? QString() : QStringLiteral("s"))
+                               .arg(QFileInfo(path).fileName())
+                               .arg(syms ? QStringLiteral(", with its symbols") : QString()));
+        m_seenSerial = 0;
+        if (intvdebug_is_paused(m_dbg))
+            refreshAll();
+    } else {
+        basicImported(path, kind);
+    }
 }
 
 QWidget *DebuggerWindow::buildFujinet()
@@ -827,6 +1100,7 @@ void DebuggerWindow::refreshAll()
      * not machine state, and is cheap to skip when nothing changed (see
      * refreshSymbols's own comment). */
     refreshSymbols();
+    refreshBasic(paused);
     if (fujiShowing())
         refreshFujinet(false);
     m_wasPaused = paused;

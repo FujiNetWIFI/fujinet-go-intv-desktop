@@ -55,13 +55,15 @@ cmake -B build -DFRONTEND=none -DWITH_INTV_ROMS=OFF
 cmake -B build -DFRONTEND=gnome   # or kde, macos, windows
 ```
 
-`ctest` runs 22 suites covering the headless jzIntv core, ROM embedding, the
+`ctest` runs 29 suites covering the headless jzIntv core, ROM embedding, the
 frame/audio publish contract, pad and keyboard input mapping (including the
 ECS keyboard/second controller pair and the ECS/Intellivoice/PAL machine
 options), the Windows/evdev/macOS key-code tables, the keypad disc's 16-way
 pointer geometry, the public session API, the peripheral bus' address decode
 teardown (which the FujiNet cart hot-swap depends on), the debugger's symbol
-table, STIC views and FujiBus packet decoder, and (when `WITH_INTV_ROMS=OFF`)
+table, the IntyBASIC source map and line stepping (the latter on a real
+running machine, against a ROM built by the real `intybasic` and `as1600`),
+STIC views and FujiBus packet decoder, and (when `WITH_INTV_ROMS=OFF`)
 that no Mattel firmware bytes ended up in the shipped binary.
 
 The ECS keyboard has three of those to itself, because its shifted layer is
@@ -84,7 +86,11 @@ to have it open those windows on startup. The Windows one exists because
 that frontend is only ever exercised by cross-building and running under
 Wine, where there is no way to drive a menu.
 `INTV_DEBUGGER_TAB` picks the debugger's tab when it opens: a number from 0,
-or the start of a tab's name (`cpu`, `stic`, `symbols`, `fujinet`).
+or the start of a tab's name (`cpu`, `basic`, `stic`, `symbols`, `fujinet`).
+`INTV_BASIC_IMPORT=<file.bas or folder>` imports IntyBASIC source into the
+debugger's BASIC tab as it opens, and `INTV_BASIC_BREAK=<name.bas>:<line>` sets
+a breakpoint on one of its lines (GNOME, KDE and Windows; macOS is unbuilt like
+the rest of its debugger).
 
 ## Project layout
 

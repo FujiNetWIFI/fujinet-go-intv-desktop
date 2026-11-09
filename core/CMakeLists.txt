@@ -176,6 +176,7 @@ list(APPEND JZINTV_CORE_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/jzintv/intv_host.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/debugger.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/fujitrace.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/debugger/srcmap.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/sticview.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/symbols.c"
 )
@@ -451,6 +452,21 @@ add_executable(symtab_test tests/symtab_test.c)
 target_link_libraries(symtab_test jzintv_core)
 target_include_directories(symtab_test PRIVATE debugger)
 
+# Pure test of the IntyBASIC source map; the fixtures are real intybasic +
+# as1600 output.
+add_executable(srcmap_test tests/srcmap_test.c)
+target_link_libraries(srcmap_test jzintv_core)
+target_include_directories(srcmap_test PRIVATE debugger)
+target_compile_definitions(srcmap_test PRIVATE
+  SRCMAP_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/srcmap")
+
+# Stepping by BASIC line on a real machine (needs the embedded ROMs).
+add_executable(linestep_test tests/linestep_test.c)
+target_link_libraries(linestep_test jzintv_core)
+target_include_directories(linestep_test PRIVATE src debugger)
+target_compile_definitions(linestep_test PRIVATE
+  SRCMAP_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/srcmap")
+
 # Pure decoder test: synthetic SLIP bytes, no ROMs, no network.
 add_executable(fujitrace_test tests/fujitrace_test.c)
 target_link_libraries(fujitrace_test jzintv_core)
@@ -487,6 +503,9 @@ set_tests_properties(external PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 add_test(NAME debug COMMAND debug_test)
 add_test(NAME stic COMMAND stic_test)
 add_test(NAME symtab COMMAND symtab_test)
+add_test(NAME srcmap COMMAND srcmap_test)
+add_test(NAME linestep COMMAND linestep_test)
+set_tests_properties(linestep PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
 add_test(NAME fujitrace COMMAND fujitrace_test)
 add_test(NAME periph COMMAND periph_test)
 add_test(NAME rom_import COMMAND rom_import_test)

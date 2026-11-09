@@ -12,6 +12,11 @@
  * It is the one view that changes while the machine runs, so the frame
  * clock also refreshes it twice a second while it shows.
  *
+ * The BASIC tab shows IntyBASIC source (core/debugger/srcmap.h) beside the
+ * stepping: on it, Step / Step Over / Step Out go by BASIC line. Like the
+ * symbol table, the imported source is process-wide (intvsrcmap_shared()),
+ * so it survives closing this window.
+ *
  * The disassembly, register and memory views drive intvdebug.h directly.
  * The symbol table (core/debugger/symbols.h) is not owned by intvdebug --
  * unlike cocodebug's built-in one -- so this window uses the process-wide
@@ -32,6 +37,7 @@
 
 #include "intvdebug.h"
 #include "intvstic.h"
+#include "srcmap.h"
 #include "symbols.h"
 #include "../help/help_window.h"
 
@@ -40,6 +46,8 @@
 #define MEM_ROWS 16
 #define CARD_ROWS_PER_PAGE 8 /* 128 cards/page at CARDS_PER_ROW=16 */
 #define FUJI_REFRESH_US 500000 /* the FujiNet tab, while it shows */
+
+enum { TAB_CPU, TAB_BASIC, TAB_STIC, TAB_SYMBOLS, TAB_FUJINET };
 
 typedef struct {
     GtkWindow *win;
@@ -72,6 +80,20 @@ typedef struct {
     GtkTextView *stic_state;
     int card_first;
     int card_total;
+
+    /* BASIC tab */
+    intvsrcmap *srcmap;
+    GtkLabel *bas_note;
+    GtkDropDown *bas_files;
+    GtkStringList *bas_names;
+    GtkScrolledWindow *bas_scroll;
+    GtkListBox *bas_list;
+    GPtrArray *bas_labels;   /* one GtkLabel per line of the file shown */
+    GArray *bas_marks;       /* char[3] per line: what its gutter shows now */
+    int bas_file;            /* index into the map; -1 = nothing shown */
+    unsigned bas_gen;        /* intvsrcmap_generation() the list was built from */
+    int bas_scroll_line;     /* a line to bring into view once it has a size */
+    gboolean bas_syncing;    /* dropdown being set by us, not the user */
 
     GtkNotebook *notebook;
     GtkWidget *fuji_page;
@@ -517,6 +539,204 @@ static void refresh_fujinet(DbgWin *w, gboolean force)
     g_string_free(t, TRUE);
 }
 
+/* ---- BASIC tab ------------------------------------------------------------ */
+
+static gboolean basic_tab_active(DbgWin *w)
+{
+    return w->tabs && gtk_notebook_get_current_page(w->tabs) == TAB_BASIC;
+}
+
+/* A line's gutter: '>' the machine is here, '*' a breakpoint on its code. */
+static void basic_mark(DbgWin *w, int line, int pc_line, char out[3])
+{
+    int addr = intvsrcmap_first_addr(w->srcmap, w->bas_file, line);
+    out[0] = line == pc_line ? '>' : ' ';
+    out[1] = addr >= 0 && intvdebug_breakpoint_is_set(w->dbg, (uint16_t)addr)
+                 ? '*' : ' ';
+    out[2] = '\0';
+}
+
+static void basic_set_row(DbgWin *w, int line, const char mark[3])
+{
+    GtkLabel *label = g_ptr_array_index(w->bas_labels, line - 1);
+    const char *src = intvsrcmap_line_text(w->srcmap, w->bas_file, line);
+    g_autofree char *text =
+        g_strdup_printf("%s %5d  %s", mark, line, src ? src : "");
+    gtk_label_set_text(label, text);
+    memcpy(w->bas_marks->data + 3 * (line - 1), mark, 3);
+}
+
+static void basic_rebuild(DbgWin *w)
+{
+    int n, i;
+
+    gtk_list_box_remove_all(w->bas_list);
+    g_ptr_array_set_size(w->bas_labels, 0);
+    g_array_set_size(w->bas_marks, 0);
+    if (w->bas_file < 0)
+        return;
+
+    n = intvsrcmap_line_count(w->srcmap, w->bas_file);
+    for (i = 1; i <= n; i++) {
+        static const char blank[3] = "  ";
+        GtkWidget *row = gtk_list_box_row_new();
+        GtkWidget *label = gtk_label_new(NULL);
+
+        gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+        gtk_widget_add_css_class(label, "monospace");
+        /* lines with no code (comments, labels, blanks) recede */
+        if (intvsrcmap_first_addr(w->srcmap, w->bas_file, i) < 0)
+            gtk_widget_add_css_class(label, "dim-label");
+        gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), label);
+        g_object_set_data(G_OBJECT(row), "intv-line", GINT_TO_POINTER(i));
+        gtk_list_box_append(w->bas_list, row);
+        g_ptr_array_add(w->bas_labels, label);
+        g_array_append_vals(w->bas_marks, blank, 1);
+        basic_set_row(w, i, blank);
+    }
+}
+
+/* Brings the line the machine is on to the middle of the view. A row has no
+ * height until it has been laid out, so this is retried from the tick. */
+static void basic_try_scroll(DbgWin *w)
+{
+    int line = w->bas_scroll_line;
+    GtkWidget *row;
+    graphene_point_t in = GRAPHENE_POINT_INIT(0, 0), out;
+    GtkAdjustment *adj;
+    double h, page, top;
+
+    if (line < 1 || line > (int)w->bas_labels->len) {
+        w->bas_scroll_line = 0;
+        return;
+    }
+    row = gtk_widget_get_ancestor(
+        GTK_WIDGET(g_ptr_array_index(w->bas_labels, line - 1)),
+        GTK_TYPE_LIST_BOX_ROW);
+    h = row ? gtk_widget_get_height(row) : 0;
+    adj = gtk_scrolled_window_get_vadjustment(w->bas_scroll);
+    page = gtk_adjustment_get_page_size(adj);
+    if (h <= 0 || page <= 0 ||
+        !gtk_widget_compute_point(row, GTK_WIDGET(w->bas_list), &in, &out))
+        return;
+    top = gtk_adjustment_get_value(adj);
+    if (out.y < top + h || out.y + 2 * h > top + page)
+        gtk_adjustment_set_value(adj, out.y - page / 2 + h / 2);
+    w->bas_scroll_line = 0;
+}
+
+static void basic_select_file(DbgWin *w, int file)
+{
+    w->bas_syncing = TRUE;
+    gtk_drop_down_set_selected(w->bas_files,
+                               file >= 0 ? (guint)file : GTK_INVALID_LIST_POSITION);
+    w->bas_syncing = FALSE;
+}
+
+/* The map changed (an import, a Load Map): the file list, the list. */
+static void basic_reload(DbgWin *w)
+{
+    int n = intvsrcmap_file_count(w->srcmap), i;
+    g_autoptr(GPtrArray) names = g_ptr_array_new();
+
+    for (i = 0; i < n; i++)
+        g_ptr_array_add(names, (gpointer)intvsrcmap_file_name(w->srcmap, i));
+    g_ptr_array_add(names, NULL);
+    w->bas_syncing = TRUE;
+    gtk_string_list_splice(w->bas_names, 0,
+                           g_list_model_get_n_items(G_LIST_MODEL(w->bas_names)),
+                           (const char *const *)names->pdata);
+    w->bas_syncing = FALSE;
+
+    if (w->bas_file >= n)
+        w->bas_file = -1;
+    if (w->bas_file < 0 && n > 0) {
+        /* the first file with any code on it */
+        w->bas_file = 0;
+        for (i = 0; i < n; i++) {
+            int l, lines = intvsrcmap_line_count(w->srcmap, i);
+            for (l = 1; l <= lines; l++)
+                if (intvsrcmap_first_addr(w->srcmap, i, l) >= 0)
+                    break;
+            if (l <= lines) {
+                w->bas_file = i;
+                break;
+            }
+        }
+    }
+    basic_select_file(w, w->bas_file);
+    if (n == 0)
+        gtk_label_set_text(w->bas_note,
+            "Import a .bas file, or a folder of them. The assembler's map "
+            "(as1600 -j game.smap) puts each line at its address.");
+    basic_rebuild(w);
+}
+
+static void basic_refresh(DbgWin *w, int paused)
+{
+    unsigned gen = intvsrcmap_generation(w->srcmap);
+    int pf = -1, pl = 0, n, i;
+    intvdebug_regs r;
+
+    if (gen != w->bas_gen) {
+        w->bas_gen = gen;
+        basic_reload(w);
+    }
+    if (paused && intvdebug_regs_get(w->dbg, &r)) {
+        int f, l;
+        if (intvsrcmap_lookup(w->srcmap, r.pc, &f, &l)) {
+            pf = f;
+            pl = l;
+        }
+    }
+    if (pf >= 0 && pf != w->bas_file) {   /* followed into another file */
+        w->bas_file = pf;
+        basic_select_file(w, pf);
+        basic_rebuild(w);
+    }
+    n = (int)w->bas_labels->len;
+    for (i = 1; i <= n; i++) {
+        char mark[3];
+        basic_mark(w, i, pf == w->bas_file ? pl : 0, mark);
+        if (memcmp(mark, w->bas_marks->data + 3 * (i - 1), 3) != 0)
+            basic_set_row(w, i, mark);
+    }
+    if (pf >= 0 && pf == w->bas_file) {
+        w->bas_scroll_line = pl;
+        basic_try_scroll(w);
+    }
+}
+
+static void on_bas_file_selected(GObject *dd, GParamSpec *pspec,
+                                 gpointer user_data)
+{
+    DbgWin *w = user_data;
+    guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(dd));
+    (void)pspec;
+
+    if (w->bas_syncing)
+        return;
+    w->bas_file = sel == GTK_INVALID_LIST_POSITION ? -1 : (int)sel;
+    basic_rebuild(w);
+    invalidate(w);
+}
+
+static void on_bas_row_activated(GtkListBox *box, GtkListBoxRow *row,
+                                 gpointer user_data)
+{
+    DbgWin *w = user_data;
+    int line = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "intv-line"));
+    int addr = intvsrcmap_first_addr(w->srcmap, w->bas_file, line);
+    (void)box;
+
+    if (addr < 0) {   /* a message, not a refresh: see go_to_mem_addr */
+        gtk_label_set_text(w->status, "No code on that line");
+        return;
+    }
+    intvdebug_breakpoint_toggle(w->dbg, (uint16_t)addr);
+    invalidate(w);
+}
+
 static void refresh_all(DbgWin *w)
 {
     int paused = intvdebug_is_paused(w->dbg);
@@ -533,6 +753,7 @@ static void refresh_all(DbgWin *w)
         gtk_list_box_remove_all(w->disasm);
         gtk_label_set_text(w->mem, "");
     }
+    basic_refresh(w, paused);
     /* Independent of run/pause -- the symbol list reflects what's loaded,
      * not machine state, and is cheap to skip when nothing changed (see
      * refresh_symbols's own comment). */
@@ -565,6 +786,8 @@ static gboolean tick_cb(GtkWidget *widget, GdkFrameClock *clock,
         /* the one view that moves while the machine runs */
         refresh_fujinet(w, FALSE);
     }
+    if (w->bas_scroll_line)
+        basic_try_scroll(w);
     /* Paused with nothing pending: stop (this removes the callback). */
     if (intvdebug_is_paused(w->dbg) && w->kick <= 0) {
         w->tick_id = 0;
@@ -591,12 +814,34 @@ static void on_run_pause(GtkButton *button, gpointer user_data)
         intvdebug_pause(w->dbg);
 }
 
+/* On the BASIC tab the three steppers go by BASIC line. */
 static void on_step(GtkButton *b, gpointer u)
-{ (void)b; intvdebug_step(((DbgWin *)u)->dbg); }
+{
+    DbgWin *w = u;
+    (void)b;
+    if (basic_tab_active(w))
+        intvdebug_step_line(w->dbg);
+    else
+        intvdebug_step(w->dbg);
+}
 static void on_step_over(GtkButton *b, gpointer u)
-{ (void)b; intvdebug_step_over(((DbgWin *)u)->dbg); }
+{
+    DbgWin *w = u;
+    (void)b;
+    if (basic_tab_active(w))
+        intvdebug_step_line_over(w->dbg);
+    else
+        intvdebug_step_over(w->dbg);
+}
 static void on_step_out(GtkButton *b, gpointer u)
-{ (void)b; intvdebug_step_out(((DbgWin *)u)->dbg); }
+{
+    DbgWin *w = u;
+    (void)b;
+    if (basic_tab_active(w))
+        intvdebug_step_line_out(w->dbg);
+    else
+        intvdebug_step_out(w->dbg);
+}
 static void on_clear_bp(GtkButton *b, gpointer u)
 {
     DbgWin *w = u;
@@ -734,6 +979,133 @@ static void on_load_symbols(GtkButton *button, gpointer user_data)
     g_object_unref(dialog);
 }
 
+/* ---- BASIC tab: Import File / Import Folder / Load Map ------------------- */
+
+enum { PICK_FILE, PICK_FOLDER, PICK_MAP };
+
+typedef struct {
+    GWeakRef win;
+    int kind;
+} PickReq;
+
+static void basic_after_import(DbgWin *w, const char *path, int kind)
+{
+    intvsrcmap_import_result r;
+    g_autofree char *msg = NULL;
+    int n = intvsrcmap_import(w->srcmap, path, w->symtab, &r);
+
+    if (n < 0) {
+        gtk_label_set_text(w->bas_note,
+            kind == PICK_FOLDER ? "No .bas files in that folder."
+                                : "Could not read that file.");
+        return;
+    }
+    if (r.mapped > 0) {
+        g_autofree char *base = g_path_get_basename(r.map_path);
+        msg = g_strdup_printf("%d file%s, %d address range%s from %s%s%s",
+                              r.files, r.files == 1 ? "" : "s", r.mapped,
+                              r.mapped == 1 ? "" : "s", base,
+                              r.symbols ? ", with its symbols" : "", ".");
+    } else {
+        msg = g_strdup_printf(
+            "%d file%s loaded, but no .smap or .lst was found beside them. "
+            "Build with as1600 -j game.smap, then Load Map.",
+            r.files, r.files == 1 ? "" : "s");
+    }
+    gtk_label_set_text(w->bas_note, msg);
+    w->bas_file = -1;   /* basic_reload picks the first file with code */
+    invalidate(w);
+}
+
+static void pick_done(GObject *source, GAsyncResult *result, gpointer user_data)
+{
+    PickReq *req = user_data;
+    g_autoptr(GObject) wobj = g_weak_ref_get(&req->win);
+    DbgWin *w = wobj ? g_object_get_data(wobj, "dbgwin") : NULL;
+    int kind = req->kind;
+    g_autoptr(GFile) file =
+        kind == PICK_FOLDER
+            ? gtk_file_dialog_select_folder_finish(GTK_FILE_DIALOG(source), result, NULL)
+            : gtk_file_dialog_open_finish(GTK_FILE_DIALOG(source), result, NULL);
+    g_autofree char *path = NULL;
+
+    g_weak_ref_clear(&req->win);
+    g_free(req);
+    if (!w || !file)    /* closed, or the picker was cancelled */
+        return;
+    path = g_file_get_path(file);
+    if (!path)
+        return;
+
+    {   /* start the next picker where this one ended */
+        char dir[1024];
+        if (kind == PICK_FOLDER)
+            g_strlcpy(dir, path, sizeof(dir));
+        else
+            intvsym_dirname(path, dir, sizeof(dir));
+        if (dir[0] && w->session) {
+            intvsession_set_str(w->session, "bas_dir", dir);
+            intvsession_settings_flush(w->session);
+        }
+    }
+    if (kind == PICK_MAP) {
+        int n = intvsrcmap_load_map(w->srcmap, path);
+        if (n < 0) {
+            gtk_label_set_text(w->bas_note, "Could not read that map.");
+        } else {
+            g_autofree char *base = g_path_get_basename(path);
+            int syms = intvsrcmap_load_sibling_sym(path, w->symtab);
+            g_autofree char *msg = g_strdup_printf(
+                "%d address range%s from %s%s.", n, n == 1 ? "" : "s", base,
+                syms ? ", with its symbols" : "");
+            gtk_label_set_text(w->bas_note, msg);
+        }
+        invalidate(w);
+    } else {
+        basic_after_import(w, path, kind);
+    }
+}
+
+static void on_basic_pick(GtkButton *button, gpointer user_data)
+{
+    DbgWin *w = user_data;
+    int kind = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "kind"));
+    GtkFileDialog *dialog = gtk_file_dialog_new();
+    GtkFileFilter *filter = gtk_file_filter_new();
+    GListStore *filters = g_list_store_new(GTK_TYPE_FILE_FILTER);
+    const char *last_dir =
+        w->session ? intvsession_get_str(w->session, "bas_dir", "") : "";
+    PickReq *req = g_new0(PickReq, 1);
+
+    if (kind == PICK_MAP) {
+        gtk_file_filter_set_name(filter, "as1600 source maps and listings");
+        gtk_file_filter_add_suffix(filter, "smap");
+        gtk_file_filter_add_suffix(filter, "lst");
+    } else {
+        gtk_file_filter_set_name(filter, "IntyBASIC source");
+        gtk_file_filter_add_suffix(filter, "bas");
+    }
+    gtk_file_filter_add_pattern(filter, "*");
+    g_list_store_append(filters, filter);
+    gtk_file_dialog_set_title(dialog, kind == PICK_FOLDER ? "Import Folder"
+                                      : kind == PICK_MAP  ? "Load Map"
+                                                          : "Import File");
+    if (kind != PICK_FOLDER)
+        gtk_file_dialog_set_filters(dialog, G_LIST_MODEL(filters));
+    if (last_dir[0]) {
+        g_autoptr(GFile) folder = g_file_new_for_path(last_dir);
+        gtk_file_dialog_set_initial_folder(dialog, folder);
+    }
+    req->kind = kind;
+    g_weak_ref_init(&req->win, w->win);
+    if (kind == PICK_FOLDER)
+        gtk_file_dialog_select_folder(dialog, w->win, NULL, pick_done, req);
+    else
+        gtk_file_dialog_open(dialog, w->win, NULL, pick_done, req);
+    g_object_unref(filters);
+    g_object_unref(dialog);
+}
+
 static void on_clear_symbols(GtkButton *b, gpointer u)
 {
     DbgWin *w = u;
@@ -752,7 +1124,8 @@ static void on_fuji_clear(GtkButton *b, gpointer u)
 
 /* Help's contexts (intvhelp.h), one per tab */
 static const char *const k_tab_contexts[] = {
-    "debugger/cpu", "debugger/stic", "debugger/symbols", "debugger/fujinet",
+    "debugger/cpu", "debugger/basic", "debugger/stic", "debugger/symbols",
+    "debugger/fujinet",
 };
 
 static gboolean on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num,
@@ -764,6 +1137,8 @@ static gboolean on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num,
         intv_help_set_context(w->win, k_tab_contexts[num]);
     if (page == w->fuji_page)
         refresh_fujinet(w, FALSE);
+    if (num == TAB_BASIC)
+        kick(w);   /* the list has no height until it shows: scroll then */
     return FALSE;
 }
 
@@ -782,13 +1157,13 @@ static gboolean on_key(GtkEventControllerKey *c, guint keyval, guint keycode,
         on_run_pause(NULL, w);
         return TRUE;
     case GDK_KEY_F7:
-        intvdebug_step(w->dbg);
+        on_step(NULL, w);
         return TRUE;
     case GDK_KEY_F8:
         if (state & GDK_SHIFT_MASK)
-            intvdebug_step_out(w->dbg);
+            on_step_out(NULL, w);
         else
-            intvdebug_step_over(w->dbg);
+            on_step_over(NULL, w);
         return TRUE;
     default:
         return FALSE;
@@ -799,7 +1174,12 @@ static gboolean on_key(GtkEventControllerKey *c, guint keyval, guint keycode,
  * when no child can still signal into it. */
 static void dbgwin_free(gpointer data, GObject *where)
 {
+    DbgWin *w = data;
     (void)where;
+    if (w->bas_labels)
+        g_ptr_array_free(w->bas_labels, TRUE);
+    if (w->bas_marks)
+        g_array_free(w->bas_marks, TRUE);
     g_free(data);
 }
 
@@ -909,9 +1289,63 @@ static GtkWidget *build_fujinet(DbgWin *w)
     return paned;
 }
 
+static GtkWidget *build_basic(DbgWin *w)
+{
+    static const struct { const char *label, *tip; int kind; } buttons[] = {
+        { "Import _File…", "Load a .bas file and everything it INCLUDEs", PICK_FILE },
+        { "Import F_older…", "Load every .bas file under a folder", PICK_FOLDER },
+        { "Load _Map…", "Load an as1600 -j source map, or a -l listing", PICK_MAP },
+    };
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *note = gtk_label_new("");
+    size_t i;
+
+    for (i = 0; i < G_N_ELEMENTS(buttons); i++) {
+        GtkWidget *b = tool_button(buttons[i].label, buttons[i].tip,
+                                   G_CALLBACK(on_basic_pick), w);
+        g_object_set_data(G_OBJECT(b), "kind", GINT_TO_POINTER(buttons[i].kind));
+        gtk_box_append(GTK_BOX(bar), b);
+    }
+    w->bas_names = gtk_string_list_new(NULL);
+    w->bas_files = GTK_DROP_DOWN(
+        gtk_drop_down_new(G_LIST_MODEL(w->bas_names), NULL));
+    gtk_widget_set_tooltip_text(GTK_WIDGET(w->bas_files),
+                                "The source file shown");
+    g_signal_connect(w->bas_files, "notify::selected",
+                     G_CALLBACK(on_bas_file_selected), w);
+    gtk_box_append(GTK_BOX(bar), GTK_WIDGET(w->bas_files));
+
+    gtk_widget_add_css_class(note, "dim-label");
+    gtk_label_set_xalign(GTK_LABEL(note), 0);
+    gtk_label_set_wrap(GTK_LABEL(note), TRUE);
+    w->bas_note = GTK_LABEL(note);
+
+    w->bas_labels = g_ptr_array_new();
+    w->bas_marks = g_array_new(FALSE, TRUE, 3);
+    w->bas_file = -1;
+    w->bas_list = GTK_LIST_BOX(gtk_list_box_new());
+    gtk_list_box_set_selection_mode(w->bas_list, GTK_SELECTION_NONE);
+    g_signal_connect(w->bas_list, "row-activated",
+                     G_CALLBACK(on_bas_row_activated), w);
+    w->bas_scroll = GTK_SCROLLED_WINDOW(gtk_scrolled_window_new());
+    gtk_scrolled_window_set_child(w->bas_scroll, GTK_WIDGET(w->bas_list));
+    gtk_widget_set_vexpand(GTK_WIDGET(w->bas_scroll), TRUE);
+    gtk_widget_set_hexpand(GTK_WIDGET(w->bas_scroll), TRUE);
+
+    gtk_widget_set_margin_top(box, 6);
+    gtk_widget_set_margin_bottom(box, 6);
+    gtk_widget_set_margin_start(box, 6);
+    gtk_widget_set_margin_end(box, 6);
+    gtk_box_append(GTK_BOX(box), bar);
+    gtk_box_append(GTK_BOX(box), note);
+    gtk_box_append(GTK_BOX(box), GTK_WIDGET(w->bas_scroll));
+    return box;
+}
+
 /* The notebook's pages, in order; INTV_DEBUGGER_TAB picks one by number or
  * by the start of its name (any case), for tests and captures. */
-static const char *const k_tab_names[] = { "CPU", "STIC", "Symbols", "FujiNet" };
+static const char *const k_tab_names[] = { "CPU", "BASIC", "STIC", "Symbols", "FujiNet" };
 
 static int tab_from_env(void)
 {
@@ -950,6 +1384,7 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     w->session = session;
     w->dbg = intvdebug_get();
     w->symtab = intvsymtab_shared();
+    w->srcmap = intvsrcmap_shared();
     w->mem_view_addr = 0x0000;
 
     w->win = GTK_WINDOW(adw_window_new());
@@ -976,10 +1411,10 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
                                           G_CALLBACK(on_run_pause), w));
     gtk_box_append(GTK_BOX(bar), GTK_WIDGET(w->run_pause));
     gtk_box_append(GTK_BOX(bar),
-                   tool_button("_Step", "One instruction (F7)",
+                   tool_button("_Step", "One instruction, or on the BASIC tab one BASIC line (F7)",
                                G_CALLBACK(on_step), w));
     gtk_box_append(GTK_BOX(bar),
-                   tool_button("Step _Over", "Over a subroutine call (F8)",
+                   tool_button("Step _Over", "Over a subroutine call or GOSUB (F8)",
                                G_CALLBACK(on_step_over), w));
     gtk_box_append(GTK_BOX(bar),
                    tool_button("Step Ou_t",
@@ -1128,13 +1563,15 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     notebook = gtk_notebook_new();
     w->notebook = GTK_NOTEBOOK(notebook);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), panes,
-                             gtk_label_new(k_tab_names[0]));
+                             gtk_label_new(k_tab_names[TAB_CPU]));
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_basic(w),
+                             gtk_label_new(k_tab_names[TAB_BASIC]));
     {
         GtkWidget *outer_scroll = gtk_scrolled_window_new();
         gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(outer_scroll),
                                       stic_grid);
         gtk_notebook_append_page(GTK_NOTEBOOK(notebook), outer_scroll,
-                                 gtk_label_new(k_tab_names[1]));
+                                 gtk_label_new(k_tab_names[TAB_STIC]));
     }
     {
         GtkWidget *sym_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
@@ -1166,16 +1603,16 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
         gtk_box_append(GTK_BOX(sym_box), sym_filter_bar);
         gtk_box_append(GTK_BOX(sym_box), sym_scroll);
         gtk_notebook_append_page(GTK_NOTEBOOK(notebook), sym_box,
-                                 gtk_label_new(k_tab_names[2]));
+                                 gtk_label_new(k_tab_names[TAB_SYMBOLS]));
     }
     w->fuji_page = build_fujinet(w);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), w->fuji_page,
-                             gtk_label_new(k_tab_names[3]));
+                             gtk_label_new(k_tab_names[TAB_FUJINET]));
     w->tabs = GTK_NOTEBOOK(notebook);
     g_signal_connect(notebook, "switch-page", G_CALLBACK(on_switch_page), w);
     {
         int cur = gtk_notebook_get_current_page(GTK_NOTEBOOK(notebook));
-        intv_help_set_context(w->win, k_tab_contexts[cur > 0 && cur < 4 ? cur : 0]);
+        intv_help_set_context(w->win, k_tab_contexts[cur > 0 && cur < (int)G_N_ELEMENTS(k_tab_contexts) ? cur : 0]);
     }
     if (tab_from_env() >= 0)
         gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), tab_from_env());
@@ -1195,6 +1632,26 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     g_signal_connect(keys, "key-pressed", G_CALLBACK(on_key), w);
     gtk_widget_add_controller(GTK_WIDGET(w->win), keys);
     g_signal_connect(w->win, "close-request", G_CALLBACK(on_closed), w);
+
+    /* For captures and tests, like INTV_DEBUGGER_TAB: INTV_BASIC_IMPORT=<.bas
+     * file or folder> imports it as Import File / Import Folder would, and
+     * INTV_BASIC_BREAK=<name.bas>:<line> sets a breakpoint on that line. */
+    {
+        const char *imp = g_getenv("INTV_BASIC_IMPORT");
+        const char *brk = g_getenv("INTV_BASIC_BREAK");
+        if (imp && *imp)
+            basic_after_import(w, imp, PICK_FILE);
+        if (brk && strchr(brk, ':')) {
+            g_autofree char *name = g_strndup(brk, (gsize)(strchr(brk, ':') - brk));
+            int line = atoi(strchr(brk, ':') + 1), f;
+            for (f = 0; f < intvsrcmap_file_count(w->srcmap); f++) {
+                int addr = intvsrcmap_first_addr(w->srcmap, f, line);
+                if (strcmp(intvsrcmap_file_name(w->srcmap, f), name) == 0 &&
+                    addr >= 0 && !intvdebug_breakpoint_is_set(w->dbg, (uint16_t)addr))
+                    intvdebug_breakpoint_toggle(w->dbg, (uint16_t)addr);
+            }
+        }
+    }
 
     /* Engaging switches the CPU hook to the path that honours breakpoints
      * (see intvdebug.h). Pausing immediately is what a user opening a

@@ -360,7 +360,7 @@ controls that differ from the defaults).
 # Debugger
 
 The Debugger (<kbd>F12</kbd>) stops the console and shows what it is doing.
-It has four tabs; closing it lets the console go on as it was.
+It has five tabs; closing it lets the console go on as it was.
 
 | Button | Does |
 |---|---|
@@ -380,6 +380,29 @@ It has four tabs; closing it lets the console go on as it was.
 The CP1610 disassembled with symbols; double-click a line to toggle its
 breakpoint. Beside it are the registers, and below it a memory view: type an
 address or a symbol after **Address:** and press Enter.
+
+<!-- context: debugger/basic -->
+## BASIC
+
+Your IntyBASIC source, a line at a time. **Import File** loads a `.bas` file and
+every file it `INCLUDE`s; **Import Folder** loads every `.bas` under a folder.
+Which address is which line comes from the assembler's map, which the import
+looks for beside the source (`game.smap` or `game.lst`). Build with:
+
+```
+intybasic game.bas game.asm
+as1600 -o game -j game.smap -l game.lst -s game.sym game.asm
+```
+
+If there is no map, **Load Map** reads one; a `.sym` beside it is loaded too.
+The file list picks the source shown. The line the machine is on is marked `>`;
+double-click a line that has code to toggle a breakpoint on it (`*`).
+
+On this tab Step, Step Over and Step Out (<kbd>F7</kbd>, <kbd>F8</kbd>,
+<kbd>Shift+F8</kbd>) go by BASIC line. Step goes into a `GOSUB`, Step Over runs
+it, and Step Out runs until the procedure returns. The IntyBASIC runtime is no
+line of yours, so stepping runs straight through it. The map has to come from
+the ROM that is running.
 
 <!-- context: debugger/stic -->
 ## STIC

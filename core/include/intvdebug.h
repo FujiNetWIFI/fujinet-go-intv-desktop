@@ -92,6 +92,22 @@ void intvdebug_step_over(intvdebug *d);
  * meaningful while paused. */
 void intvdebug_step_out(intvdebug *d);
 
+/* ---- stepping by IntyBASIC line ------------------------------------------
+ * These use the shared source map (core/debugger/srcmap.h): they run until
+ * the PC reaches the first word of a BASIC line, then pause. Code with no
+ * BASIC line behind it (the IntyBASIC runtime, EXEC) is run through. With no
+ * map loaded they never stop on their own; Pause still works. Only
+ * meaningful while paused.
+ *   step_line       stops on the next line, going into GOSUBs and ISRs.
+ *   step_line_over  the same, but skips whatever a line calls: only lines at
+ *                   the starting stack depth or shallower count.
+ *   step_line_out   runs until the current routine has returned to its
+ *                   caller (the stack is shallower than where it started).
+ * The CP-1610 stack grows upward, so "deeper" is a larger R6. */
+void intvdebug_step_line(intvdebug *d);
+void intvdebug_step_line_over(intvdebug *d);
+void intvdebug_step_line_out(intvdebug *d);
+
 /* Bumped every time the machine stops. A UI polls this on its frame clock
  * and refreshes when it changes, rather than being called back on the
  * emulator thread. */

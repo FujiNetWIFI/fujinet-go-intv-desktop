@@ -155,6 +155,7 @@ typedef struct {
     int bas_file;       /* index into the map; -1 = nothing shown */
     unsigned bas_gen;   /* intvsrcmap_generation() the view was built from */
     int bas_pc_line;    /* the machine's line in the file shown, 0 = none */
+    uint64_t bas_serial; /* the stop the view last followed */
 
     HWND backtab_label, backtab_view;
     HWND mob_label, mob_view[INTVSTIC_MOB_COUNT], mob_info;
@@ -1655,7 +1656,12 @@ static void refresh_basic(debugger *d, int paused)
     line = pf == d->bas_file ? pl : 0;
     {
         int reveal = -1;
-        if (line != d->bas_pc_line) {
+        /* every new stop brings the current line into view, even the same line as last time */
+        const uint64_t ser = intvdebug_stop_serial(d->dbg);
+        const int new_stop = paused && ser != d->bas_serial;
+        if (paused)
+            d->bas_serial = ser;
+        if (line != d->bas_pc_line || (new_stop && line > 0)) {
             d->bas_pc_line = line;
             if (line > 0)
                 reveal = line - 1;

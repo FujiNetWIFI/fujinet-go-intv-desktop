@@ -49,6 +49,13 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.18.1" date="2026-11-09">
+      <description>
+        <p>
+          Debugger: every stop (a pause or a breakpoint) now brings the CPU and BASIC views to the current line, even when you had scrolled away from it.
+        </p>
+      </description>
+    </release>
     <release version="0.18.0" date="2026-11-09">
       <description>
         <p>

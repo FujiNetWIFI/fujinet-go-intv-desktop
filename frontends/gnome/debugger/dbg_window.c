@@ -366,6 +366,11 @@ static void refresh_disasm(DbgWin *w)
                           GUINT_TO_POINTER((guint)l->addr));
         gtk_list_box_append(w->disasm, row);
     }
+    {   /* the list always starts at the PC: a stop shows it, not wherever the reader had scrolled */
+        GtkWidget *sw = gtk_widget_get_ancestor(GTK_WIDGET(w->disasm), GTK_TYPE_SCROLLED_WINDOW);
+        if (sw)
+            gtk_adjustment_set_value(gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(sw)), 0);
+    }
 }
 
 static void refresh_mem(DbgWin *w)

@@ -1278,7 +1278,13 @@ void DebuggerWindow::refreshBasic(bool paused)
     m_basGuard = false;
 
     const int line = pf == m_basFile ? pl : 0;
-    if (line != m_basPcLine) {
+    /* Every new stop brings the current line into view, even when it is the
+     * same line as last time and the reader has scrolled away. */
+    const uint64_t ser = intvdebug_stop_serial(m_dbg);
+    const bool newStop = paused && ser != m_basSerial;
+    if (paused)
+        m_basSerial = ser;
+    if (line != m_basPcLine || (newStop && line)) {
         m_basPcLine = line;
         basicScrollToPc();
     }
@@ -1605,6 +1611,7 @@ void DebuggerWindow::refreshDisasm()
         pcBar(sels, m_disasm, m_disasmBar, bar);
     }
     m_disasm->setExtraSelections(sels);
+    m_disasm->verticalScrollBar()->setValue(0);   /* it always starts at the PC */
 }
 
 void DebuggerWindow::refreshRegs()

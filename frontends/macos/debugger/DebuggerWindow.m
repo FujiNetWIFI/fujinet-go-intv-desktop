@@ -252,6 +252,7 @@ static int tabFromEnv(void)
     int _basFile;       /* index into the map; -1 = nothing shown */
     unsigned _basGen;   /* intvsrcmap_generation() the view was built from */
     int _basPcLine;     /* the machine's line in the file shown, 0 = none */
+    uint64_t _basSerial; /* the stop the view last followed */
 
     NSButton *_runBtn;
     NSTextField *_status;
@@ -1268,7 +1269,12 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     setAttrText(_basView, text);
 
     const int line = pf == _basFile ? pl : 0;
-    if (line != _basPcLine) {
+    /* every new stop brings the current line into view, even the same line as last time */
+    const uint64_t ser = intvdebug_stop_serial(_dbg);
+    const BOOL newStop = paused && ser != _basSerial;
+    if (paused)
+        _basSerial = ser;
+    if (line != _basPcLine || (newStop && line)) {
         _basPcLine = line;
         if (pcRange.location != NSNotFound)
             [_basView scrollRangeToVisible:pcRange];
@@ -2049,6 +2055,7 @@ static PickTextView *makePickView(NSScrollView **scrollOut)
                    intvdebug_breakpoint_state(_dbg, lines[i].addr));
     }
     setAttrText(_disasm, text);
+    [_disasm scrollRangeToVisible:NSMakeRange(0, 0)];   /* it always starts at the PC */
 }
 
 - (void)refreshRegs

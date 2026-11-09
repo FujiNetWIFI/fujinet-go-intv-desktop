@@ -122,6 +122,7 @@ private:
     int m_basFile = -1;       /* index into the map; -1 = nothing shown */
     unsigned m_basGen = 0;    /* intvsrcmap_generation() the view was built from */
     int m_basBar = -1;        /* the block wearing the current-line bar */
+    uint64_t m_basSerial = 0; /* the stop the view last followed */
     int m_basPcLine = 0;      /* the machine's line in the file shown, 0 = none */
     bool m_basGuard = false;  /* we are moving the cursor, not the user */
 

@@ -1,10 +1,14 @@
 /*
- * Debugger window (Win32): disassembly with click-to-toggle breakpoints,
- * read-only registers, a memory view, and an STIC tab (BACKTAB, all 8
- * MOBs, GRAM/GROM card sheet with pager, palette, decoded state) -- the
- * same content as the GNOME/KDE debugger windows, built from plain common
- * controls (a tab control, EDIT/STATIC/BUTTON children, and a small custom
- * window class for the RGBA pictures).
+ * Debugger window (Win32), thirteen tabs: Console (the engine's prompt),
+ * Disassembly with click-to-toggle breakpoints, BASIC (IntyBASIC source
+ * stepping), Memory (16-bit words, 8-bit where the bus is, with a Poke bar),
+ * Breakpoints (expression conditions), Watches, Cart & I/O, Trace, History,
+ * Video (the shared controller in core/include/intvvidtab.h, drawn by
+ * dbg_video.c; the old STIC panes are its Decoded sources), Sound, Symbols
+ * and FujiNet. An editable register strip sits under every tab (Enter
+ * applies, only while stopped). Built from plain common controls (a tab
+ * control, EDIT/STATIC/BUTTON children, and small custom window classes for
+ * the line view and the pictures).
  *
  * A FujiNet tab, last, shows every FujiBus packet between the machine and
  * FujiNet (intvdebug_fujinet_trace, always on) beside the mailbox's state;
@@ -12,30 +16,25 @@
  * the one view that changes while the machine runs. Its text arrives as
  * UTF-8 and is shown as ASCII, like everything else in this ANSI window.
  *
- * Refreshing is a WM_TIMER poll (100ms), not a callback: intvdebug.h has
- * no stop-callback mechanism at all (unlike the CoCo/MSX ports' own
- * cocodebug/msxdebug, which fire one on the emulator thread and marshal it
- * with PostMessage) -- the engine stops the machine synchronously inside
- * cp1600_instr_tick on the emulator thread, and this window watches
- * intvdebug_stop_serial()/intvdebug_is_paused() on its own timer instead,
- * same reasoning the GNOME/KDE ports' own debugger windows document.
+ * Refreshing is a WM_TIMER poll (100ms), not a callback: the engine stops
+ * the machine synchronously inside cp1600_instr_tick on the emulator thread,
+ * and this window watches intvdebug_stop_snapshot() on its own timer instead
+ * (the serial, the paused flag and the stop's text are read in one critical
+ * section, so a stop is never seen with the old reason).
  *
- * All intvstic_render_* outputs are RGBA8888 (red byte first); GDI's
- * 32bpp BI_RGB DIB format wants BGRX (blue byte first) in memory, so each
- * is converted with rgba_to_bgrx before StretchDIBits, unlike the CoCo/MSX
- * Windows debuggers' own VDP pictures, which already arrive pre-converted
- * from their own core.
+ * The symbol table (core/debugger/symbols.h) is not owned by intvdebug, so
+ * this window uses the process-wide intvsymtab_shared(): a cart arrives
+ * through FujiNet CONFIG with no path a .sym could ever be derived from, so a
+ * user loading one by hand is the only way symbols get here at all, and that
+ * work should survive closing this window. It ships pre-seeded with EXEC
+ * ROM/RAM and cart-header symbols (see symbols.c); "Load Symbols..." loads a
+ * per-game as1600 .sym file on top.
  *
- * The symbol table (core/debugger/symbols.h) is not owned by intvdebug --
- * unlike msxdebug's own -- so this window uses the process-wide
- * intvsymtab_shared() instead of its own instance: a cart arrives through
- * FujiNet CONFIG with no path a .sym could ever be derived from, so a user
- * loading one by hand is the only way symbols get here at all, and that
- * work should survive closing this window, not be thrown away with it. It
- * ships pre-seeded with EXEC ROM/RAM and cart-header symbols (see
- * symbols.c); "Load Symbols..." loads a per-game as1600 .sym file on top,
- * matching the GNOME/KDE ports' own UI. No register/memory editing
- * either: intvdebug has no register-write call.
+ * Environment hooks, for captures and tests: INTV_DEBUGGER_TAB (a number, or
+ * the start of a tab's name; "cpu" and "stic" still work), INTV_WATCH,
+ * INTV_WATCH_BREAK, INTV_MEM_GOTO, INTV_HISTORY, INTV_POPOUT (a tab, as for
+ * INTV_DEBUGGER_TAB), INTV_BASIC_IMPORT / INTV_BASIC_BREAK, and the Video
+ * tab's INTV_DEBUGGER_VIDEO_* (read by intvvid_tab_new).
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -50,8 +49,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "dbg_video.h"
 #include "intvdebug.h"
-#include "intvstic.h"
 #include "../accent_button.h"
 #include "../help/help_window.h"
 #include "memtools.h"
@@ -61,25 +60,32 @@
 #define DISASM_LINES 32
 #define MEM_WORDS_PER_ROW 8
 #define MEM_ROWS 16
-#define CARD_ROWS_PER_PAGE 8 /* 128 cards/page at CARDS_PER_ROW=16 */
 
 #define WM_DBG_ACCEPT (WM_APP + 1) /* wp: control id -- Enter in an edit */
 #define WM_DBG_LINE (WM_APP + 2)   /* wp: control id, lp: the clicked line's value */
+#define WM_DBG_TAB (WM_APP + 3)    /* Tab in the console: complete */
+#define WM_DBG_HISTORY (WM_APP + 4) /* wp: 0 Up (older), 1 Down (newer) in the console */
 
 #define TIMER_REFRESH 1
 
-#define PAGE_CPU 0
-#define PAGE_BASIC 1
-#define PAGE_MEMORY 2
-#define PAGE_BREAKS 3
-#define PAGE_WATCHES 4
-#define PAGE_CART 5
-#define PAGE_TRACE 6
-#define PAGE_HISTORY 7
-#define PAGE_STIC 8
-#define PAGE_SYMBOLS 9
-#define PAGE_FUJINET 10
-#define PAGE_COUNT 11
+#define PAGE_CONSOLE 0
+#define PAGE_CPU 1   /* Disassembly */
+#define PAGE_BASIC 2
+#define PAGE_MEMORY 3
+#define PAGE_BREAKS 4
+#define PAGE_WATCHES 5
+#define PAGE_CART 6  /* Cart & I/O */
+#define PAGE_TRACE 7
+#define PAGE_HISTORY 8
+#define PAGE_VIDEO 9
+#define PAGE_SOUND 10
+#define PAGE_SYMBOLS 11
+#define PAGE_FUJINET 12
+#define PAGE_COUNT 13
+
+#define CONSOLE_KEEP 60000   /* characters of transcript kept */
+#define HISTORY_MAX 64       /* commands recalled with Up/Down */
+#define CART_TICKS 5         /* the Cart & I/O tab, every 500ms while it shows and the machine runs */
 
 #define FUJI_TICKS 5 /* the FujiNet tab, every 500ms while it shows */
 
@@ -87,29 +93,25 @@ enum {
     IDC_PAUSE = 1000, IDC_STEP, IDC_STEP_OVER, IDC_STEP_OUT, IDC_CLEAR_BP,
     IDC_LOAD_SYMS, IDC_CLEAR_SYMS, IDC_HELP_BTN,
     IDC_BAS_FILE, IDC_BAS_FOLDER, IDC_BAS_MAP, IDC_BAS_FILES, IDC_BAS_VIEW,
-    IDC_BP_TYPE, IDC_BP_ADDR, IDC_BP_COND, IDC_BP_VALUE, IDC_BP_ADD, IDC_BP_LIST,
+    IDC_BP_TYPE, IDC_BP_ADDR, IDC_BP_COND, IDC_BP_ADD, IDC_BP_LIST,
     IDC_BP_TOGGLE, IDC_BP_REMOVE, IDC_BP_HITS, IDC_BP_CLEAR, IDC_BP_STOP,
     IDC_WT_ENTRY, IDC_WT_ADD, IDC_WT_LIST, IDC_WT_MEM, IDC_WT_BRK, IDC_WT_REMOVE,
     IDC_SRCH_KIND, IDC_SRCH_ENTRY, IDC_SRCH_NEXT, IDC_SRCH_PREV, IDC_SRCH_NOTE,
-    IDC_CART_TEXT, IDC_POPOUT, IDC_DOCK,
+    IDC_CART_TEXT, IDC_IO_TEXT, IDC_SOUND_TEXT, IDC_POPOUT, IDC_DOCK,
+    IDC_CON_OUT, IDC_CON_PROMPT, IDC_CON_IN,
+    IDC_POKE_ADDR, IDC_POKE_VALUE, IDC_POKE_BTN,
+    IDC_FLAG_S, IDC_FLAG_Z, IDC_FLAG_O, IDC_FLAG_C, IDC_FLAG_I,
     IDC_H_REC0, IDC_H_REC1, IDC_H_FILTER0, IDC_H_FILTER1, IDC_H_RANGE0, IDC_H_RANGE1,
     IDC_H_CLEAR0, IDC_H_CLEAR1, IDC_H_NOTE0, IDC_H_NOTE1, IDC_H_TEXT0, IDC_H_TEXT1,
     IDC_STATUS, IDC_TABS,
     IDC_DISASM, IDC_FLAGS,
     IDC_MEM_ADDR, IDC_MEM_VIEW,
     IDC_BREAK_ADDR,
-    IDC_BACKTAB, IDC_MOB0, IDC_MOB_LAST = IDC_MOB0 + 7, IDC_MOB_INFO,
-    IDC_CARDS, IDC_CARDS_PREV, IDC_CARDS_NEXT, IDC_PALETTE, IDC_STIC_STATE,
     IDC_SYM_FILTER, IDC_SYM_LIST, IDC_SYM_COUNT,
     IDC_REG0, IDC_REG_LAST = IDC_REG0 + 7,
     IDC_FUJI_CLEAR, IDC_FUJI_TEXT, IDC_FUJI_STATE,
     IDC_LABEL_FIRST
 };
-
-typedef struct {
-    const uint8_t *bgrx; /* owned by the debugger struct */
-    int w, h;
-} pixel_view;
 
 typedef struct {
     HWND hwnd;
@@ -118,9 +120,16 @@ typedef struct {
     HWND load_syms_btn, clear_syms_btn, help_btn;
     HWND status;
 
+    /* Console page */
+    HWND con_out, con_prompt, con_in;
+    char history[HISTORY_MAX][256];
+    int nhistory, history_pos;
+    uint64_t con_serial;   /* the stop the console last reported */
+
     HWND disasm;
-    HWND reg_label[8], reg_edit[8], flags;
+    HWND reg_label[8], reg_edit[8], flag_chk[5], flags;
     HWND mem_label, mem_addr, mem_view;
+    HWND poke_label, poke_addr, poke_value, poke_btn;
     HWND break_label, break_addr;
     uint16_t mem_base;
 
@@ -133,13 +142,15 @@ typedef struct {
     HWND srch_label, srch_kind, srch_entry, srch_next, srch_prev, srch_note;
 
     /* Breakpoints and Watches pages */
-    HWND bp_type, bp_addr, bp_cond, bp_value, bp_add, bp_list;
+    HWND bp_type, bp_addr, bp_cond, bp_add, bp_list;
     HWND bp_toggle, bp_remove, bp_hits, bp_clear, bp_stop;
     unsigned bp_gen;
     HWND wt_label, wt_entry, wt_add, wt_list, wt_mem, wt_brk, wt_remove;
 
     /* Cart page; Trace (0, live) and History (1, when stopped) share one ring */
-    HWND cart_text;
+    HWND cart_text, io_text, sound_text;
+    HWND video;
+    int cart_ticks;
     HWND h_rec[2], h_filter[2], h_range[2], h_clear[2], h_note[2], h_text[2];
     uint64_t h_seen[2];
     int h_ticks;
@@ -157,12 +168,6 @@ typedef struct {
     int bas_pc_line;    /* the machine's line in the file shown, 0 = none */
     uint64_t bas_serial; /* the stop the view last followed */
 
-    HWND backtab_label, backtab_view;
-    HWND mob_label, mob_view[INTVSTIC_MOB_COUNT], mob_info;
-    HWND cards_label, cards_view, cards_prev, cards_next, cards_range;
-    HWND pal_label, pal_view;
-    HWND state_label, stic_state;
-
     HWND sym_filter_label, sym_filter, sym_list, sym_count;
     unsigned sym_seen_gen;
     char sym_filter_text[64];
@@ -172,14 +177,6 @@ typedef struct {
     uint64_t fuji_last;
     int fuji_count;
     int fuji_ticks;
-
-    pixel_view backtab_pv, mob_pv[INTVSTIC_MOB_COUNT], cards_pv, pal_pv;
-    uint8_t backtab_bgrx[INTVSTIC_BACKTAB_W * INTVSTIC_BACKTAB_H * 4];
-    uint8_t mob_bgrx[INTVSTIC_MOB_COUNT][16 * 16 * 4];
-    uint8_t cards_bgrx[INTVSTIC_CARDS_PER_ROW * 8 * CARD_ROWS_PER_PAGE * 8 * 4];
-    uint8_t pal_bgrx[INTVSTIC_PAL_CELL * 16 * INTVSTIC_PAL_CELL * 4];
-    int card_first;
-    int card_total;
 
     intvsession *session;
     intvdebug *dbg;
@@ -195,87 +192,75 @@ typedef struct {
 static debugger *g_dbg;
 static const char *const kRegNames[8] = {"R0", "R1", "R2", "R3",
                                          "R4", "R5", "R6(SP)", "R7(PC)"};
+static const char *const kFlagNames[5] = {"S", "Z", "O", "C", "I"};
+static const int kFlagIds[5] = {INTVDEBUG_REG_S, INTVDEBUG_REG_Z, INTVDEBUG_REG_O, INTVDEBUG_REG_C, INTVDEBUG_REG_I};
 
-/* The tabs, in PAGE_* order; INTV_DEBUGGER_TAB picks one by number or by the
- * start of its name (any case), for tests and captures. */
-static const char *const k_tab_names[] = {"CPU", "BASIC", "Memory", "Breakpoints",
-                                          "Watches", "Cart", "Trace", "History", "STIC", "Symbols", "FujiNet"};
-#define TAB_COUNT ((int)(sizeof(k_tab_names) / sizeof(k_tab_names[0])))
+/* The tabs, in PAGE_* order: the label on the tab, and the name INTV_DEBUGGER_TAB
+ * and INTV_POPOUT take (any case, or the start of it, or the start of a word
+ * of the label). The older names still work: "cpu" is Disassembly and "stic"
+ * is Video. */
+static const struct {
+    const char *name, *label;
+} k_tabs[] = {
+    {"console", "Console"}, {"disassembly", "Disassembly"}, {"basic", "BASIC"}, {"memory", "Memory"},
+    {"breakpoints", "Breakpoints"}, {"watches", "Watches"}, {"cart", "Cart & I/O"}, {"trace", "Trace"},
+    {"history", "History"}, {"video", "Video"}, {"sound", "Sound"}, {"symbols", "Symbols"}, {"fujinet", "FujiNet"},
+};
+#define TAB_COUNT ((int)(sizeof(k_tabs) / sizeof(k_tabs[0])))
+
+/* A tab control reads '&' as a mnemonic, so the label's own is doubled. */
+static const char *tab_text(int page, char *buf, size_t cap)
+{
+    const char *in = k_tabs[page].label;
+    size_t o = 0;
+    for (; *in && o + 3 < cap; in++) {
+        buf[o++] = *in;
+        if (*in == '&')
+            buf[o++] = '&';
+    }
+    buf[o] = '\0';
+    return buf;
+}
 
 static int tab_from_env_var(const char *var)
 {
     const char *tab = getenv(var);
     char *end;
     long n;
-    int i;
+    size_t len;
+    int i, pass;
 
     if (!tab || !*tab)
         return -1;
+    if (_stricmp(tab, "cpu") == 0)
+        return PAGE_CPU;
+    if (_stricmp(tab, "stic") == 0)
+        return PAGE_VIDEO;
+    if (_stricmp(tab, "io") == 0 || _stricmp(tab, "i/o") == 0)
+        return PAGE_CART;
     n = strtol(tab, &end, 10);
     if (end != tab && *end == '\0')
         return n >= 0 && n < TAB_COUNT ? (int)n : -1;
-    for (i = 0; i < TAB_COUNT; i++)
-        if (_strnicmp(tab, k_tab_names[i], strlen(tab)) == 0)
-            return i;
+    len = strlen(tab);
+    for (pass = 0; pass < 3; pass++)
+        for (i = 0; i < TAB_COUNT; i++) {
+            if (pass == 0 && _strnicmp(tab, k_tabs[i].name, len) == 0)
+                return i;
+            if (pass == 1 && _strnicmp(tab, k_tabs[i].label, len) == 0)
+                return i;
+            if (pass == 2) {
+                const char *word = k_tabs[i].label;
+                while ((word = strchr(word, ' ')) != NULL)
+                    if (_strnicmp(tab, ++word, len) == 0)
+                        return i;
+            }
+        }
     return -1;
 }
 
 static int tab_from_env(void)
 {
     return tab_from_env_var("INTV_DEBUGGER_TAB");
-}
-
-/* RGBA8888 (red first) -> BGRX (blue first), the byte order GDI's 32bpp
- * BI_RGB DIB format expects in memory. Alpha is dropped -- every
- * intvstic_render_* output is either fully opaque or, for MOBs, uses alpha
- * for transparency that this debugger view does not attempt to composite
- * (it always draws over its own black background instead). */
-static void rgba_to_bgrx(const uint8_t *rgba, uint8_t *bgrx, int w, int h)
-{
-    int i, n = w * h;
-    for (i = 0; i < n; i++) {
-        bgrx[i * 4 + 0] = rgba[i * 4 + 2];
-        bgrx[i * 4 + 1] = rgba[i * 4 + 1];
-        bgrx[i * 4 + 2] = rgba[i * 4 + 0];
-        bgrx[i * 4 + 3] = 0;
-    }
-}
-
-/* ---- pixel view (STIC images) --------------------------------------------- */
-
-static LRESULT CALLBACK pixels_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-{
-    pixel_view *pv = (pixel_view *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
-
-    switch (msg) {
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hwnd, &ps);
-        RECT c;
-        BITMAPINFO bmi;
-
-        GetClientRect(hwnd, &c);
-        if (pv && pv->bgrx) {
-            memset(&bmi, 0, sizeof(bmi));
-            bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
-            bmi.bmiHeader.biWidth = pv->w;
-            bmi.bmiHeader.biHeight = -pv->h; /* top-down */
-            bmi.bmiHeader.biPlanes = 1;
-            bmi.bmiHeader.biBitCount = 32;
-            bmi.bmiHeader.biCompression = BI_RGB;
-            SetStretchBltMode(hdc, COLORONCOLOR);
-            StretchDIBits(hdc, 0, 0, c.right, c.bottom, 0, 0, pv->w, pv->h,
-                         pv->bgrx, &bmi, DIB_RGB_COLORS, SRCCOPY);
-        } else {
-            FillRect(hdc, &c, (HBRUSH)GetStockObject(BLACK_BRUSH));
-        }
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-    case WM_ERASEBKGND:
-        return 1;
-    }
-    return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
 /* ---- edit/disasm subclassing ----------------------------------------------- */
@@ -293,6 +278,23 @@ static LRESULT CALLBACK edit_subclass(HWND hwnd, UINT msg, WPARAM wp,
     }
     if (msg == WM_CHAR && wp == VK_RETURN)
         return 0;
+    if (GetWindowLongPtrA(hwnd, GWLP_ID) == IDC_CON_IN) { /* the console: Tab completes, Up/Down recall */
+        HWND main = g_dbg ? g_dbg->hwnd : NULL;
+        if (!main)
+            return CallWindowProcA(g_edit_proc, hwnd, msg, wp, lp);
+        if (msg == WM_KEYDOWN && wp == VK_TAB) {
+            PostMessageA(main, WM_DBG_TAB, 0, 0);
+            return 0;
+        }
+        if (msg == WM_KEYDOWN && (wp == VK_UP || wp == VK_DOWN)) {
+            PostMessageA(main, WM_DBG_HISTORY, wp == VK_DOWN, 0);
+            return 0;
+        }
+        if (msg == WM_CHAR && wp == VK_TAB)
+            return 0;
+        if (msg == WM_GETDLGCODE)
+            return DLGC_WANTALLKEYS;
+    }
     return CallWindowProcA(g_edit_proc, hwnd, msg, wp, lp);
 }
 
@@ -522,7 +524,7 @@ static LRESULT CALLBACK lines_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             r.left = 0; r.top = y; r.right = c.right; r.bottom = y + rh;
             if (lv->flags[i] & LV_PC) {
                 FillRect(hdc, &r, bar);
-                SetTextColor(hdc, RGB(255, 255, 255));
+                SetTextColor(hdc, INTV_ACCENT_INK_COLORREF);
             } else {
                 SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
             }
@@ -581,8 +583,13 @@ static LRESULT CALLBACK sym_list_subclass(HWND hwnd, UINT msg, WPARAM wp,
             buf[n] = '\0';
             if (sscanf(buf, "%4X", &addr) == 1 && addr <= 0xFFFF) {
                 g_dbg->mem_base = (uint16_t)addr;
+                {
+                    char shown[8];
+                    snprintf(shown, sizeof(shown), "%04X", addr);
+                    SetWindowTextA(g_dbg->mem_addr, shown);   /* the address box follows */
+                }
                 g_dbg->seen_serial = 0;
-                goto_page(g_dbg, PAGE_CPU);
+                goto_page(g_dbg, PAGE_MEMORY);
                 if (intvdebug_is_paused(g_dbg->dbg))
                     refresh_mem(g_dbg);
             }
@@ -627,17 +634,6 @@ static HWND label(debugger *d, const char *text)
                 IDC_LABEL_FIRST + next_id++);
 }
 
-static HWND pixels(debugger *d, int id, pixel_view *pv, const uint8_t *bgrx,
-                   int w, int h)
-{
-    HWND view = child(d, "IntvDbgPixels", "", WS_VISIBLE, id);
-    pv->bgrx = bgrx;
-    pv->w = w;
-    pv->h = h;
-    SetWindowLongPtrA(view, GWLP_USERDATA, (LONG_PTR)pv);
-    return view;
-}
-
 static void build_controls(debugger *d)
 {
     TCITEMA item;
@@ -647,7 +643,8 @@ static void build_controls(debugger *d)
     memset(&item, 0, sizeof(item));
     item.mask = TCIF_TEXT;
     for (i = 0; i < TAB_COUNT; i++) {
-        item.pszText = (char *)k_tab_names[i];
+        char shown[64];
+        item.pszText = (char *)tab_text(i, shown, sizeof(shown));
         SendMessageA(d->tabs, TCM_INSERTITEMA, i, (LPARAM)&item);
         d->tab_page[i] = i;
     }
@@ -674,10 +671,19 @@ static void build_controls(debugger *d)
                               WS_VISIBLE | BS_PUSHBUTTON, IDC_CLEAR_SYMS);
     d->help_btn = child(d, "BUTTON", "Help", WS_VISIBLE | BS_PUSHBUTTON, IDC_HELP_BTN);
     d->popout_btn = child(d, "BUTTON", "Pop Out", WS_VISIBLE | BS_PUSHBUTTON, IDC_POPOUT);
-    d->status = child(d, "STATIC", "Running", WS_VISIBLE | SS_RIGHT,
+    d->status = child(d, "STATIC", "Running", WS_VISIBLE | SS_RIGHT | SS_ENDELLIPSIS | SS_NOPREFIX,
                      IDC_STATUS);
 
-    /* CPU page */
+    /* Console page */
+    d->new_parent = d->pg[PAGE_CONSOLE];
+    d->con_out = mono_view(d, IDC_CON_OUT);
+    SendMessageA(d->con_out, EM_SETLIMITTEXT, 0, 0);
+    SetWindowTextA(d->con_out, "Intellivision debugger console. Type 'help' for every command; Tab completes, "
+                               "Up/Down recall.\r\n");
+    d->con_prompt = label(d, ">");
+    d->con_in = field(d, IDC_CON_IN);
+
+    /* Disassembly page */
     d->new_parent = d->pg[PAGE_CPU];
     d->disasm = child(d, "IntvDbgLines", "", WS_VISIBLE | WS_BORDER | WS_VSCROLL,
                       IDC_DISASM);
@@ -685,8 +691,9 @@ static void build_controls(debugger *d)
     for (i = 0; i < 8; i++) {
         d->reg_label[i] = label(d, kRegNames[i]);
         d->reg_edit[i] = field(d, IDC_REG0 + i);
-        EnableWindow(d->reg_edit[i], FALSE); /* read-only: see file header */
     }
+    for (i = 0; i < 5; i++)   /* S Z O C I; D is only shown */
+        d->flag_chk[i] = child(d, "BUTTON", kFlagNames[i], WS_VISIBLE | BS_AUTOCHECKBOX, IDC_FLAG_S + i);
     d->flags = label(d, "");
     d->new_parent = d->pg[PAGE_MEMORY];
     d->mem_label = label(d, "Address:");
@@ -695,6 +702,12 @@ static void build_controls(debugger *d)
     d->mem_view = child(d, "EDIT", "", WS_VISIBLE | WS_BORDER | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
                                           ES_READONLY | ES_AUTOVSCROLL | ES_NOHIDESEL,
                         IDC_MEM_VIEW);
+    d->poke_label = label(d, "Poke:");
+    d->poke_addr = field(d, IDC_POKE_ADDR);
+    d->poke_value = field(d, IDC_POKE_VALUE);
+    SendMessageA(d->poke_addr, EM_SETCUEBANNER, FALSE, (LPARAM)L"address or label");
+    SendMessageA(d->poke_value, EM_SETCUEBANNER, FALSE, (LPARAM)L"value (hex or expr)");
+    d->poke_btn = child(d, "BUTTON", "Poke", WS_VISIBLE | BS_PUSHBUTTON, IDC_POKE_BTN);
     d->new_parent = d->pg[PAGE_CPU];
     d->break_label = label(d, "Break at:");
     d->break_addr = field(d, IDC_BREAK_ADDR);
@@ -740,14 +753,9 @@ static void build_controls(debugger *d)
     SendMessageA(d->bp_type, CB_ADDSTRING, 0, (LPARAM)"Access");
     SendMessageA(d->bp_type, CB_SETCURSEL, 0, 0);
     d->bp_addr = field(d, IDC_BP_ADDR);
-    d->bp_cond = child(d, "COMBOBOX", "", WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_HASSTRINGS,
-                       IDC_BP_COND);
-    SendMessageA(d->bp_cond, CB_ADDSTRING, 0, (LPARAM)"any value");
-    SendMessageA(d->bp_cond, CB_ADDSTRING, 0, (LPARAM)"changed");
-    SendMessageA(d->bp_cond, CB_ADDSTRING, 0, (LPARAM)"equals");
-    SendMessageA(d->bp_cond, CB_ADDSTRING, 0, (LPARAM)"not equal");
-    SendMessageA(d->bp_cond, CB_SETCURSEL, 0, 0);
-    d->bp_value = field(d, IDC_BP_VALUE);
+    d->bp_cond = field(d, IDC_BP_COND);
+    SendMessageA(d->bp_cond, EM_SETCUEBANNER, FALSE,
+                 (LPARAM)L"condition, e.g. value == $FF  (value, old, addr, r0-r7, [addr])");
     d->bp_add = child(d, "BUTTON", "Add", WS_VISIBLE | BS_PUSHBUTTON, IDC_BP_ADD);
     d->bp_list = child(d, "LISTBOX", "", WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
                        IDC_BP_LIST);
@@ -771,6 +779,11 @@ static void build_controls(debugger *d)
     /* Cart page */
     d->new_parent = d->pg[PAGE_CART];
     d->cart_text = mono_view(d, IDC_CART_TEXT);
+    d->io_text = mono_view(d, IDC_IO_TEXT);
+
+    /* Sound page */
+    d->new_parent = d->pg[PAGE_SOUND];
+    d->sound_text = mono_view(d, IDC_SOUND_TEXT);
 
     /* Trace (live) and History (when stopped) pages */
     for (i = 0; i < 2; i++) {
@@ -790,29 +803,10 @@ static void build_controls(debugger *d)
         d->h_seen[i] = (uint64_t)-1;
     }
 
-    /* STIC page */
-    d->new_parent = d->pg[PAGE_STIC];
-    d->backtab_label = label(d, "BACKTAB");
-    d->backtab_view = pixels(d, IDC_BACKTAB, &d->backtab_pv, d->backtab_bgrx,
-                             INTVSTIC_BACKTAB_W, INTVSTIC_BACKTAB_H);
-    d->mob_label = label(d, "MOBs");
-    for (i = 0; i < INTVSTIC_MOB_COUNT; i++)
-        d->mob_view[i] = pixels(d, IDC_MOB0 + i, &d->mob_pv[i],
-                                d->mob_bgrx[i], 16, 16);
-    d->mob_info = mono_view(d, IDC_MOB_INFO);
-    d->cards_label = label(d, "GRAM/GROM cards");
-    d->cards_view = pixels(d, IDC_CARDS, &d->cards_pv, d->cards_bgrx,
-                           INTVSTIC_CARDS_PER_ROW * 8, CARD_ROWS_PER_PAGE * 8);
-    d->cards_prev = child(d, "BUTTON", "< Prev", WS_VISIBLE | BS_PUSHBUTTON,
-                          IDC_CARDS_PREV);
-    d->cards_next = child(d, "BUTTON", "Next >", WS_VISIBLE | BS_PUSHBUTTON,
-                          IDC_CARDS_NEXT);
-    d->cards_range = label(d, "");
-    d->pal_label = label(d, "Palette");
-    d->pal_view = pixels(d, IDC_PALETTE, &d->pal_pv, d->pal_bgrx,
-                        INTVSTIC_PAL_CELL * 16, INTVSTIC_PAL_CELL);
-    d->state_label = label(d, "Registers & mode");
-    d->stic_state = mono_view(d, IDC_STIC_STATE);
+    /* Video page: the shared controller's tab, one child holding all its controls */
+    d->new_parent = NULL;
+    /* 96 dpi: the rest of this window is laid out in plain pixels with a 13 px font */
+    d->video = dbg_video_create(d->pg[PAGE_VIDEO], d->dbg, d->mono, d->mono, 96);
 
     /* Symbols page */
     d->new_parent = d->pg[PAGE_SYMBOLS];
@@ -851,9 +845,9 @@ static void build_controls(debugger *d)
 
 /* Help's contexts (intvhelp.h), one per tab */
 static const char *const k_tab_contexts[] = {
-    "debugger/cpu", "debugger/basic", "debugger/memory", "debugger/breakpoints",
-    "debugger/watches", "debugger/cart", "debugger/trace", "debugger/history", "debugger/stic",
-    "debugger/symbols", "debugger/fujinet",
+    "debugger/console", "debugger/disassembly", "debugger/basic", "debugger/memory", "debugger/breakpoints",
+    "debugger/watches", "debugger/cart", "debugger/trace", "debugger/history", "debugger/video",
+    "debugger/sound", "debugger/symbols", "debugger/fujinet",
 };
 
 /* On screen: the page the tab control shows, or one living in a window of its own. */
@@ -873,6 +867,8 @@ static void show_page(debugger *d, int page)
         ShowWindow(d->pg[p], d->popped[p] || p == page ? SW_SHOW : SW_HIDE);
     if (page == PAGE_FUJINET)
         refresh_fujinet(d, 0);
+    if (page == PAGE_VIDEO && d->video)
+        dbg_video_refresh(d->video, 1);
 }
 
 /* The tab control's index for a page, or -1 when it is in a window of its own. */
@@ -917,9 +913,10 @@ static void dock_page(debugger *d, int page)
         d->tab_page[i] = d->tab_page[i - 1];
     d->tab_page[pos] = page;
     d->ntabs++;
+    char shown[64];
     memset(&item, 0, sizeof(item));
     item.mask = TCIF_TEXT;
-    item.pszText = (char *)k_tab_names[page];
+    item.pszText = (char *)tab_text(page, shown, sizeof(shown));
     SendMessageA(d->tabs, TCM_INSERTITEMA, (WPARAM)pos, (LPARAM)&item);
     DestroyWindow(pop);
     SendMessageA(d->tabs, TCM_SETCURSEL, (WPARAM)pos, 0);
@@ -945,7 +942,7 @@ static void pop_out(debugger *d, int page)
         d->tab_page[i] = d->tab_page[i + 1];
     d->ntabs--;
 
-    snprintf(title, sizeof(title), "Intellivision Debugger - %s", k_tab_names[page]);
+    snprintf(title, sizeof(title), "Intellivision Debugger - %s", k_tabs[page].label);
     pop = CreateWindowExA(0, "IntvDbgPop", title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 820, 580,
                           d->hwnd, NULL, inst, NULL);
     SetWindowLongPtrA(pop, GWLP_USERDATA, page);
@@ -1032,7 +1029,7 @@ static void layout(debugger *d)
     MoveWindow(d->help_btn, 842, y, 70, 26, TRUE);
     MoveWindow(d->popout_btn, 916, y, 80, 26, TRUE);
     {
-        const int sx = client.right - 210 > 1004 ? client.right - 210 : 1004;
+        const int sx = 1004;
         MoveWindow(d->status, sx, y + 4, client.right - sx - 10 > 40 ? client.right - sx - 10 : 40, 20, TRUE);
     }
     y += 32;
@@ -1061,7 +1058,13 @@ static void layout(debugger *d)
         }
     }
 
-    /* CPU page: the disassembly, and a "Break at" row under it */
+    /* Console page: the transcript, and the prompt under it */
+    page = pr[PAGE_CONSOLE];
+    MoveWindow(d->con_out, page.left, page.top, page.right - page.left - 8, page.bottom - page.top - 32, TRUE);
+    MoveWindow(d->con_prompt, page.left + 2, page.bottom - 24, 14, 18, TRUE);
+    MoveWindow(d->con_in, page.left + 20, page.bottom - 26, page.right - page.left - 28, 22, TRUE);
+
+    /* Disassembly page: the disassembly, and a "Break at" row under it */
     page = pr[PAGE_CPU];
     MoveWindow(d->disasm, page.left, page.top, page.right - page.left - 8,
               page.bottom - page.top - 30, TRUE);
@@ -1079,7 +1082,11 @@ static void layout(debugger *d)
     MoveWindow(d->srch_prev, page.left + 550, page.top + 28, 110, 26, TRUE);
     MoveWindow(d->srch_note, page.left + 668, page.top + 34, 260, 18, TRUE);
     MoveWindow(d->mem_view, page.left, page.top + 60, page.right - page.left - 8,
-              page.bottom - page.top - 64, TRUE);
+              page.bottom - page.top - 64 - 30, TRUE);
+    MoveWindow(d->poke_label, page.left, page.bottom - 22, 70, 18, TRUE);
+    MoveWindow(d->poke_addr, page.left + 74, page.bottom - 26, 160, 22, TRUE);
+    MoveWindow(d->poke_value, page.left + 240, page.bottom - 26, 160, 22, TRUE);
+    MoveWindow(d->poke_btn, page.left + 406, page.bottom - 28, 70, 26, TRUE);
 
     /* Breakpoints page */
     {
@@ -1087,9 +1094,12 @@ static void layout(debugger *d)
         page = pr[PAGE_BREAKS];
         MoveWindow(d->bp_type, page.left, top, 90, 200, TRUE);
         MoveWindow(d->bp_add, R - 60, top - 2, 60, 26, TRUE);
-        MoveWindow(d->bp_value, R - 60 - 4 - 90, top, 90, 22, TRUE);
-        MoveWindow(d->bp_cond, R - 60 - 4 - 90 - 4 - 110, top, 110, 200, TRUE);
-        MoveWindow(d->bp_addr, page.left + 94, top, R - 60 - 4 - 90 - 4 - 110 - 4 - (page.left + 94), 22, TRUE);
+        {
+            const int avail = R - 60 - 4 - (page.left + 94);
+            const int aw = avail / 3 > 150 ? avail / 3 : 150;
+            MoveWindow(d->bp_addr, page.left + 94, top, aw, 22, TRUE);
+            MoveWindow(d->bp_cond, page.left + 94 + aw + 4, top, avail - aw - 4 > 60 ? avail - aw - 4 : 60, 22, TRUE);
+        }
         MoveWindow(d->bp_list, page.left, top + 30, R - page.left, page.bottom - top - 30 - 64, TRUE);
         MoveWindow(d->bp_toggle, page.left, page.bottom - 58, 130, 26, TRUE);
         MoveWindow(d->bp_remove, page.left + 134, page.bottom - 58, 80, 26, TRUE);
@@ -1119,7 +1129,9 @@ static void layout(debugger *d)
             MoveWindow(d->reg_label[i], rx, rr + 2, 58, 18, TRUE);
             MoveWindow(d->reg_edit[i], rx + 58, rr, 62, 22, TRUE);
         }
-        MoveWindow(d->flags, 8 + 4 * 128 + 12, ry + 2, 300, 40, TRUE);
+        for (i = 0; i < 5; i++)
+            MoveWindow(d->flag_chk[i], 8 + 4 * 128 + 12 + i * 46, ry + 2, 42, 20, TRUE);
+        MoveWindow(d->flags, 8 + 4 * 128 + 12, ry + 28, 520, 20, TRUE);
     }
 
     /* BASIC page */
@@ -1137,40 +1149,11 @@ static void layout(debugger *d)
                   page.bottom - by - 4, TRUE);
     }
 
-    /* STIC page */
-    {
-        int sx = 0, sy = 0;
-        page = pr[PAGE_STIC];
-        MoveWindow(d->backtab_label, sx, sy, 200, 18, TRUE);
-        MoveWindow(d->backtab_view, sx, sy + 20, INTVSTIC_BACKTAB_W * 2,
-                  INTVSTIC_BACKTAB_H * 2, TRUE);
+    /* Video page */
+    dbg_video_place(d->video, 0, 0, pr[PAGE_VIDEO].right, pr[PAGE_VIDEO].bottom);
 
-        int mx = sx + INTVSTIC_BACKTAB_W * 2 + 12;
-        MoveWindow(d->mob_label, mx, sy, 200, 18, TRUE);
-        for (i = 0; i < INTVSTIC_MOB_COUNT; i++)
-            MoveWindow(d->mob_view[i], mx + (i % 4) * 36, sy + 20 + (i / 4) * 36,
-                      32, 32, TRUE);
-        MoveWindow(d->mob_info, mx, sy + 96, 340, 130, TRUE);
-
-        int cy = sy + INTVSTIC_BACKTAB_H * 2 + 28;
-        MoveWindow(d->cards_label, sx, cy, 200, 18, TRUE);
-        MoveWindow(d->cards_view, sx, cy + 20, INTVSTIC_CARDS_PER_ROW * 8 * 2,
-                  CARD_ROWS_PER_PAGE * 8 * 2, TRUE);
-        MoveWindow(d->cards_prev, sx,
-                  cy + 24 + CARD_ROWS_PER_PAGE * 8 * 2, 70, 24, TRUE);
-        MoveWindow(d->cards_next, sx + 74,
-                  cy + 24 + CARD_ROWS_PER_PAGE * 8 * 2, 70, 24, TRUE);
-        MoveWindow(d->cards_range, sx + 150,
-                  cy + 28 + CARD_ROWS_PER_PAGE * 8 * 2, 160, 18, TRUE);
-
-        MoveWindow(d->pal_label, mx, cy, 200, 18, TRUE);
-        MoveWindow(d->pal_view, mx, cy + 20, INTVSTIC_PAL_CELL * 16,
-                  INTVSTIC_PAL_CELL, TRUE);
-
-        MoveWindow(d->state_label, sx, cy + 200, 200, 18, TRUE);
-        MoveWindow(d->stic_state, sx, cy + 220, page.right - sx - 8,
-                  page.bottom - (cy + 220) - 4, TRUE);
-    }
+    /* Sound page */
+    MoveWindow(d->sound_text, 0, 0, pr[PAGE_SOUND].right - 8, pr[PAGE_SOUND].bottom - 4, TRUE);
 
     /* Symbols page */
     {
@@ -1205,7 +1188,11 @@ static void layout(debugger *d)
     }
 
     /* Cart page */
-    MoveWindow(d->cart_text, 0, 0, pr[PAGE_CART].right - 8, pr[PAGE_CART].bottom - 4, TRUE);
+    {
+        const int half = (pr[PAGE_CART].right - 8) * 2 / 5;
+        MoveWindow(d->cart_text, 0, 0, half, pr[PAGE_CART].bottom - 4, TRUE);
+        MoveWindow(d->io_text, half + 6, 0, pr[PAGE_CART].right - 8 - half - 6, pr[PAGE_CART].bottom - 4, TRUE);
+    }
 
     /* Trace and History pages */
     for (i = 0; i < 2; i++) {
@@ -1249,25 +1236,32 @@ static void refresh_disasm(debugger *d)
     lv_end(d->disasm, -1);
 }
 
+/* The register boxes and flag checkboxes: the machine's values while it is
+ * stopped, empty while it runs. */
 static void refresh_regs(debugger *d)
 {
     intvdebug_regs r;
-    char buf[16];
-    char flagbuf[48];
+    char buf[160];
+    int flag[5];
     int i;
 
     if (!intvdebug_regs_get(d->dbg, &r)) {
         for (i = 0; i < 8; i++) SetWindowTextA(d->reg_edit[i], "");
+        for (i = 0; i < 5; i++) SendMessageA(d->flag_chk[i], BM_SETCHECK, BST_UNCHECKED, 0);
         SetWindowTextA(d->flags, "");
         return;
     }
+    flag[0] = r.S; flag[1] = r.Z; flag[2] = r.O; flag[3] = r.C; flag[4] = r.I;
     for (i = 0; i < 8; i++) {
         snprintf(buf, sizeof(buf), "%04X", r.r[i]);
         SetWindowTextA(d->reg_edit[i], buf);
     }
-    snprintf(flagbuf, sizeof(flagbuf), "S%d C%d O%d Z%d I%d D%d", r.S, r.C,
-             r.O, r.Z, r.I, r.D);
-    SetWindowTextA(d->flags, flagbuf);
+    for (i = 0; i < 5; i++)
+        SendMessageA(d->flag_chk[i], BM_SETCHECK, flag[i] ? BST_CHECKED : BST_UNCHECKED, 0);
+    snprintf(buf, sizeof(buf), "D %d%s  %s  INTRQ %d  BUSRQ %d  frame %u  cycle %llu", r.D ? 1 : 0,
+             r.D ? " (SDBD pending)" : "", r.interruptible ? "interruptible" : "not interruptible", r.intrq,
+             r.busrq, (unsigned)r.frame, (unsigned long long)r.cycles);
+    SetWindowTextA(d->flags, buf);
 }
 
 static void refresh_mem(debugger *d)
@@ -1288,15 +1282,17 @@ static void refresh_mem(debugger *d)
             for (col = 0; col < MEM_WORDS_PER_ROW; col++) {
                 int idx = row * MEM_WORDS_PER_ROW + col;
                 const uint16_t a = (uint16_t)(row_addr + col);
+                /* a word is 4 hex digits, 2 in the 8-bit areas (scratchpad, GROM/GRAM, ECS RAM) */
+                const int narrow = intvdebug_word_width(d->dbg, a) == 8;
                 if (idx >= n)
                     continue;
                 if (d->mem_hl && a >= d->mem_hl_lo && a <= d->mem_hl_hi) {
                     if (sel_start < 0)
-                        sel_start = len + 1;   /* the word, after its space */
+                        sel_start = len + (narrow ? 3 : 1);   /* the digits, after the padding */
                     sel_end = len + 5;
                 }
                 len += snprintf(text + len, sizeof(text) - (size_t)len,
-                               " %04X", words[idx]);
+                               narrow ? "   %02X" : " %04X", narrow ? words[idx] & 0xFF : words[idx]);
             }
             /* Only label the first row of a run in the same region -- see
              * symbols.c's k_regions and the GNOME frontend's own
@@ -1321,86 +1317,13 @@ static void show_in_memory(debugger *d, uint16_t lo, uint16_t hi)
     d->mem_hl_lo = lo;
     d->mem_hl_hi = hi;
     d->seen_serial = 0;
+    {
+        char shown[16];
+        snprintf(shown, sizeof(shown), "%04X", lo);
+        SetWindowTextA(d->mem_addr, shown);
+    }
     if (intvdebug_is_paused(d->dbg))
         refresh_mem(d);
-}
-
-/* Shared scratch buffer for all four STIC renders below -- sized to the
- * largest of them (the palette sheet, INTVSTIC_PAL_CELL*16 wide by
- * INTVSTIC_PAL_CELL tall), not just the cards sheet. A buffer sized only
- * for the cards sheet caused intvstic_render_backtab/_palette to overrun it
- * by tens of KB into adjacent .bss, corrupting g_dbg itself -- caught via a
- * real Wine crash (a garbage read at intv_debugger_pretranslate, traced
- * back to pixel data bleeding into g_dbg's storage). */
-#define STIC_SCRATCH_BYTES_A (INTVSTIC_BACKTAB_W * INTVSTIC_BACKTAB_H * 4)
-#define STIC_SCRATCH_BYTES_B \
-    (INTVSTIC_CARDS_PER_ROW * 8 * CARD_ROWS_PER_PAGE * 8 * 4)
-#define STIC_SCRATCH_BYTES_C (INTVSTIC_PAL_CELL * 16 * INTVSTIC_PAL_CELL * 4)
-#define STIC_SCRATCH_BYTES \
-    (STIC_SCRATCH_BYTES_A > STIC_SCRATCH_BYTES_B \
-         ? (STIC_SCRATCH_BYTES_A > STIC_SCRATCH_BYTES_C ? STIC_SCRATCH_BYTES_A \
-                                                        : STIC_SCRATCH_BYTES_C) \
-         : (STIC_SCRATCH_BYTES_B > STIC_SCRATCH_BYTES_C ? STIC_SCRATCH_BYTES_B \
-                                                        : STIC_SCRATCH_BYTES_C))
-
-static void refresh_stic(debugger *d)
-{
-    static intvstic_snapshot snap;
-    static uint8_t rgba_scratch[STIC_SCRATCH_BYTES];
-    char text[2048];
-    char mobtext[2048];
-    int len = 0, i, total;
-
-    intvstic_snapshot_get(d->dbg, &snap);
-
-    intvstic_render_backtab(&snap, rgba_scratch);
-    rgba_to_bgrx(rgba_scratch, d->backtab_bgrx, INTVSTIC_BACKTAB_W,
-                INTVSTIC_BACKTAB_H);
-    InvalidateRect(d->backtab_view, NULL, FALSE);
-
-    len = snprintf(mobtext, sizeof(mobtext),
-                  "## X   Y  CARD CLR SZx SZy VIS PRI GRAM COLL\r\n");
-    for (i = 0; i < INTVSTIC_MOB_COUNT; i++) {
-        intvstic_mob mob;
-        intvstic_mob_get(&snap, i, &mob);
-        intvstic_render_mob(&snap, i, rgba_scratch);
-        rgba_to_bgrx(rgba_scratch, d->mob_bgrx[i], 16, 16);
-        InvalidateRect(d->mob_view[i], NULL, FALSE);
-        len += snprintf(mobtext + len, sizeof(mobtext) - (size_t)len,
-                       "%d  %3d %3d  %3d  %2d  %dx  %dx  %d   %d   %d    "
-                       "%03X\r\n",
-                       i, mob.x, mob.y, mob.card, mob.color, mob.x_size,
-                       mob.y_stretch, mob.visible, mob.priority, mob.gram,
-                       mob.collision);
-    }
-    SetWindowTextA(d->mob_info, mobtext);
-
-    total = intvstic_card_count(&snap);
-    d->card_total = total;
-    if (d->card_first >= total)
-        d->card_first = 0;
-    intvstic_render_cards(&snap, d->card_first, CARD_ROWS_PER_PAGE,
-                          rgba_scratch);
-    rgba_to_bgrx(rgba_scratch, d->cards_bgrx, INTVSTIC_CARDS_PER_ROW * 8,
-                CARD_ROWS_PER_PAGE * 8);
-    InvalidateRect(d->cards_view, NULL, FALSE);
-    {
-        int page = INTVSTIC_CARDS_PER_ROW * CARD_ROWS_PER_PAGE;
-        int last_shown =
-            (d->card_first + page < total ? d->card_first + page : total) - 1;
-        char range_text[64];
-        snprintf(range_text, sizeof(range_text), "cards %d-%d of %d",
-                d->card_first, last_shown, total);
-        SetWindowTextA(d->cards_range, range_text);
-    }
-
-    intvstic_render_palette(d->dbg, rgba_scratch);
-    rgba_to_bgrx(rgba_scratch, d->pal_bgrx, INTVSTIC_PAL_CELL * 16,
-                INTVSTIC_PAL_CELL);
-    InvalidateRect(d->pal_view, NULL, FALSE);
-
-    intvstic_format_state(&snap, text, (int)sizeof(text));
-    SetWindowTextA(d->stic_state, text);
 }
 
 /* Case-insensitive substring test -- MinGW does not reliably provide
@@ -1516,6 +1439,9 @@ static void ascii_view_text(const char *in, char *out, size_t cap)
             memcpy(out + o, "...", 3);
             o += 3;
             in += 3;
+        } else if (strncmp(in, "\xe2\x80\x94", 3) == 0 || strncmp(in, "\xe2\x80\x93", 3) == 0) {
+            out[o++] = '-';
+            in += 3;
         } else if (strncmp(in, "\xc3\x97", 2) == 0) {
             out[o++] = 'x';
             in += 2;
@@ -1523,6 +1449,13 @@ static void ascii_view_text(const char *in, char *out, size_t cap)
             out[o++] = '\r';
             out[o++] = '\n';
             in++;
+        } else if (c == '\r') {
+            in++;
+        } else if (c >= 0x80) {   /* anything else outside ASCII: one '?' */
+            out[o++] = '?';
+            do
+                in++;
+            while (((unsigned char)*in & 0xC0) == 0x80);
         } else {
             out[o++] = c >= 0x20 && c < 0x7F ? (char)c : '?';
             in++;
@@ -1800,31 +1733,282 @@ static void do_step(debugger *d, int how)
 
 /* ---- Breakpoints, Watches, memory search ------------------------------------ */
 
-/* One line on why the machine stopped. */
-static void stop_text(const intvdebug_stop_info *st, char *dst, size_t n)
+static void say(debugger *d, const char *msg)
 {
-    switch (st->reason) {
-    case INTVDEBUG_STOP_WATCH_WRITE:
-        snprintf(dst, n, "wrote $%04X = $%02X (was $%02X), now at $%04X", st->addr,
-                 st->value & 0xFF, st->old_value & 0xFF, st->pc);
-        break;
-    case INTVDEBUG_STOP_WATCH_READ:
-        snprintf(dst, n, "read $%04X, now at $%04X", st->addr, st->pc);
-        break;
-    case INTVDEBUG_STOP_BREAKPOINT:
-        snprintf(dst, n, "breakpoint at $%04X", st->pc);
-        break;
-    default:
-        dst[0] = '\0';
+    SetWindowTextA(d->status, msg);
+}
+
+static void edit_text(HWND h, char *dst, int n)
+{
+    GetWindowTextA(h, dst, n);
+    dst[n - 1] = '\0';
+}
+
+static char *strip_text(char *text)
+{
+    size_t n;
+    while (*text == ' ' || *text == '\t')
+        text++;
+    n = strlen(text);
+    while (n > 0 && (text[n - 1] == ' ' || text[n - 1] == '\t' || text[n - 1] == '\r' || text[n - 1] == '\n'))
+        text[--n] = '\0';
+    return text;
+}
+
+/* A value typed into a register or poke box: bare hex ("1F"), or anything the
+ * engine's expression parser takes ($1F, 31, r0 + 2, [$0200], a label). */
+static int parse_value(debugger *d, const char *text, long *out, char *err, int errsz)
+{
+    char buf[128], *p;
+    size_t n;
+    int hex = 1;
+
+    snprintf(buf, sizeof(buf), "%s", text);
+    p = strip_text(buf);
+    if (!*p) {
+        snprintf(err, (size_t)errsz, "Type a value");
+        return 0;
+    }
+    for (n = 0; p[n]; n++)
+        if (!((p[n] >= '0' && p[n] <= '9') || (p[n] >= 'a' && p[n] <= 'f') || (p[n] >= 'A' && p[n] <= 'F')))
+            hex = 0;
+    if (hex && n <= 8) {
+        *out = (long)strtoul(p, NULL, 16);
+        return 1;
+    }
+    return intvdebug_eval(d->dbg, p, out, err, errsz) == 0;
+}
+
+/* ---- the Console page ----------------------------------------------------------------
+ * The engine's prompt (intvdebug_command): what it prints is UTF-8; the
+ * transcript is shown as ASCII like every view in this window. */
+
+/* Long sessions keep the last CONSOLE_KEEP characters, whole lines. */
+static void console_trim(debugger *d)
+{
+    const int len = GetWindowTextLengthA(d->con_out);
+    char *all, *nl;
+    int cut_at;
+    if (len <= CONSOLE_KEEP)
+        return;
+    all = malloc((size_t)len + 1);
+    if (!all)
+        return;
+    GetWindowTextA(d->con_out, all, len + 1);
+    cut_at = len - CONSOLE_KEEP * 3 / 4;
+    nl = strchr(all + cut_at, '\n');
+    if (nl)
+        cut_at = (int)(nl - all) + 1;
+    free(all);
+    SendMessageA(d->con_out, EM_SETSEL, 0, (LPARAM)cut_at);
+    SendMessageA(d->con_out, EM_REPLACESEL, FALSE, (LPARAM)"");
+}
+
+/* Onto the transcript, which follows its end only while the reader is there. */
+static void console_append(debugger *d, const char *text)
+{
+    const int follow = edit_at_end(d, d->con_out);
+    const int first = (int)SendMessageA(d->con_out, EM_GETFIRSTVISIBLELINE, 0, 0);
+    const size_t cap = strlen(text) * 2 + 8;
+    char *a = malloc(cap);
+    int len;
+
+    if (!a)
+        return;
+    ascii_view_text(text, a, cap);
+    len = GetWindowTextLengthA(d->con_out);
+    SendMessageA(d->con_out, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+    SendMessageA(d->con_out, EM_REPLACESEL, FALSE, (LPARAM)a);
+    free(a);
+    console_trim(d);
+    if (follow)
+        edit_to_end(d->con_out);
+    else
+        edit_scroll_to(d->con_out, first);
+}
+
+/* Command output, ended with a newline. */
+static void console_output(debugger *d, const char *text)
+{
+    const size_t n = strlen(text);
+    if (!n)
+        return;
+    console_append(d, text);
+    if (text[n - 1] != '\n')
+        console_append(d, "\n");
+}
+
+static void on_console(debugger *d)
+{
+    static char out[65536];
+    char buf[256], line[300], *cmd;
+
+    edit_text(d->con_in, buf, sizeof(buf));
+    cmd = strip_text(buf);
+    if (!*cmd)
+        return;
+    /* history: the newest last, no repeats of the one before */
+    if (d->nhistory == 0 || strcmp(d->history[d->nhistory - 1], cmd) != 0) {
+        if (d->nhistory == HISTORY_MAX) {
+            memmove(d->history[0], d->history[1], sizeof(d->history[0]) * (HISTORY_MAX - 1));
+            d->nhistory--;
+        }
+        snprintf(d->history[d->nhistory++], sizeof(d->history[0]), "%s", cmd);
+    }
+    d->history_pos = d->nhistory;
+    snprintf(line, sizeof(line), "> %s\n", cmd);
+    edit_to_end(d->con_out);   /* a command brings the reader back down */
+    console_append(d, line);
+
+    out[0] = '\0';
+    intvdebug_command(d->dbg, cmd, out, sizeof(out));
+    SetWindowTextA(d->con_in, "");
+    console_output(d, out);
+    d->seen_serial = 0;   /* the views follow what it did */
+}
+
+/* Up and Down walk the commands already run; past the newest is an empty line again. */
+static void history_step(debugger *d, int newer)
+{
+    int len;
+    if (d->nhistory == 0)
+        return;
+    d->history_pos += newer ? 1 : -1;
+    if (d->history_pos < 0)
+        d->history_pos = 0;
+    if (d->history_pos >= d->nhistory) {
+        d->history_pos = d->nhistory;
+        SetWindowTextA(d->con_in, "");
+        return;
+    }
+    SetWindowTextA(d->con_in, d->history[d->history_pos]);
+    len = GetWindowTextLengthA(d->con_in);
+    SendMessageA(d->con_in, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+}
+
+/* Tab: the engine completes the end of the line; one answer takes its place,
+ * several are listed (and the part they share is typed). */
+static void complete_console(debugger *d)
+{
+    char text[256], comps[4096], common[256] = "", line[256];
+    char *sp, *cur, *nl;
+    int n, first = 1;
+
+    edit_text(d->con_in, text, sizeof(text));
+    n = intvdebug_completions(d->dbg, text, comps, sizeof(comps));
+    if (n <= 0)
+        return;
+    for (cur = comps; *cur; cur = nl ? nl + 1 : cur + strlen(cur)) {
+        int k = 0;
+        nl = strchr(cur, '\n');
+        snprintf(line, sizeof(line), "%.*s", nl ? (int)(nl - cur) : (int)strlen(cur), cur);
+        if (!line[0])
+            continue;
+        if (first) {
+            snprintf(common, sizeof(common), "%s", line);
+            first = 0;
+        } else {
+            while (common[k] && line[k] && common[k] == line[k])
+                k++;
+            common[k] = '\0';
+        }
+    }
+    if (n > 1)
+        console_output(d, comps);
+    sp = strrchr(text, ' ');
+    if ((int)strlen(common) < (int)strlen(sp ? sp + 1 : text))
+        snprintf(common, sizeof(common), "%s", sp ? sp + 1 : text);   /* never shorter than typed */
+    if (sp)
+        sp[1] = '\0';
+    else
+        text[0] = '\0';
+    {
+        char joined[600];
+        snprintf(joined, sizeof(joined), "%s%s%s", text, common, n == 1 ? " " : "");
+        SetWindowTextA(d->con_in, joined);
+        SendMessageA(d->con_in, EM_SETSEL, (WPARAM)strlen(joined), (LPARAM)strlen(joined));
     }
 }
+
+/* ---- editable registers and the Memory page's Poke bar ---------------------- */
+
+static void on_reg(debugger *d, int index)
+{
+    char buf[32], err[96];
+    long v;
+
+    edit_text(d->reg_edit[index], buf, sizeof(buf));
+    if (!intvdebug_is_paused(d->dbg)) {
+        SetWindowTextA(d->reg_edit[index], "");   /* a running machine has no register values */
+        say(d, "Stop the machine first to change a register");
+        return;
+    }
+    if (!parse_value(d, buf, &v, err, sizeof(err))) {
+        say(d, "Not a number (hex, or an expression)");
+        refresh_regs(d);   /* the box goes back to the CPU's */
+        return;
+    }
+    intvdebug_regs_set(d->dbg, INTVDEBUG_REG_R0 + index, (unsigned)v);
+    SetFocus(d->hwnd);
+    d->seen_serial = 0;
+    refresh_all(d);
+}
+
+static void on_flag(debugger *d, int index)
+{
+    if (!intvdebug_is_paused(d->dbg)) {
+        SendMessageA(d->flag_chk[index], BM_SETCHECK, BST_UNCHECKED, 0);
+        say(d, "Stop the machine first to change a flag");
+        return;
+    }
+    intvdebug_regs_set(d->dbg, kFlagIds[index],
+                       SendMessageA(d->flag_chk[index], BM_GETCHECK, 0, 0) == BST_CHECKED);
+    d->seen_serial = 0;
+    refresh_all(d);
+}
+
+static void on_poke(debugger *d)
+{
+    char addr_text[64], val_text[64], err[96], msg[160];
+    uint16_t addr, word;
+    long v;
+    int width;
+
+    edit_text(d->poke_addr, addr_text, sizeof(addr_text));
+    edit_text(d->poke_value, val_text, sizeof(val_text));
+    if (!intvdebug_is_paused(d->dbg)) {
+        say(d, "Stop the machine first to poke memory");
+        return;
+    }
+    if (!intvsym_parse_addr(d->symtab, addr_text, &addr)) {
+        snprintf(msg, sizeof(msg), "No such symbol or address: %s", addr_text);
+        say(d, msg);
+        return;
+    }
+    if (!parse_value(d, val_text, &v, err, sizeof(err))) {
+        say(d, "Not a number (hex, or an expression)");
+        return;
+    }
+    width = intvdebug_word_width(d->dbg, addr);
+    word = (uint16_t)(width == 8 ? v & 0xFF : v & 0xFFFF);
+    intvdebug_write(d->dbg, addr, &word, 1);
+    snprintf(msg, sizeof(msg), width == 8 ? "Poked $%04X = $%02X" : "Poked $%04X = $%04X", addr, word);
+    say(d, msg);
+    d->mem_base = (uint16_t)(addr & 0xFFF8);
+    d->mem_hl = 1;
+    d->mem_hl_lo = d->mem_hl_hi = addr;
+    d->seen_serial = 0;
+    refresh_mem(d);
+}
+
+/* ---- Breakpoints, Watches, memory search ------------------------------------ */
 
 static void refresh_breaks(debugger *d)
 {
     const unsigned gen = intvdebug_bp_generation(d->dbg);
-    intvdebug_stop_info st;
-    char why[160], line[220];
-    const int paused = intvdebug_is_paused(d->dbg);
+    intvdebug_snapshot snap;
+    char line[220];
+    const int paused = intvdebug_stop_snapshot(d->dbg, &snap);
 
     if (gen != d->bp_gen) {
         intvdebug_bp bps[INTVDEBUG_MAX_BREAKPOINTS];
@@ -1835,7 +2019,7 @@ static void refresh_breaks(debugger *d)
         SendMessageA(d->bp_list, WM_SETREDRAW, FALSE, 0);
         SendMessageA(d->bp_list, LB_RESETCONTENT, 0, 0);
         for (i = 0; i < n; i++) {
-            char desc[160];
+            char desc[200];
             int at;
             intvbp_describe(&bps[i], d->symtab, desc, sizeof(desc));
             snprintf(line, sizeof(line), "[%c] %s    hits %u", bps[i].enabled ? 'x' : ' ', desc, bps[i].hits);
@@ -1847,13 +2031,13 @@ static void refresh_breaks(debugger *d)
         SendMessageA(d->bp_list, WM_SETREDRAW, TRUE, 0);
         InvalidateRect(d->bp_list, NULL, TRUE);
     }
-    why[0] = '\0';
-    if (paused && intvdebug_last_stop(d->dbg, &st))
-        stop_text(&st, why, sizeof(why));
-    snprintf(line, sizeof(line), "%s", paused ? (why[0] ? "Stopped: " : "Paused.") : "Running.");
-    if (paused && why[0])
-        snprintf(line + strlen(line), sizeof(line) - strlen(line), "%s", why);
-    SetWindowTextA(d->bp_stop, line);
+    /* the core words the stop, with the width of the word it touched */
+    snprintf(line, sizeof(line), "%s%s", paused ? "Stopped: " : "", paused ? snap.text : "Running.");
+    {
+        char shown[480];
+        ascii_view_text(line, shown, sizeof(shown));
+        SetWindowTextA(d->bp_stop, shown);
+    }
 }
 
 static void refresh_watches(debugger *d)
@@ -1877,38 +2061,34 @@ static void refresh_watches(debugger *d)
 
 static void add_break(debugger *d)
 {
-    char text[128], val[32];
+    char text[128], cond[128], msg[220];
     const int type = (int)SendMessageA(d->bp_type, CB_GETCURSEL, 0, 0);
     uint16_t lo = 0, hi = 0;
     intvdebug_bp bp;
-    const char *v = val;
 
     GetWindowTextA(d->bp_addr, text, sizeof(text));
-    GetWindowTextA(d->bp_value, val, sizeof(val));
+    GetWindowTextA(d->bp_cond, cond, sizeof(cond));
     memset(&bp, 0, sizeof(bp));
     if (type == 0 ? !intvsym_parse_addr(d->symtab, text, &lo)
                   : !intvsym_parse_range(d->symtab, text, &lo, &hi, NULL)) {
-        char msg[200];
         snprintf(msg, sizeof(msg), "No such symbol, variable or address: %s", text);
-        SetWindowTextA(d->status, msg);
+        say(d, msg);
         return;
     }
     if (type == 0)
         hi = lo;
     bp.type = type == 0 ? INTVDEBUG_BP_EXEC : type == 1 ? INTVDEBUG_BP_READ
-              : type == 2 ? INTVDEBUG_BP_WRITE : (INTVDEBUG_BP_READ | INTVDEBUG_BP_WRITE);
+              : type == 2 ? INTVDEBUG_BP_WRITE : INTVDEBUG_BP_ACCESS;
     bp.lo = lo;
     bp.hi = hi;
-    bp.cond = (int)SendMessageA(d->bp_cond, CB_GETCURSEL, 0, 0);
-    if (*v == '$')
-        v++;
-    bp.value = (uint16_t)strtoul(v, NULL, 16);
-    bp.mask = lo >= 0x0100 && hi <= 0x01EF ? 0x00FF : 0xFFFF; /* the scratchpad is 8 bits */
+    snprintf(bp.condition, sizeof(bp.condition), "%s", strip_text(cond));
     if (intvdebug_bp_add(d->dbg, &bp) < 0) {
-        SetWindowTextA(d->status, "The breakpoint table is full");
+        say(d, bp.condition[0] ? "Refused: the condition does not parse, or the breakpoint table is full"
+                               : "The breakpoint table is full");
         return;
     }
     SetWindowTextA(d->bp_addr, "");
+    SetWindowTextA(d->bp_cond, "");
     d->seen_serial = 0;
 }
 
@@ -1958,6 +2138,108 @@ static void selected_watch_range(debugger *d, uint16_t *lo, uint16_t *hi, int *o
 }
 
 /* ---- Cart, Trace and History pages ------------------------------------------- */
+
+/* The controllers, the PSG I/O ports, the ECS keyboard, the Intellivoice, JLP and the
+ * bank switches, as intvdebug_io_get reads them. */
+static void refresh_io(debugger *d)
+{
+    intvdebug_io io;
+    char text[6144], cur[6144];
+    int len = 0, pad, i;
+
+    text[0] = '\0';
+    if (!intvdebug_io_get(d->dbg, &io)) {
+        snprintf(text, sizeof(text), "No machine.");
+    } else {
+        len += snprintf(text + len, sizeof(text) - (size_t)len, "Controllers\r\n");
+        for (pad = 0; pad < 2; pad++) {
+            const intvdebug_pad *pd = &io.pad[pad];
+            if (!pd->present) {
+                len += snprintf(text + len, sizeof(text) - (size_t)len, "  Pads %d  absent%s\r\n", pad,
+                                pad ? " (needs the ECS)" : "");
+                continue;
+            }
+            len += snprintf(text + len, sizeof(text) - (size_t)len,
+                            "  Pads %d  side 0 $%02X%s  side 1 $%02X%s\r\n", pad, pd->side[0],
+                            pd->output[0] ? " (out)" : "", pd->side[1], pd->output[1] ? " (out)" : "");
+            len += snprintf(text + len, sizeof(text) - (size_t)len, "    left  held:");
+            for (i = 0; i < 18; i++)
+                if (pd->left[i])
+                    len += snprintf(text + len, sizeof(text) - (size_t)len, " %d", i);
+            len += snprintf(text + len, sizeof(text) - (size_t)len, "\r\n    right held:");
+            for (i = 0; i < 18; i++)
+                if (pd->right[i])
+                    len += snprintf(text + len, sizeof(text) - (size_t)len, " %d", i);
+            len += snprintf(text + len, sizeof(text) - (size_t)len, "\r\n");
+            if (pad == 1) {
+                len += snprintf(text + len, sizeof(text) - (size_t)len, "    ECS keyboard rows:");
+                for (i = 0; i < 8; i++)
+                    len += snprintf(text + len, sizeof(text) - (size_t)len, " %02X", (unsigned)(pd->keys[i] & 0xFF));
+                len += snprintf(text + len, sizeof(text) - (size_t)len, "\r\n");
+            }
+        }
+        len += snprintf(text + len, sizeof(text) - (size_t)len, "\r\nECS      %s", io.ecs ? "present" : "no");
+        if (io.ecs)
+            len += snprintf(text + len, sizeof(text) - (size_t)len, "  pages $2xxx %d  $7xxx %d  $Exxx %d",
+                            io.ecs_page[0], io.ecs_page[1], io.ecs_page[2]);
+        len += snprintf(text + len, sizeof(text) - (size_t)len, "\r\nIntellivoice  %s", io.ivoice ? "present" : "no");
+        if (io.ivoice)
+            len += snprintf(text + len, sizeof(text) - (size_t)len,
+                            "\r\n  LRQ %d  ALD %d  PC $%04X  %s  FIFO %u..%u  mode %u  page %u",
+                            io.ivoice_lrq, io.ivoice_ald, io.ivoice_pc & 0xFFFF,
+                            io.ivoice_halted ? "halted" : "running", (unsigned)io.ivoice_fifo_head,
+                            (unsigned)io.ivoice_fifo_tail, (unsigned)io.ivoice_mode, (unsigned)io.ivoice_page);
+        len += snprintf(text + len, sizeof(text) - (size_t)len, "\r\nJLP      %s", io.jlp ? "present" : "no");
+        if (io.jlp)
+            len += snprintf(text + len, sizeof(text) - (size_t)len,
+                            "\r\n  accelerators %s  flash %s (%u bytes)  FujiNet mailbox hole %s",
+                            io.jlp_accel ? "on" : "off", io.jlp_flash ? "open" : "none",
+                            (unsigned)io.jlp_flash_bytes, io.jlp_mb_hole ? "yes" : "no");
+        len += snprintf(text + len, sizeof(text) - (size_t)len, "\r\nLocutus  %s\r\nFujiNet  mailbox %s\r\n",
+                        io.locutus ? "owns the cartridge space" : "no", io.fujinet_mailbox ? "mapped" : "absent");
+    }
+    GetWindowTextA(d->io_text, cur, sizeof(cur));
+    if (strcmp(cur, text) != 0)   /* unchanged keeps a selection */
+        set_text_at(d->io_text, text, 0);
+}
+
+/* The two AY-3-8914 PSGs, straight out of the chips (stopped only). */
+static void refresh_sound(debugger *d)
+{
+    char text[6144], cur[6144];
+    int len = 0, unit;
+
+    if (!intvdebug_is_paused(d->dbg)) {
+        snprintf(text, sizeof(text), "Stop the machine to read the sound chips.");
+    } else {
+        text[0] = '\0';
+        for (unit = 0; unit < 2; unit++) {
+            intvdebug_psg psg;
+            int v, r;
+            if (!intvdebug_sound_get(d->dbg, unit, &psg) || !psg.present) {
+                len += snprintf(text + len, sizeof(text) - (size_t)len, "%s: absent%s\r\n\r\n",
+                                unit ? "ECS PSG ($00F0)" : "PSG ($01F0)", unit ? " (needs the ECS)" : "");
+                continue;
+            }
+            len += snprintf(text + len, sizeof(text) - (size_t)len, "%s\r\n  regs", unit ? "ECS PSG ($00F0)" : "PSG ($01F0)");
+            for (r = 0; r < 14; r++)
+                len += snprintf(text + len, sizeof(text) - (size_t)len, " %02X", psg.reg[r] & 0xFF);
+            len += snprintf(text + len, sizeof(text) - (size_t)len, "\r\n");
+            for (v = 0; v < 3; v++)
+                len += snprintf(text + len, sizeof(text) - (size_t)len,
+                                "  %c  period $%03X  %8.1f Hz  tone %-3s  noise %-3s  level %2d%s  wave %s\r\n",
+                                'A' + v, psg.period[v], psg.hz[v], psg.tone_on[v] ? "on" : "off",
+                                psg.noise_on[v] ? "on" : "off", psg.level[v], psg.envelope[v] ? " (env)" : "      ",
+                                psg.channel_state[v] ? "high" : "low");
+            len += snprintf(text + len, sizeof(text) - (size_t)len,
+                            "  noise period %d   envelope period $%04X  shape $%X  level %d   mixer $%02X (a set bit is OFF)\r\n\r\n",
+                            psg.noise_period, psg.env_period, psg.env_shape, psg.env_level, psg.reg[7] & 0xFF);
+        }
+    }
+    GetWindowTextA(d->sound_text, cur, sizeof(cur));
+    if (strcmp(cur, text) != 0)
+        set_text_at(d->sound_text, text, 0);
+}
 
 static void refresh_cart(debugger *d)
 {
@@ -2045,32 +2327,44 @@ static void hist_refresh(debugger *d, int idx, int force)
     SetWindowTextA(d->h_note[idx], note);
 }
 
+/* The console says why at each new stop, as the other frontends' do. */
+static void console_stop(debugger *d, const intvdebug_snapshot *snap)
+{
+    char line[220];
+    if (!snap->paused || snap->serial == d->con_serial)
+        return;
+    d->con_serial = snap->serial;
+    snprintf(line, sizeof(line), "\xe2\x80\x94 %s", snap->text);
+    console_output(d, line);
+}
+
 static void refresh_all(debugger *d)
 {
-    int paused = intvdebug_is_paused(d->dbg);
+    intvdebug_snapshot snap;
+    const int paused = intvdebug_stop_snapshot(d->dbg, &snap);
+
     SetWindowTextA(d->pause_btn, paused ? "Continue (F5)" : "Pause (F5)");
     {
-        intvdebug_stop_info st;
-        char why[160], status[220];
-        why[0] = '\0';
-        if (paused && intvdebug_last_stop(d->dbg, &st) && st.reason != INTVDEBUG_STOP_BREAKPOINT)
-            stop_text(&st, why, sizeof(why));
-        if (why[0]) {
-            snprintf(status, sizeof(status), "Paused: %s", why);
-            SetWindowTextA(d->status, status);
+        char status[220];
+        if (paused) {
+            char shown[480];
+            snprintf(status, sizeof(status), "%s", snap.text);
+            ascii_view_text(status, shown, sizeof(shown));
+            SetWindowTextA(d->status, shown);
         } else {
-            SetWindowTextA(d->status, paused ? "Paused" : "Running");
+            SetWindowTextA(d->status, "running");
         }
     }
+    console_stop(d, &snap);
 
     if (paused) {
         refresh_regs(d);
         refresh_disasm(d);
         refresh_mem(d);
-        refresh_stic(d);
     } else {
         int i;
         for (i = 0; i < 8; i++) SetWindowTextA(d->reg_edit[i], "");
+        for (i = 0; i < 5; i++) SendMessageA(d->flag_chk[i], BM_SETCHECK, BST_UNCHECKED, 0);
         SetWindowTextA(d->flags, "");
         lv_begin(d->disasm);
         lv_end(d->disasm, -1);
@@ -2084,8 +2378,11 @@ static void refresh_all(debugger *d)
     refresh_breaks(d);
     refresh_watches(d);
     refresh_cart(d);
+    refresh_io(d);
+    refresh_sound(d);
     hist_refresh(d, 0, 0);
     hist_refresh(d, 1, 0);
+    dbg_video_refresh(d->video, 1);
     if (page_visible(d, PAGE_FUJINET))
         refresh_fujinet(d, 0);
     d->was_paused = paused;
@@ -2119,18 +2416,25 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_TIMER:
         if (d) {
-            uint64_t serial = intvdebug_stop_serial(d->dbg);
-            if (serial != d->seen_serial ||
-                intvdebug_is_paused(d->dbg) != d->was_paused) {
-                d->seen_serial = serial;
+            intvdebug_snapshot snap;
+            const int paused = intvdebug_stop_snapshot(d->dbg, &snap);
+            if (snap.serial != d->seen_serial || paused != d->was_paused) {
+                d->seen_serial = snap.serial;
                 refresh_all(d);
-            } else if (page_visible(d, PAGE_TRACE) && ++d->h_ticks >= 4) {
-                d->h_ticks = 0;   /* the live view moves while the machine runs */
-                hist_refresh(d, 0, 0);
-            } else if (page_visible(d, PAGE_FUJINET) &&
-                       ++d->fuji_ticks >= FUJI_TICKS) {
-                /* the one view that moves while the machine runs */
-                refresh_fujinet(d, 0);
+            } else {
+                /* the live views: they move while the machine runs */
+                if (page_visible(d, PAGE_VIDEO))
+                    dbg_video_refresh(d->video, 0);
+                if (page_visible(d, PAGE_TRACE) && ++d->h_ticks >= 4) {
+                    d->h_ticks = 0;
+                    hist_refresh(d, 0, 0);
+                }
+                if (page_visible(d, PAGE_CART) && !paused && ++d->cart_ticks >= CART_TICKS) {
+                    d->cart_ticks = 0;
+                    refresh_io(d);
+                }
+                if (page_visible(d, PAGE_FUJINET) && ++d->fuji_ticks >= FUJI_TICKS)
+                    refresh_fujinet(d, 0);
             }
         }
         return 0;
@@ -2150,14 +2454,28 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
         }
         return 0;
+    case WM_DBG_TAB:
+        if (d)
+            complete_console(d);
+        return 0;
+    case WM_DBG_HISTORY:
+        if (d)
+            history_step(d, (int)wp);
+        return 0;
     case WM_DBG_ACCEPT:
         if (!d)
             return 0;
         if (wp == IDC_H_RANGE0 || wp == IDC_H_RANGE1) {
             d->h_seen[0] = d->h_seen[1] = (uint64_t)-1;
             d->seen_serial = 0;
-        } else if (wp == IDC_BP_ADDR || wp == IDC_BP_VALUE) {
+        } else if (wp == IDC_BP_ADDR || wp == IDC_BP_COND) {
             add_break(d);
+        } else if (wp == IDC_CON_IN) {
+            on_console(d);
+        } else if (wp >= IDC_REG0 && wp <= IDC_REG_LAST) {
+            on_reg(d, (int)(wp - IDC_REG0));
+        } else if (wp == IDC_POKE_ADDR || wp == IDC_POKE_VALUE) {
+            on_poke(d);
         } else if (wp == IDC_WT_ENTRY) {
             add_watch(d);
         } else if (wp == IDC_SRCH_ENTRY) {
@@ -2234,6 +2552,11 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             return 0;
         case IDC_BP_ADD: add_break(d); return 0;
+        case IDC_POKE_BTN: on_poke(d); return 0;
+        case IDC_FLAG_S: case IDC_FLAG_Z: case IDC_FLAG_O: case IDC_FLAG_C: case IDC_FLAG_I:
+            if (HIWORD(wp) == BN_CLICKED)
+                on_flag(d, LOWORD(wp) - IDC_FLAG_S);
+            return 0;
         case IDC_WT_ADD: add_watch(d); return 0;
         case IDC_SRCH_NEXT: do_search(d, 0); return 0;
         case IDC_SRCH_PREV: do_search(d, 1); return 0;
@@ -2283,8 +2606,7 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 bp.type = INTVDEBUG_BP_WRITE;
                 bp.lo = lo;
                 bp.hi = hi;
-                bp.cond = INTVDEBUG_COND_CHANGED;
-                bp.mask = lo >= 0x0100 && hi <= 0x01EF ? 0x00FF : 0xFFFF;
+                snprintf(bp.condition, sizeof(bp.condition), "value != old");
                 if (intvdebug_bp_add(d->dbg, &bp) >= 0)
                     SetWindowTextA(d->status, "Breaking when it changes");
                 d->seen_serial = 0;
@@ -2362,25 +2684,6 @@ static LRESULT CALLBACK dbg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             d->seen_serial = 0;
             if (intvdebug_is_paused(d->dbg)) refresh_all(d);
             return 0;
-        case IDC_CARDS_PREV: {
-            int page = INTVSTIC_CARDS_PER_ROW * CARD_ROWS_PER_PAGE;
-            d->card_first -= page;
-            if (d->card_first < 0) d->card_first = 0;
-            d->seen_serial = 0;
-            if (intvdebug_is_paused(d->dbg)) refresh_stic(d);
-            return 0;
-        }
-        case IDC_CARDS_NEXT: {
-            int page = INTVSTIC_CARDS_PER_ROW * CARD_ROWS_PER_PAGE;
-            int last_page = d->card_total > 0
-                               ? ((d->card_total - 1) / page) * page
-                               : 0;
-            d->card_first += page;
-            if (d->card_first > last_page) d->card_first = last_page;
-            d->seen_serial = 0;
-            if (intvdebug_is_paused(d->dbg)) refresh_stic(d);
-            return 0;
-        }
         default:
             break;
         }
@@ -2491,18 +2794,12 @@ void intv_debugger_show(HWND parent, intvsession *session)
         pc.lpszClassName = "IntvDbgLines";
         RegisterClassA(&pc);
 
-        memset(&pc, 0, sizeof(pc));
-        pc.lpfnWndProc = pixels_proc;
-        pc.hInstance = inst;
-        pc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        pc.lpszClassName = "IntvDbgPixels";
-        RegisterClassA(&pc);
-
         registered = 1;
     }
 
     d = (debugger *)calloc(1, sizeof(*d));
     d->session = session;
+    d->sym_seen_gen = (unsigned)-1;   /* the list is built the first time round */
     d->dbg = intvdebug_get();
     d->symtab = intvsymtab_shared();
     d->srcmap = intvsrcmap_shared();
@@ -2514,7 +2811,7 @@ void intv_debugger_show(HWND parent, intvsession *session)
 
     d->hwnd = CreateWindowExA(0, "IntvDebuggerWindow",
                               "Intellivision Debugger", WS_OVERLAPPEDWINDOW,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 1180, 780, parent,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 1400, 800, parent,
                               NULL, inst, NULL);
     SetWindowLongPtrA(d->hwnd, GWLP_USERDATA, (LONG_PTR)d);
     g_dbg = d;
@@ -2533,11 +2830,15 @@ void intv_debugger_show(HWND parent, intvsession *session)
     layout(d);
     {
         int tab = tab_from_env();
-        if (tab >= 0)
-            SendMessageA(d->tabs, TCM_SETCURSEL, (WPARAM)tab, 0);
-        show_page(d, tab >= 0 ? tab : PAGE_CPU);
-        if (getenv("INTV_HISTORY"))   /* record from the start, for captures */
-            intvdebug_history_enable(d->dbg, 1);
+        if (tab < 0)
+            tab = PAGE_CPU;
+        SendMessageA(d->tabs, TCM_SETCURSEL, (WPARAM)tab, 0);
+        show_page(d, tab);
+        {
+            const char *hist = getenv("INTV_HISTORY");
+            if (hist && *hist && *hist != '0')   /* record from the start, for captures */
+                intvdebug_history_enable(d->dbg, 1);
+        }
         if (tab_from_env_var("INTV_POPOUT") >= 0)   /* peel a tab off at the start, for captures */
             pop_out(d, tab_from_env_var("INTV_POPOUT"));
     }
@@ -2564,22 +2865,28 @@ void intv_debugger_show(HWND parent, intvsession *session)
         }
     }
 
-    /* More captures: INTV_WATCH="x" adds a watch, INTV_WATCH_BREAK="x" a
+    /* More captures: INTV_WATCH="x,y" adds watches, INTV_WATCH_BREAK="x" a
      * write-when-changed breakpoint on it, INTV_MEM_GOTO="x" shows it in Memory. */
     {
         const char *wt = getenv("INTV_WATCH"), *wb = getenv("INTV_WATCH_BREAK"),
                    *mg = getenv("INTV_MEM_GOTO");
         uint16_t lo, hi;
-        if (wt && *wt)
-            intvwatch_add(wt);
+        if (wt && *wt) {
+            char list[512], *item, *save = NULL;
+            snprintf(list, sizeof(list), "%s", wt);
+            for (item = strtok_s(list, ",", &save); item; item = strtok_s(NULL, ",", &save)) {
+                item = strip_text(item);
+                if (*item)
+                    intvwatch_add(item);
+            }
+        }
         if (wb && *wb && intvsym_parse_range(d->symtab, wb, &lo, &hi, NULL)) {
             intvdebug_bp bp;
             memset(&bp, 0, sizeof(bp));
             bp.type = INTVDEBUG_BP_WRITE;
             bp.lo = lo;
             bp.hi = hi;
-            bp.cond = INTVDEBUG_COND_CHANGED;
-            bp.mask = 0xFF;
+            snprintf(bp.condition, sizeof(bp.condition), "value != old");
             intvdebug_bp_add(d->dbg, &bp);
         }
         if (mg && *mg && intvsym_parse_range(d->symtab, mg, &lo, &hi, NULL))

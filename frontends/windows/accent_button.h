@@ -21,6 +21,15 @@
     RGB((INTVSESSION_ACCENT_RGB >> 16) & 0xFF,                           \
         (INTVSESSION_ACCENT_RGB >> 8) & 0xFF, INTVSESSION_ACCENT_RGB & 0xFF)
 
+/* The ink on an accent fill, and the accent for text and lines on a dark ground
+ * (the dark green itself is ~1.5:1 on a dark background). */
+#define INTV_ACCENT_INK_COLORREF                                          \
+    RGB((INTVSESSION_ACCENT_INK_RGB >> 16) & 0xFF,                       \
+        (INTVSESSION_ACCENT_INK_RGB >> 8) & 0xFF, INTVSESSION_ACCENT_INK_RGB & 0xFF)
+#define INTV_ACCENT_LIGHT_COLORREF                                        \
+    RGB((INTVSESSION_ACCENT_LIGHT_RGB >> 16) & 0xFF,                     \
+        (INTVSESSION_ACCENT_LIGHT_RGB >> 8) & 0xFF, INTVSESSION_ACCENT_LIGHT_RGB & 0xFF)
+
 /* Handles one NM_CUSTOMDRAW from a button. on = the button's toggle state;
  * the result is what the parent's WM_NOTIFY should return. */
 static inline LRESULT intv_accent_customdraw(const NMCUSTOMDRAW *cd, int on)
@@ -37,7 +46,7 @@ static inline LRESULT intv_accent_customdraw(const NMCUSTOMDRAW *cd, int on)
     FillRect(cd->hdc, &r, accent);
     FrameRect(cd->hdc, &r, (HBRUSH)GetStockObject(GRAY_BRUSH));
     SetBkMode(cd->hdc, TRANSPARENT);
-    SetTextColor(cd->hdc, RGB(255, 255, 255));
+    SetTextColor(cd->hdc, INTV_ACCENT_INK_COLORREF);
     text[0] = '\0';
     GetWindowTextA(cd->hdr.hwndFrom, text, sizeof text);
     {

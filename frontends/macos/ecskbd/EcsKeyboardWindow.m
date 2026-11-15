@@ -60,22 +60,22 @@
 @end
 
 @implementation EcsModButton
-/* Latched = dark green (INTVSESSION_ACCENT_RGB 0x1E4912) with white text;
+/* Latched = the accent (INTVSESSION_ACCENT_RGB) with INTVSESSION_ACCENT_INK_RGB text;
  * released = the system default look. */
 - (void)applyLatchLook
 {
     BOOL on = self.state == NSControlStateValueOn;
     NSString *t = self.title;
     if (on) {
-        self.bezelColor = [NSColor colorWithSRGBRed:0x1E / 255.0
-                                              green:0x49 / 255.0
-                                               blue:0x12 / 255.0
+        self.bezelColor = [NSColor colorWithSRGBRed:((INTVSESSION_ACCENT_RGB >> 16) & 255) / 255.0
+                                              green:((INTVSESSION_ACCENT_RGB >> 8) & 255) / 255.0
+                                               blue:(INTVSESSION_ACCENT_RGB & 255) / 255.0
                                               alpha:1.0];
         self.attributedTitle = [[NSAttributedString alloc]
             initWithString:t
                 attributes:@{
                     NSFontAttributeName : [NSFont systemFontOfSize:NSFont.systemFontSize],
-                    NSForegroundColorAttributeName : NSColor.whiteColor
+                    NSForegroundColorAttributeName : [NSColor colorWithSRGBRed:((INTVSESSION_ACCENT_INK_RGB >> 16) & 255) / 255.0 green:((INTVSESSION_ACCENT_INK_RGB >> 8) & 255) / 255.0 blue:(INTVSESSION_ACCENT_INK_RGB & 255) / 255.0 alpha:1.0]
                 }];
     } else {
         self.bezelColor = nil;

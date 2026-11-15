@@ -1,10 +1,11 @@
 /*
- * Debugger window (AppKit): disassembly with click-to-toggle breakpoints,
- * read-only registers, a memory view, and an STIC tab (BACKTAB, all 8
- * MOBs, GRAM/GROM card sheet with pager, palette, decoded state) -- the
- * same content and scope as the GNOME/KDE/Windows debugger windows, built
- * from plain AppKit views (an NSTabView, NSTextView/NSTextField/NSButton
- * children, and NSImageView for the STIC pictures).
+ * Debugger window (AppKit): thirteen tabs (Console, Disassembly, BASIC,
+ * Memory, Breakpoints, Watches, Cart & I/O, Trace, History, Video, Sound,
+ * Symbols, FujiNet) over an editable register strip -- the same content and
+ * scope as the GNOME/KDE/Windows debugger windows, built from plain AppKit
+ * views (an NSTabView, NSTextView/NSTextField/NSButton children). The Video
+ * tab is VideoTab.m, a view over core/include/intvvidtab.h; the old STIC
+ * panes are its Decoded sources.
  *
  * A FujiNet tab, last, shows every FujiBus packet between the machine and
  * FujiNet (intvdebug_fujinet_trace, always on) beside the mailbox's state;
@@ -28,8 +29,9 @@
  * work should survive closing this window, not be thrown away with it. It
  * ships pre-seeded with EXEC ROM/RAM and cart-header symbols (see
  * symbols.c); "Load Symbols..." loads a per-game as1600 .sym file on top
- * via NSOpenPanel, matching the GNOME/KDE/Windows ports' own UI. No
- * register/memory editing either: intvdebug has no register-write call.
+ * via NSOpenPanel, matching the GNOME/KDE/Windows ports' own UI. The
+ * register strip and the Memory tab's Poke bar write the machine while it
+ * is stopped (intvdebug_regs_set, the core's poke command).
  *
  * NOT BUILT OR RUN-VERIFIED -- see ../main.m's file header.
  *
@@ -38,6 +40,7 @@
  */
 
 #import "DebuggerWindow.h"
+#import "VideoTab.h"
 #import "../help/HelpWindow.h"
 
 #include <float.h>
@@ -46,7 +49,8 @@
 #include <strings.h>
 
 #include "intvdebug.h"
-#include "intvstic.h"
+#include "intvmemtools.h"
+#include "intvsession.h"
 #include "memtools.h"
 #include "srcmap.h"
 #include "symbols.h"
@@ -54,44 +58,45 @@
 #define DISASM_LINES 32
 #define MEM_ROWS 16
 #define MEM_WORDS_PER_ROW 8
-#define CARD_ROWS_PER_PAGE 8 /* 128 cards/page at INTVSTIC_CARDS_PER_ROW=16 */
 #define FUJI_TICKS 5 /* the FujiNet tab, every 0.5s while it shows */
-
-/* Same shared-scratch sizing lesson learned the hard way in the Windows
- * port (frontends/windows/debugger/dbg_window.c's own file comment): size
- * to the LARGEST of the four STIC renders (the palette sheet), not just
- * the cards sheet -- a buffer sized only for the cards sheet would
- * silently overrun on the BACKTAB and palette renders. */
-#define STIC_SCRATCH_A (INTVSTIC_BACKTAB_W * INTVSTIC_BACKTAB_H * 4)
-#define STIC_SCRATCH_B (INTVSTIC_CARDS_PER_ROW * 8 * CARD_ROWS_PER_PAGE * 8 * 4)
-#define STIC_SCRATCH_C (INTVSTIC_PAL_CELL * 16 * INTVSTIC_PAL_CELL * 4)
-#define STIC_SCRATCH_BYTES \
-    (STIC_SCRATCH_A > STIC_SCRATCH_B \
-         ? (STIC_SCRATCH_A > STIC_SCRATCH_C ? STIC_SCRATCH_A : STIC_SCRATCH_C) \
-         : (STIC_SCRATCH_B > STIC_SCRATCH_C ? STIC_SCRATCH_B : STIC_SCRATCH_C))
+#define VIDEO_TICKS 3 /* the Video tab follows a running machine, every 0.3s */
+#define REG_FIELDS 14 /* R0-R7, then S Z O C I D */
 
 static DebuggerWindow *g_debugger;
 
-/* The tabs, in order; INTV_DEBUGGER_TAB picks one by number or by the start
- * of its name (any case), for tests and captures. */
-static const char *const kTabNames[] = {"CPU", "BASIC", "Memory", "Breakpoints", "Watches", "Cart", "Trace", "History", "STIC", "Symbols", "FujiNet"};
+/* The tabs, in order. The identifiers are the help contexts' ends
+ * (debugger/<id>, intvhelp.h). INTV_DEBUGGER_TAB picks one by number, by the
+ * start of its title or id (any case), or by an older name ("cpu", "stic"),
+ * for tests and captures. */
+static const char *const kTabNames[] = {"Console", "Disassembly", "BASIC", "Memory", "Breakpoints", "Watches",
+                                        "Cart & I/O", "Trace", "History", "Video", "Sound", "Symbols", "FujiNet"};
+static const char *const kTabIds[] = {"console", "disassembly", "basic", "memory", "breakpoints", "watches",
+                                      "cart", "trace", "history", "video", "sound", "symbols", "fujinet"};
 #define TAB_COUNT ((int)(sizeof(kTabNames) / sizeof(kTabNames[0])))
-enum { MT_CPU, MT_BASIC, MT_MEMORY, MT_BREAKS, MT_WATCHES, MT_CART, MT_TRACE, MT_HISTORY, MT_STIC, MT_SYMBOLS,
-       MT_FUJINET };
+enum { MT_CONSOLE, MT_DISASM, MT_BASIC, MT_MEMORY, MT_BREAKS, MT_WATCHES, MT_CART, MT_TRACE, MT_HISTORY, MT_VIDEO,
+       MT_SOUND, MT_SYMBOLS, MT_FUJINET };
 
-static int tabFromEnv(void)
+static int tabFromText(const char *tab)
 {
-    const char *tab = getenv("INTV_DEBUGGER_TAB");
     if (!tab || !*tab)
         return -1;
     char *end;
     const long n = strtol(tab, &end, 10);
     if (end != tab && *end == '\0')
         return n >= 0 && n < TAB_COUNT ? (int)n : -1;
-    for (int i = 0; i < TAB_COUNT; i++)
-        if (strncasecmp(tab, kTabNames[i], strlen(tab)) == 0)
-            return i;
+    if (strcasecmp(tab, "cpu") == 0)
+        return MT_DISASM;
+    if (strcasecmp(tab, "stic") == 0)
+        return MT_VIDEO;
+    for (int idx = 0; idx < TAB_COUNT; idx++)
+        if (strncasecmp(tab, kTabNames[idx], strlen(tab)) == 0 || strncasecmp(tab, kTabIds[idx], strlen(tab)) == 0)
+            return idx;
     return -1;
+}
+
+static int tabFromEnv(void)
+{
+    return tabFromText(getenv("INTV_DEBUGGER_TAB"));
 }
 
 /* Disassembly text view: a click toggles the breakpoint on the clicked
@@ -202,7 +207,7 @@ static int tabFromEnv(void)
 }
 @end
 
-@interface DebuggerWindow () <NSWindowDelegate, NSTabViewDelegate>
+@interface DebuggerWindow () <NSWindowDelegate, NSTabViewDelegate, NSTextFieldDelegate>
 - (instancetype)initWithSession:(intvsession *)session;
 @end
 
@@ -213,7 +218,24 @@ static int tabFromEnv(void)
     intvsrcmap *_srcmap;
     NSWindow *_window;
 
-    /* Memory tab: the highlighted words, and the search */
+    /* Console tab */
+    NSTextView *_conOut;
+    NSTextField *_conIn;
+    NSMutableArray<NSString *> *_conHistory;
+    NSInteger _conPos;
+
+    /* Video and Sound tabs */
+    IntvVideoTab *_video;
+    NSTextView *_soundText;
+    int _videoTicks;
+
+    /* The register strip under every tab: R0-R7, then S Z O C I D */
+    NSTextField *_reg[REG_FIELDS];
+    NSTextField *_regInfo;
+
+    /* Memory tab: the Poke bar, the highlighted words, and the search */
+    NSTextField *_memPoke;
+    NSTextField *_memNote;
     BOOL _memHl;
     uint16_t _memHlLo, _memHlHi;
     NSPopUpButton *_srchKind;
@@ -234,8 +256,8 @@ static int tabFromEnv(void)
     NSWindow *_popped[16];
 
     /* Breakpoints tab */
-    NSPopUpButton *_bpType, *_bpCond;
-    NSTextField *_bpAddr, *_bpValue, *_bpStop;
+    NSPopUpButton *_bpType;
+    NSTextField *_bpAddr, *_bpCondition, *_bpStop;
     PickTextView *_bpList;
     NSMutableArray<NSNumber *> *_bpIds;
     unsigned _bpGen;
@@ -257,7 +279,6 @@ static int tabFromEnv(void)
     NSButton *_runBtn;
     NSTextField *_status;
     DasmTextView *_disasm;
-    NSTextView *_regs;
 
     NSTextField *_memAddr;
     NSTextView *_memView;
@@ -270,18 +291,6 @@ static int tabFromEnv(void)
     unsigned _symSeenGen;
     NSString *_symFilterText;
 
-    NSImageView *_backtabView;
-    NSImageView *_mobView[INTVSTIC_MOB_COUNT];
-    NSTextView *_mobInfo;
-    NSImageView *_cardsView;
-    NSTextField *_cardsRangeLabel;
-    int _cardFirst;
-    int _cardTotal;
-    NSImageView *_palView;
-    NSTextView *_sticState;
-
-    uint8_t *_scratch; /* STIC_SCRATCH_BYTES, reused across all 4 renders */
-
     NSTabView *_tabs;
     NSTabViewItem *_fujiItem;
     NSTextField *_fujiNote;
@@ -293,36 +302,35 @@ static int tabFromEnv(void)
 
     NSTimer *_tick;
     uint64_t _seenSerial;
+    unsigned _seenGen;  /* intvdebug_generation: a command ran, a breakpoint changed */
     int _wasPaused; /* seeded -1: force the first tick to refresh */
-}
-
-/* RGBA8888 (red first). Every intvstic_render_* output is either fully
- * opaque (backtab/cards/palette -- alpha dropped via kCGImageAlphaNoneSkip
- * Last) or, for MOBs, carries real per-pixel transparency (straight, not
- * premultiplied -- kCGImageAlphaLast). */
-static NSImage *imageFromRGBA(const uint8_t *rgba, int w, int h, BOOL hasAlpha)
-{
-    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
-    CGDataProviderRef provider =
-        CGDataProviderCreateWithData(NULL, rgba, (size_t)w * h * 4, NULL);
-    CGBitmapInfo info = hasAlpha
-                            ? (CGBitmapInfo)kCGImageAlphaLast
-                            : (CGBitmapInfo)kCGImageAlphaNoneSkipLast;
-    CGImageRef cg = CGImageCreate((size_t)w, (size_t)h, 8, 32, (size_t)w * 4,
-                                  space, info, provider, NULL, false,
-                                  kCGRenderingIntentDefault);
-    CGDataProviderRelease(provider);
-    CGColorSpaceRelease(space);
-    NSImage *img = [[NSImage alloc] initWithCGImage:cg size:NSMakeSize(w, h)];
-    CGImageRelease(cg);
-    return img;
 }
 
 /* The current line is a bar in the accent (the icon's green) with white text;
  * a breakpoint is a red dot in the gutter's first column. */
+static NSColor *rgbColor(unsigned rgb)
+{
+    return [NSColor colorWithSRGBRed:((rgb >> 16) & 255) / 255.0
+                               green:((rgb >> 8) & 255) / 255.0
+                                blue:(rgb & 255) / 255.0
+                               alpha:1];
+}
+
+/* The accent as a fill (the icon's green), the ink on that fill, and the
+ * accent as text or lines on a dark theme (the green fill is too dark there). */
 static NSColor *accentColor(void)
 {
-    return [NSColor colorWithSRGBRed:0x1E / 255.0 green:0x49 / 255.0 blue:0x12 / 255.0 alpha:1];
+    return rgbColor(INTVSESSION_ACCENT_RGB);
+}
+
+static NSColor *accentInk(void)
+{
+    return rgbColor(INTVSESSION_ACCENT_INK_RGB);
+}
+
+static NSColor *accentLight(void)
+{
+    return rgbColor(INTVSESSION_ACCENT_LIGHT_RGB);
 }
 
 static NSColor *breakpointRed(void)
@@ -335,18 +343,18 @@ static void appendLine(NSMutableAttributedString *out, NSString *body, BOOL pc, 
 {
     NSFont *font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
     NSString *line = [NSString stringWithFormat:@"%@ %@\n", bp == 1 ? @"\u25CF" : bp == 2 ? @"\u25CB" : @" ", body];
-    NSMutableAttributedString *a = [[NSMutableAttributedString alloc]
+    NSMutableAttributedString *attr = [[NSMutableAttributedString alloc]
         initWithString:line
             attributes:@{ NSFontAttributeName : font, NSForegroundColorAttributeName : NSColor.textColor }];
     if (pc) {
-        [a addAttribute:NSBackgroundColorAttributeName value:accentColor() range:NSMakeRange(0, line.length)];
-        [a addAttribute:NSForegroundColorAttributeName value:NSColor.whiteColor range:NSMakeRange(1, line.length - 1)];
+        [attr addAttribute:NSBackgroundColorAttributeName value:accentColor() range:NSMakeRange(0, line.length)];
+        [attr addAttribute:NSForegroundColorAttributeName value:accentInk() range:NSMakeRange(1, line.length - 1)];
     }
-    if (bp)   /* enabled: red; disabled: a hollow grey dot */
-        [a addAttribute:NSForegroundColorAttributeName
+    if (bp)   /* enabled: red; disabled: attr hollow grey dot */
+        [attr addAttribute:NSForegroundColorAttributeName
                   value:bp == 1 ? breakpointRed() : NSColor.systemGrayColor
                   range:NSMakeRange(0, 1)];
-    [out appendAttributedString:a];
+    [out appendAttributedString:attr];
 }
 
 /* Replaces a view's styled text where the reader left it. */
@@ -387,7 +395,7 @@ static void setAttrText(NSTextView *view, NSAttributedString *text)
     _srcmap = intvsrcmap_shared();
     _basFile = -1;
     _symFilterText = @"";
-    _scratch = calloc(1, STIC_SCRATCH_BYTES);
+    _conHistory = [NSMutableArray array];
     _fujiCount = -1;
     _hSeen[0] = _hSeen[1] = (uint64_t)-1;
     [self buildWindow];
@@ -413,6 +421,21 @@ static void setAttrText(NSTextView *view, NSAttributedString *text)
         }
     }
 
+    /* More captures: INTV_WATCH="x" adds a watch, INTV_WATCH_BREAK="x" a
+     * breakpoint on a write that changes it, INTV_MEM_GOTO="x" shows it in
+     * Memory, INTV_POPOUT=<tab> pops that tab out into a window. */
+    {
+        const char *watchText = getenv("INTV_WATCH"), *breakText = getenv("INTV_WATCH_BREAK"),
+                   *gotoText = getenv("INTV_MEM_GOTO");
+        uint16_t first, last;
+        if (watchText && *watchText)
+            intvwatch_add(watchText);
+        if (breakText && *breakText && intvsym_parse_range(_symtab, breakText, &first, &last, NULL))
+            [self breakOnChangeFrom:first to:last];
+        if (gotoText && *gotoText && intvsym_parse_range(_symtab, gotoText, &first, &last, NULL))
+            [self showInMemoryLo:first hi:last];
+    }
+
     if (getenv("INTV_HISTORY"))   /* record from the start, for captures */
         intvdebug_history_enable(_dbg, 1);
 
@@ -430,17 +453,29 @@ static void setAttrText(NSTextView *view, NSAttributedString *text)
                                                 [weakSelf onTick];
                                               }];
     _wasPaused = -1;
+
+    {
+        const int pop = tabFromText(getenv("INTV_POPOUT"));
+        if (pop >= 0)
+            [self popOutTab:pop];
+    }
     return self;
 }
 
 - (void)onTick
 {
-    uint64_t serial = intvdebug_stop_serial(_dbg);
-    BOOL paused = intvdebug_is_paused(_dbg);
-    if (serial != _seenSerial || paused != _wasPaused) {
-        _seenSerial = serial;
+    intvdebug_snapshot snap;
+    intvdebug_stop_snapshot(_dbg, &snap);
+    const unsigned gen = intvdebug_generation(_dbg);
+    const BOOL paused = snap.paused != 0;
+    if (snap.serial != _seenSerial || paused != _wasPaused || gen != _seenGen) {
+        _seenSerial = snap.serial;
+        _seenGen = gen;
         _wasPaused = paused;
         [self refreshAll:paused];
+    } else if (_window.visible && !paused && [self tabVisible:MT_VIDEO] && ++_videoTicks >= VIDEO_TICKS) {
+        _videoTicks = 0;   /* the picture follows attr running machine */
+        [_video refreshForce:NO];
     } else if (_window.visible && [self tabVisible:MT_TRACE] && ++_hTicks >= 4) {
         _hTicks = 0;   /* the live view moves while the machine runs */
         [self refreshHist:0 force:NO];
@@ -522,19 +557,57 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     return [NSTextField labelWithString:text];
 }
 
-- (NSImageView *)pictureView:(int)w height:(int)h
+/* The Console: the core's command line (intvdebug_command). Tab completes,
+ * Up and Down walk what was typed. */
+- (NSView *)buildConsoleTab
 {
-    NSImageView *v = [[NSImageView alloc]
-        initWithFrame:NSMakeRect(0, 0, w * 2, h * 2)];
-    v.imageScaling = NSImageScaleProportionallyUpOrDown;
-    v.wantsLayer = YES;
-    v.layer.magnificationFilter = kCAFilterNearest;
-    [v.widthAnchor constraintEqualToConstant:w * 2].active = YES;
-    [v.heightAnchor constraintEqualToConstant:h * 2].active = YES;
-    return v;
+    NSScrollView *outScroll;
+    _conOut = monoView(&outScroll);
+    _conOut.string = @"Debugger console. Type 'help' for every command; Tab completes, Up/Down walk the history.\n";
+    _conIn = [[NSTextField alloc] init];
+    _conIn.placeholderString = @"command (help, step, break $5000, bpa $0200, print r3, mem $0200 32, video ...)";
+    _conIn.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    _conIn.target = self;
+    _conIn.action = @selector(runCommand:);
+    _conIn.delegate = self;
+
+    NSStackView *root = [NSStackView stackViewWithViews:@[ outScroll, _conIn ]];
+    root.orientation = NSUserInterfaceLayoutOrientationVertical;
+    root.alignment = NSLayoutAttributeLeading;
+    root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
+    [outScroll.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    [_conIn.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    [outScroll setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationVertical];
+    return root;
 }
 
-- (NSView *)buildCpuTab
+/* The two AY-3-8914 PSGs, as text; only a stopped machine can be read. */
+- (NSView *)buildSoundTab
+{
+    NSScrollView *scroll;
+    _soundText = monoView(&scroll);
+    NSStackView *root = [NSStackView stackViewWithViews:@[ scroll ]];
+    root.orientation = NSUserInterfaceLayoutOrientationVertical;
+    root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
+    [scroll.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    return root;
+}
+
+/* The Video tab: a controller (core intvvidtab.h) behind its own views. */
+- (NSView *)buildVideoTab
+{
+    _video = [[IntvVideoTab alloc] initWithDebugger:_dbg];
+    NSView *view = _video.view;
+    NSStackView *root = [NSStackView stackViewWithViews:@[ view ]];
+    root.orientation = NSUserInterfaceLayoutOrientationVertical;
+    root.alignment = NSLayoutAttributeLeading;
+    root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
+    [view.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    [view.heightAnchor constraintEqualToAnchor:root.heightAnchor constant:-16].active = YES;
+    return root;
+}
+
+- (NSView *)buildDisasmTab
 {
     NSScrollView *dasmScroll = [[NSScrollView alloc] init];
     dasmScroll.hasVerticalScroller = YES;
@@ -597,13 +670,25 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
         [self button:@"Find Previous" action:@selector(searchPrev:)], _srchNote
     ]];
     searchRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    NSStackView *root = [NSStackView stackViewWithViews:@[ memRow, searchRow, memScroll ]];
+    _memPoke = [[NSTextField alloc] init];
+    _memPoke.placeholderString = @"address value ... (hex; several values go to consecutive words)";
+    _memPoke.target = self;
+    _memPoke.action = @selector(pokeMem:);
+    _memNote = [self label:@""];
+    _memNote.textColor = NSColor.secondaryLabelColor;
+    NSStackView *pokeRow = [NSStackView stackViewWithViews:@[
+        [self label:@"Poke"], _memPoke, [self button:@"Write" action:@selector(pokeMem:)], _memNote
+    ]];
+    pokeRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    NSStackView *root = [NSStackView stackViewWithViews:@[ memRow, searchRow, memScroll, pokeRow ]];
     root.orientation = NSUserInterfaceLayoutOrientationVertical;
     root.alignment = NSLayoutAttributeLeading;
     root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
     [memRow.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
     [searchRow.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
     [memScroll.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    [pokeRow.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
+    [memScroll setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationVertical];
     return root;
 }
 
@@ -663,97 +748,6 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     [bar.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
     [_basNote.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
     [scroll.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-16].active = YES;
-    return root;
-}
-
-- (NSView *)buildSticTab
-{
-    _backtabView = [self pictureView:INTVSTIC_BACKTAB_W
-                              height:INTVSTIC_BACKTAB_H];
-    NSStackView *backtabCol = [NSStackView stackViewWithViews:@[
-        [self label:@"BACKTAB"], _backtabView
-    ]];
-    backtabCol.orientation = NSUserInterfaceLayoutOrientationVertical;
-    backtabCol.alignment = NSLayoutAttributeLeading;
-
-    NSMutableArray<NSView *> *mobGridRows = [NSMutableArray array];
-    for (int row = 0; row < 2; row++) {
-        NSMutableArray<NSView *> *rowViews = [NSMutableArray array];
-        for (int col = 0; col < 4; col++) {
-            int i = row * 4 + col;
-            _mobView[i] = [self pictureView:16 height:16];
-            [rowViews addObject:_mobView[i]];
-        }
-        NSStackView *rowStack = [NSStackView stackViewWithViews:rowViews];
-        rowStack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-        rowStack.spacing = 4;
-        [mobGridRows addObject:rowStack];
-    }
-    NSStackView *mobGrid = [NSStackView stackViewWithViews:mobGridRows];
-    mobGrid.orientation = NSUserInterfaceLayoutOrientationVertical;
-    mobGrid.spacing = 4;
-
-    NSScrollView *mobInfoScroll;
-    _mobInfo = monoView(&mobInfoScroll);
-    [mobInfoScroll.heightAnchor constraintEqualToConstant:130].active = YES;
-
-    NSStackView *mobCol = [NSStackView stackViewWithViews:@[
-        [self label:@"MOBs"], mobGrid, mobInfoScroll
-    ]];
-    mobCol.orientation = NSUserInterfaceLayoutOrientationVertical;
-    mobCol.alignment = NSLayoutAttributeLeading;
-    mobCol.spacing = 6;
-
-    _cardsView = [self pictureView:INTVSTIC_CARDS_PER_ROW * 8
-                             height:CARD_ROWS_PER_PAGE * 8];
-    NSButton *prevBtn = [self button:@"< Prev" action:@selector(cardsPrev:)];
-    NSButton *nextBtn = [self button:@"Next >" action:@selector(cardsNext:)];
-    _cardsRangeLabel = [self label:@""];
-    NSStackView *pagerRow = [NSStackView
-        stackViewWithViews:@[ prevBtn, nextBtn, _cardsRangeLabel ]];
-    pagerRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    NSStackView *cardsCol = [NSStackView stackViewWithViews:@[
-        [self label:@"GRAM/GROM cards"], _cardsView, pagerRow
-    ]];
-    cardsCol.orientation = NSUserInterfaceLayoutOrientationVertical;
-    cardsCol.alignment = NSLayoutAttributeLeading;
-
-    _palView = [self pictureView:INTVSTIC_PAL_CELL * 16
-                           height:INTVSTIC_PAL_CELL];
-    NSStackView *palCol = [NSStackView stackViewWithViews:@[
-        [self label:@"Palette"], _palView
-    ]];
-    palCol.orientation = NSUserInterfaceLayoutOrientationVertical;
-    palCol.alignment = NSLayoutAttributeLeading;
-
-    NSScrollView *stateScroll;
-    _sticState = monoView(&stateScroll);
-    NSStackView *stateCol = [NSStackView stackViewWithViews:@[
-        [self label:@"Registers & mode"], stateScroll
-    ]];
-    stateCol.orientation = NSUserInterfaceLayoutOrientationVertical;
-    stateCol.alignment = NSLayoutAttributeLeading;
-
-    NSStackView *leftCol = [NSStackView stackViewWithViews:@[
-        backtabCol, cardsCol
-    ]];
-    leftCol.orientation = NSUserInterfaceLayoutOrientationVertical;
-    leftCol.alignment = NSLayoutAttributeLeading;
-    leftCol.spacing = 12;
-
-    NSStackView *rightCol = [NSStackView stackViewWithViews:@[
-        mobCol, palCol, stateCol
-    ]];
-    rightCol.orientation = NSUserInterfaceLayoutOrientationVertical;
-    rightCol.alignment = NSLayoutAttributeLeading;
-    rightCol.spacing = 12;
-
-    NSStackView *root =
-        [NSStackView stackViewWithViews:@[ leftCol, rightCol ]];
-    root.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    root.alignment = NSLayoutAttributeTop;
-    root.spacing = 16;
-    root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
     return root;
 }
 
@@ -849,10 +843,45 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     return split;
 }
 
+/* The registers under every tab: R0-R7, then the flags S Z O C I and D. Each
+ * is a field that takes a value (hex, $hex, or an expression) while the
+ * machine is stopped; Enter applies it (intvdebug_regs_set). */
+- (NSView *)buildRegStrip
+{
+    static const char *const names[REG_FIELDS] = {"R0", "R1", "R2", "R3", "R4", "R5", "R6 (SP)", "R7 (PC)",
+                                                   "S", "Z", "O", "C", "I", "D"};
+    NSMutableArray<NSView *> *row1 = [NSMutableArray array], *row2 = [NSMutableArray array];
+    for (int idx = 0; idx < REG_FIELDS; idx++) {
+        _reg[idx] = [[NSTextField alloc] init];
+        _reg[idx].font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+        _reg[idx].tag = idx;
+        _reg[idx].target = self;
+        _reg[idx].action = @selector(applyRegister:);
+        _reg[idx].toolTip = @"Edit while the machine is stopped (hex, $hex or a label), then Enter. "
+                          @"A flag takes 0 or 1; D set means SDBD is pending";
+        [_reg[idx].widthAnchor constraintEqualToConstant:idx < 8 ? 56 : 30].active = YES;
+        NSMutableArray<NSView *> *row = idx < 8 ? row1 : row2;
+        [row addObject:[self label:@(names[idx])]];
+        [row addObject:_reg[idx]];
+    }
+    _regInfo = [self label:@""];
+    _regInfo.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    _regInfo.textColor = NSColor.secondaryLabelColor;
+    [row2 addObject:_regInfo];
+    NSStackView *topRow = [NSStackView stackViewWithViews:row1];
+    NSStackView *bottomRow = [NSStackView stackViewWithViews:row2];
+    topRow.orientation = bottomRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    NSStackView *strip = [NSStackView stackViewWithViews:@[ topRow, bottomRow ]];
+    strip.orientation = NSUserInterfaceLayoutOrientationVertical;
+    strip.alignment = NSLayoutAttributeLeading;
+    strip.spacing = 4;
+    return strip;
+}
+
 - (void)buildWindow
 {
     _window = [[NSWindow alloc]
-        initWithContentRect:NSMakeRect(0, 0, 1080, 780)
+        initWithContentRect:NSMakeRect(0, 0, 1240, 860)
                   styleMask:NSWindowStyleMaskTitled |
                             NSWindowStyleMaskClosable |
                             NSWindowStyleMaskResizable |
@@ -897,58 +926,21 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     toolbar.spacing = 8;
 
     NSTabView *tabs = [[NSTabView alloc] init];
-    NSTabViewItem *cpuTab = [[NSTabViewItem alloc] initWithIdentifier:@"cpu"];
-    cpuTab.label = @(kTabNames[0]);
-    cpuTab.view = [self buildCpuTab];
-    _basicItem = [[NSTabViewItem alloc] initWithIdentifier:@"basic"];
-    _basicItem.label = @(kTabNames[1]);
-    _basicItem.view = [self buildBasicTab];
-    NSTabViewItem *memTab = [[NSTabViewItem alloc] initWithIdentifier:@"memory"];
-    memTab.label = @(kTabNames[2]);
-    memTab.view = [self buildMemoryTab];
-    NSTabViewItem *bpTab = [[NSTabViewItem alloc] initWithIdentifier:@"breakpoints"];
-    bpTab.label = @(kTabNames[3]);
-    bpTab.view = [self buildBreaksTab];
-    NSTabViewItem *wtTab = [[NSTabViewItem alloc] initWithIdentifier:@"watches"];
-    wtTab.label = @(kTabNames[4]);
-    wtTab.view = [self buildWatchesTab];
-    NSTabViewItem *cartTab = [[NSTabViewItem alloc] initWithIdentifier:@"cart"];
-    cartTab.label = @(kTabNames[5]);
-    cartTab.view = [self buildCartTab];
-    NSTabViewItem *traceTab = [[NSTabViewItem alloc] initWithIdentifier:@"trace"];
-    traceTab.label = @(kTabNames[6]);
-    traceTab.view = [self buildHistTab:0];
-    NSTabViewItem *histTab = [[NSTabViewItem alloc] initWithIdentifier:@"history"];
-    histTab.label = @(kTabNames[7]);
-    histTab.view = [self buildHistTab:1];
-    NSTabViewItem *sticTab =
-        [[NSTabViewItem alloc] initWithIdentifier:@"stic"];
-    sticTab.label = @(kTabNames[8]);
-    sticTab.view = [self buildSticTab];
-    NSTabViewItem *symTab =
-        [[NSTabViewItem alloc] initWithIdentifier:@"symbols"];
-    symTab.label = @(kTabNames[9]);
-    symTab.view = [self buildSymbolsTab];
-    _fujiItem = [[NSTabViewItem alloc] initWithIdentifier:@"fujinet"];
-    _fujiItem.label = @(kTabNames[10]);
-    _fujiItem.view = [self buildFujinetTab];
-    [tabs addTabViewItem:cpuTab];
-    [tabs addTabViewItem:_basicItem];
-    [tabs addTabViewItem:memTab];
-    [tabs addTabViewItem:bpTab];
-    [tabs addTabViewItem:wtTab];
-    [tabs addTabViewItem:cartTab];
-    [tabs addTabViewItem:traceTab];
-    [tabs addTabViewItem:histTab];
-    [tabs addTabViewItem:sticTab];
-    [tabs addTabViewItem:symTab];
-    [tabs addTabViewItem:_fujiItem];
-    {
-        NSTabViewItem *all[] = { cpuTab, _basicItem, memTab, bpTab, wtTab, cartTab, traceTab, histTab,
-                                 sticTab, symTab, _fujiItem };
-        for (int i = 0; i < TAB_COUNT; i++)   /* each keeps its place when moved around */
-            _items[i] = all[i];
+    NSArray<NSView *> *pages = @[
+        [self buildConsoleTab], [self buildDisasmTab], [self buildBasicTab], [self buildMemoryTab],
+        [self buildBreaksTab], [self buildWatchesTab], [self buildCartTab], [self buildHistTab:0],
+        [self buildHistTab:1], [self buildVideoTab], [self buildSoundTab], [self buildSymbolsTab],
+        [self buildFujinetTab]
+    ];
+    for (int idx = 0; idx < TAB_COUNT; idx++) {   /* each keeps its place when moved around */
+        NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:@(kTabIds[idx])];
+        item.label = @(kTabNames[idx]);
+        item.view = pages[(NSUInteger)idx];
+        _items[idx] = item;
+        [tabs addTabViewItem:item];
     }
+    _basicItem = _items[MT_BASIC];
+    _fujiItem = _items[MT_FUJINET];
     _tabs = tabs;
     tabs.delegate = self;
     if (tabFromEnv() >= 0)
@@ -956,11 +948,9 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     [self updateHelpContext];
 
     /* The registers sit under every tab. */
-    NSScrollView *regsScroll;
-    _regs = monoView(&regsScroll);
-    [regsScroll.heightAnchor constraintEqualToConstant:44].active = YES;
+    NSView *strip = [self buildRegStrip];
 
-    NSStackView *root = [NSStackView stackViewWithViews:@[ toolbar, tabs, regsScroll ]];
+    NSStackView *root = [NSStackView stackViewWithViews:@[ toolbar, tabs, strip ]];
     root.orientation = NSUserInterfaceLayoutOrientationVertical;
     root.alignment = NSLayoutAttributeLeading;
     root.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
@@ -968,13 +958,13 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
                                         constant:-16].active = YES;
     [tabs.widthAnchor constraintEqualToAnchor:root.widthAnchor
                                      constant:-16].active = YES;
-    [regsScroll.widthAnchor constraintEqualToAnchor:root.widthAnchor
-                                           constant:-16].active = YES;
-    [tabs.heightAnchor constraintGreaterThanOrEqualToConstant:660].active =
+    [strip.widthAnchor constraintEqualToAnchor:root.widthAnchor
+                                       constant:-16].active = YES;
+    [tabs.heightAnchor constraintGreaterThanOrEqualToConstant:640].active =
         YES;
 
     _window.contentView = root;
-    [_window setContentSize:NSMakeSize(1080, 780)];
+    [_window setContentSize:NSMakeSize(1240, 860)];
     [_window center];
 }
 
@@ -1079,31 +1069,6 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
         [self refreshAll:YES];
 }
 
-- (void)cardsPrev:(id)sender
-{
-    (void)sender;
-    int page = INTVSTIC_CARDS_PER_ROW * CARD_ROWS_PER_PAGE;
-    _cardFirst -= page;
-    if (_cardFirst < 0)
-        _cardFirst = 0;
-    _seenSerial = 0;
-    if (intvdebug_is_paused(_dbg))
-        [self refreshStic];
-}
-
-- (void)cardsNext:(id)sender
-{
-    (void)sender;
-    int page = INTVSTIC_CARDS_PER_ROW * CARD_ROWS_PER_PAGE;
-    int lastPage = _cardTotal > 0 ? ((_cardTotal - 1) / page) * page : 0;
-    _cardFirst += page;
-    if (_cardFirst > lastPage)
-        _cardFirst = lastPage;
-    _seenSerial = 0;
-    if (intvdebug_is_paused(_dbg))
-        [self refreshStic];
-}
-
 /* Shows a range in the Memory tab, highlighted, on a row boundary. */
 - (void)showInMemoryLo:(uint16_t)lo hi:(uint16_t)hi
 {
@@ -1171,6 +1136,10 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     [self updateHelpContext];
     if (item == _fujiItem)
         [self refreshFujinet:NO];
+    if (item == _items[MT_VIDEO])
+        [_video refreshForce:YES];
+    if (item == _items[MT_CONSOLE])
+        [_window makeFirstResponder:_conIn];
 }
 
 /* windowShouldClose: fires whenever the window's close control (or Window >
@@ -1374,21 +1343,157 @@ static void setText(NSTextView *view, NSString *text, BOOL follow)
     [self refreshBasic:intvdebug_is_paused(_dbg)];
 }
 
+/* ---- the console, the register strip and the Poke bar ------------------------- */
+
+- (void)appendConsole:(NSString *)text
+{
+    const BOOL follow = atEnd(_conOut);   /* attr reader scrolled back keeps their place */
+    NSAttributedString *attr = [[NSAttributedString alloc]
+        initWithString:text
+            attributes:@{ NSFontAttributeName : [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular],
+                          NSForegroundColorAttributeName : NSColor.textColor }];
+    [_conOut.textStorage appendAttributedString:attr];
+    if (follow)
+        [_conOut scrollRangeToVisible:NSMakeRange(_conOut.string.length, 0)];
+}
+
+- (void)runCommand:(id)sender
+{
+    (void)sender;
+    static char out[65536];
+    NSString *cmd = [_conIn.stringValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    if (cmd.length == 0)
+        return;
+    if (![_conHistory.lastObject isEqualToString:cmd])
+        [_conHistory addObject:cmd];
+    _conPos = (NSInteger)_conHistory.count;
+    [self appendConsole:[NSString stringWithFormat:@"> %@\n", cmd]];
+    out[0] = '\0';
+    intvdebug_command(_dbg, cmd.UTF8String, out, (int)sizeof(out));
+    NSString *text = @(out) ?: @"";
+    if (text.length)
+        [self appendConsole:[text hasSuffix:@"\n"] ? text : [text stringByAppendingString:@"\n"]];
+    _conIn.stringValue = @"";
+    _seenSerial = 0;   /* attr command may have moved the machine or changed attr table */
+}
+
+/* In the console, Tab completes instead of moving the focus, and Up/Down walk
+ * the history. */
+- (BOOL)control:(NSControl *)control textView:(NSTextView *)textView doCommandBySelector:(SEL)sel
+{
+    (void)textView;
+    if (control != _conIn)
+        return NO;
+    if (sel == @selector(moveUp:) || sel == @selector(moveDown:)) {
+        const NSInteger count = (NSInteger)_conHistory.count;
+        if (count == 0)
+            return YES;
+        _conPos += sel == @selector(moveUp:) ? -1 : 1;
+        if (_conPos < 0)
+            _conPos = 0;
+        if (_conPos > count)
+            _conPos = count;
+        _conIn.stringValue = _conPos < count ? _conHistory[(NSUInteger)_conPos] : @"";
+        [_conIn.currentEditor setSelectedRange:NSMakeRange(_conIn.stringValue.length, 0)];
+        return YES;
+    }
+    if (sel != @selector(insertTab:))
+        return NO;
+    NSString *text = _conIn.stringValue;
+    const NSRange space = [text rangeOfString:@" " options:NSBackwardsSearch];
+    NSString *word = space.location == NSNotFound ? text : [text substringFromIndex:space.location + 1];
+    char comps[4096];
+    comps[0] = '\0';
+    const int count = intvdebug_completions(_dbg, word.UTF8String, comps, (int)sizeof(comps));
+    NSString *list = @(comps) ?: @"";
+    if (count == 1) {
+        NSString *completion = [list componentsSeparatedByString:@"\n"][0];
+        NSString *head = space.location == NSNotFound ? @"" : [text substringToIndex:space.location + 1];
+        _conIn.stringValue = [NSString stringWithFormat:@"%@%@ ", head, completion];
+        [_conIn.currentEditor setSelectedRange:NSMakeRange(_conIn.stringValue.length, 0)];
+    } else if (count > 1) {
+        [self appendConsole:[list hasSuffix:@"\n"] ? list : [list stringByAppendingString:@"\n"]];
+    }
+    return YES;
+}
+
+/* A bare run of hex digits is hex (the fields show hex); anything else is an
+ * expression for the core to evaluate ($1234, 0x1234, a label, r3 + 1). */
+- (BOOL)evaluate:(NSString *)text into:(long *)out why:(NSString **)why
+{
+    NSString *trim = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    const char *chars = trim.UTF8String;
+    char err[160];
+    if (!*chars) {
+        *why = @"nothing to apply";
+        return NO;
+    }
+    char *end;
+    const unsigned long hex = strtoul(chars, &end, 16);
+    if (*end == '\0') {
+        *out = (long)hex;
+        return YES;
+    }
+    err[0] = '\0';
+    if (intvdebug_eval(_dbg, chars, out, err, (int)sizeof(err)) == 0)
+        return YES;
+    *why = @(err) ?: @"does not parse";
+    return NO;
+}
+
+- (void)applyRegister:(NSTextField *)sender
+{
+    long value = 0;
+    NSString *why = nil;
+    [_window makeFirstResponder:nil];   /* leave the field, so the refresh may rewrite it */
+    if (!intvdebug_is_paused(_dbg)) {
+        _status.stringValue = @"Pause the machine (F5) to edit registers";
+    } else if (sender.tag < 0 || sender.tag >= REG_FIELDS) {
+        /* not one of ours */
+    } else if ([self evaluate:sender.stringValue into:&value why:&why]) {
+        intvdebug_regs_set(_dbg, (int)sender.tag, (unsigned)value);
+    } else {
+        _status.stringValue = [NSString stringWithFormat:@"Register: %@", why];
+    }
+    [self refreshRegs];
+    [self refreshDisasm];
+    _seenSerial = 0;
+}
+
+/* "address value ..." (hex) through the core's poke: one word per value, at the
+ * width the bus gives that address. */
+- (void)pokeMem:(id)sender
+{
+    (void)sender;
+    char out[512];
+    NSMutableArray<NSString *> *tokens = [NSMutableArray array];
+    for (NSString *tok in [_memPoke.stringValue componentsSeparatedByCharactersInSet:
+                                                    [NSCharacterSet characterSetWithCharactersInString:@" \t,"]]) {
+        if (tok.length == 0)
+            continue;
+        const char *chars = tok.UTF8String;
+        char *end;
+        (void)strtoul(chars, &end, 16);
+        [tokens addObject:*end == '\0' ? [@"$" stringByAppendingString:tok] : tok];   /* bare hex is hex */
+    }
+    if (tokens.count < 2) {
+        _memNote.stringValue = @"Type an address and one or more values.";
+        return;
+    }
+    out[0] = '\0';
+    intvdebug_command(_dbg, [@"poke " stringByAppendingString:[tokens componentsJoinedByString:@" "]].UTF8String, out,
+                      (int)sizeof(out));
+    _memNote.stringValue = [(@(out) ?: @"") stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (intvdebug_is_paused(_dbg))
+        [self refreshMem];
+}
+
 /* ---- Breakpoints, Watches, memory search ------------------------------------- */
 
-/* One line on why the machine stopped. */
-- (NSString *)stopText:(const intvdebug_stop_info *)st
+/* Why the machine stopped, worded by the core so the width is right. */
+- (NSString *)stopTextOf:(const intvdebug_snapshot *)snap
 {
-    switch (st->reason) {
-    case INTVDEBUG_STOP_WATCH_WRITE:
-        return [NSString stringWithFormat:@"wrote $%04X = $%02X (was $%02X), now at $%04X", st->addr,
-                                          st->value & 0xFF, st->old_value & 0xFF, st->pc];
-    case INTVDEBUG_STOP_WATCH_READ:
-        return [NSString stringWithFormat:@"read $%04X, now at $%04X", st->addr, st->pc];
-    case INTVDEBUG_STOP_BREAKPOINT:
-        return [NSString stringWithFormat:@"breakpoint at $%04X", st->pc];
-    }
-    return @"";
+    return snap->paused ? (@(snap->text) ?: @"") : @"";
 }
 
 /* Text for a pick list, the picked line drawn with a background. */
@@ -1398,14 +1503,14 @@ static void setPickText(PickTextView *view, NSArray<NSString *> *lines)
     NSFont *font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
     int i = 0;
     for (NSString *l in lines) {
-        NSMutableAttributedString *a = [[NSMutableAttributedString alloc]
+        NSMutableAttributedString *attr = [[NSMutableAttributedString alloc]
             initWithString:[l stringByAppendingString:@"\n"]
                 attributes:@{ NSFontAttributeName : font, NSForegroundColorAttributeName : NSColor.textColor }];
         if (i == view.picked) {
-            [a addAttribute:NSBackgroundColorAttributeName value:accentColor() range:NSMakeRange(0, a.length)];
-            [a addAttribute:NSForegroundColorAttributeName value:NSColor.whiteColor range:NSMakeRange(0, a.length)];
+            [attr addAttribute:NSBackgroundColorAttributeName value:accentColor() range:NSMakeRange(0, attr.length)];
+            [attr addAttribute:NSForegroundColorAttributeName value:accentInk() range:NSMakeRange(0, attr.length)];
         }
-        [text appendAttributedString:a];
+        [text appendAttributedString:attr];
         i++;
     }
     setAttrText(view, text);
@@ -1436,16 +1541,21 @@ static PickTextView *makePickView(NSScrollView **scrollOut)
     _bpAddr.placeholderString = @"address, lo-hi, symbol, x, #score, a(3)";
     _bpAddr.target = self;
     _bpAddr.action = @selector(addBreak:);
-    _bpCond = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
-    [_bpCond addItemsWithTitles:@[ @"any value", @"changed", @"equals", @"not equal" ]];
-    _bpCond.toolTip = @"A condition on the value written (Write and Access)";
-    _bpValue = [[NSTextField alloc] init];
-    _bpValue.placeholderString = @"value (hex)";
-    [_bpValue.widthAnchor constraintEqualToConstant:100].active = YES;
+    _bpCondition = [[NSTextField alloc] init];
+    _bpCondition.placeholderString = @"condition (optional): value != old, r0 == 5, [$0200] > 3";
+    _bpCondition.toolTip = @"An expression: r0-r7 pc sp s z o c i d, [addr], labels, frame cycles and, on an "
+                           @"access, value, addr and old (the word before a write). On a picked entry, "
+                           @"Set Condition replaces its condition";
+    _bpCondition.target = self;
+    _bpCondition.action = @selector(addBreak:);
     NSStackView *form = [NSStackView stackViewWithViews:@[
-        _bpType, _bpAddr, _bpCond, _bpValue, [self button:@"Add" action:@selector(addBreak:)]
+        _bpType, _bpAddr, _bpCondition, [self button:@"Add" action:@selector(addBreak:)],
+        [self button:@"Set Condition" action:@selector(bpSetCondition:)]
     ]];
     form.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    form.distribution = NSStackViewDistributionFill;
+    [_bpCondition setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [_bpAddr.widthAnchor constraintGreaterThanOrEqualToConstant:200].active = YES;
 
     NSScrollView *scroll;
     _bpList = makePickView(&scroll);
@@ -1538,10 +1648,10 @@ static PickTextView *makePickView(NSScrollView **scrollOut)
         setPickText(_bpList, lines);
     }
     {
-        intvdebug_stop_info st;
-        const BOOL paused = intvdebug_is_paused(_dbg);
-        NSString *why = paused && intvdebug_last_stop(_dbg, &st) ? [self stopText:&st] : @"";
-        _bpStop.stringValue = !paused ? @"Running." : why.length ? [@"Stopped: " stringByAppendingString:why] : @"Paused.";
+        intvdebug_snapshot snap;
+        intvdebug_stop_snapshot(_dbg, &snap);
+        NSString *why = [self stopTextOf:&snap];
+        _bpStop.stringValue = !snap.paused ? @"Running." : why.length ? [@"Stopped: " stringByAppendingString:why] : @"Paused.";
     }
 }
 
@@ -1565,8 +1675,8 @@ static PickTextView *makePickView(NSScrollView **scrollOut)
     const int type = (int)_bpType.indexOfSelectedItem;
     const char *text = _bpAddr.stringValue.UTF8String;
     uint16_t lo = 0, hi = 0;
-    intvdebug_bp bp;
-    memset(&bp, 0, sizeof(bp));
+    intvdebug_bp entry;
+    memset(&entry, 0, sizeof(entry));
 
     if (type == 0 ? !intvsym_parse_addr(_symtab, text, &lo)
                   : !intvsym_parse_range(_symtab, text, &lo, &hi, NULL)) {
@@ -1575,23 +1685,35 @@ static PickTextView *makePickView(NSScrollView **scrollOut)
     }
     if (type == 0)
         hi = lo;
-    bp.type = type == 0 ? INTVDEBUG_BP_EXEC : type == 1 ? INTVDEBUG_BP_READ
-              : type == 2 ? INTVDEBUG_BP_WRITE : (INTVDEBUG_BP_READ | INTVDEBUG_BP_WRITE);
-    bp.lo = lo;
-    bp.hi = hi;
-    bp.cond = (int)_bpCond.indexOfSelectedItem;
-    {
-        const char *v = _bpValue.stringValue.UTF8String;
-        if (*v == '$')
-            v++;
-        bp.value = (uint16_t)strtoul(v, NULL, 16);
-    }
-    bp.mask = lo >= 0x0100 && hi <= 0x01EF ? 0x00FF : 0xFFFF;   /* the scratchpad is 8 bits */
-    if (intvdebug_bp_add(_dbg, &bp) < 0) {
-        _status.stringValue = @"The breakpoint table is full";
+    entry.type = type == 0 ? INTVDEBUG_BP_EXEC : type == 1 ? INTVDEBUG_BP_READ
+              : type == 2 ? INTVDEBUG_BP_WRITE : INTVDEBUG_BP_ACCESS;
+    entry.lo = lo;
+    entry.hi = hi;
+    snprintf(entry.condition, sizeof(entry.condition), "%s", _bpCondition.stringValue.UTF8String);
+    if (intvdebug_bp_add(_dbg, &entry) < 0) {
+        _status.stringValue = entry.condition[0] ? @"The table is full, or the condition does not parse"
+                                              : @"The breakpoint table is full";
         return;
     }
     _bpAddr.stringValue = @"";
+    _bpCondition.stringValue = @"";
+    _seenSerial = 0;
+}
+
+/* Replaces the picked entry's condition with the condition field's text. */
+- (void)bpSetCondition:(id)sender
+{
+    (void)sender;
+    const int sel = _bpList.picked;
+    if (sel < 0 || sel >= (int)_bpIds.count) {
+        _status.stringValue = @"Pick a breakpoint in the list first";
+        return;
+    }
+    if (!intvdebug_bp_set_condition(_dbg, _bpIds[(NSUInteger)sel].intValue, _bpCondition.stringValue.UTF8String)) {
+        _status.stringValue = [NSString stringWithFormat:@"The condition does not parse: %@", _bpCondition.stringValue];
+        return;
+    }
+    _bpCondition.stringValue = @"";
     _seenSerial = 0;
 }
 
@@ -1658,17 +1780,23 @@ static PickTextView *makePickView(NSScrollView **scrollOut)
 - (void)wtBreak:(id)sender
 {
     (void)sender;
-    uint16_t lo, hi;
-    if (_wtList.picked < 0 || !intvwatch_range(_symtab, _wtList.picked, &lo, &hi))
+    uint16_t first, last;
+    if (_wtList.picked < 0 || !intvwatch_range(_symtab, _wtList.picked, &first, &last))
         return;
-    intvdebug_bp bp;
-    memset(&bp, 0, sizeof(bp));
-    bp.type = INTVDEBUG_BP_WRITE;
-    bp.lo = lo;
-    bp.hi = hi;
-    bp.cond = INTVDEBUG_COND_CHANGED;
-    bp.mask = lo >= 0x0100 && hi <= 0x01EF ? 0x00FF : 0xFFFF;
-    if (intvdebug_bp_add(_dbg, &bp) >= 0)
+    [self breakOnChangeFrom:first to:last];
+}
+
+/* A write breakpoint on first..last that fires when the value written differs from
+ * the old one (the core's `value != old`, at the right word width). */
+- (void)breakOnChangeFrom:(uint16_t)first to:(uint16_t)last
+{
+    intvdebug_bp entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.type = INTVDEBUG_BP_WRITE;
+    entry.lo = first;
+    entry.hi = last;
+    snprintf(entry.condition, sizeof(entry.condition), "value != old");
+    if (intvdebug_bp_add(_dbg, &entry) >= 0)
         _status.stringValue = @"Breaking when it changes";
     _seenSerial = 0;
 }
@@ -1729,28 +1857,79 @@ static PickTextView *makePickView(NSScrollView **scrollOut)
     return root;
 }
 
+/* Controllers, PSG I/O ports, the ECS keyboard, Intellivoice and JLP. */
+- (NSString *)ioText:(const intvdebug_io *)ports
+{
+    NSMutableString *text = [NSMutableString string];
+    [text appendString:@"\nControllers and PSG I/O\n"];
+    for (int pair = 0; pair < 2; pair++) {
+        const intvdebug_pad *pad = &ports->pad[pair];
+        if (!pad->present) {
+            [text appendFormat:@"  Pair %d (%s)  not present\n", pair, pair ? "ECS $00FE-$00FF" : "$01FE-$01FF"];
+            continue;
+        }
+        [text appendFormat:@"  Pair %d (%s)  left port %02X%s  right port %02X%s\n", pair, pair ? "ECS $00FE-$00FF" : "$01FE-$01FF",
+                        pad->side[0], pad->output[0] ? " (out)" : "", pad->side[1], pad->output[1] ? " (out)" : ""];
+        NSMutableString *held = [NSMutableString string];
+        for (int idx = 0; idx < 18; idx++) {
+            if (pad->left[idx])
+                [held appendFormat:@" L%d", idx];
+            if (pad->right[idx])
+                [held appendFormat:@" R%d", idx];
+        }
+        [text appendFormat:@"    inputs held:%@\n", held.length ? held : @" none"];
+        if (pair == 1) {
+            [text appendString:@"    ECS keyboard rows "];
+            for (int idx = 0; idx < 8; idx++)
+                [text appendFormat:@"%02X ", pad->keys[idx] & 0xFF];
+            [text appendString:@"\n"];
+        }
+    }
+    [text appendFormat:@"\nECS %s", ports->ecs ? "present" : "absent"];
+    if (ports->ecs)
+        [text appendFormat:@"  ROM windows $2xxx %d, $7xxx %d, $Exxx %d", ports->ecs_page[0], ports->ecs_page[1], ports->ecs_page[2]];
+    [text appendFormat:@"\nIntellivoice %s", ports->ivoice ? "present" : "absent"];
+    if (ports->ivoice)
+        [text appendFormat:@"  LRQ %d  ALD %d  PC %04X  %s  FIFO %u/%u", ports->ivoice_lrq, ports->ivoice_ald, ports->ivoice_pc,
+                        ports->ivoice_halted ? "halted" : "running", ports->ivoice_fifo_head, ports->ivoice_fifo_tail];
+    [text appendFormat:@"\nJLP %s", ports->jlp ? "present" : "absent"];
+    if (ports->jlp)
+        [text appendFormat:@"  accelerators %s  flash %s%@  mailbox hole %s", ports->jlp_accel ? "on" : "off",
+                        ports->jlp_flash ? "open" : "none",
+                        ports->jlp_flash ? [NSString stringWithFormat:@" (%u bytes)", ports->jlp_flash_bytes] : @"",
+                        ports->jlp_mb_hole ? "yes" : "no"];
+    [text appendFormat:@"\nLocutus mapper %s   FujiNet mailbox %s\n", ports->locutus ? "yes" : "no",
+                    ports->fujinet_mailbox ? "mapped" : "no"];
+    return text;
+}
+
 - (void)refreshCart
 {
     intvdebug_cart cart;
     intvdebug_region reg[64];
-    NSMutableString *t = [NSMutableString string];
+    NSMutableString *text = [NSMutableString string];
 
     intvdebug_cart_info(_dbg, &cart);
-    [t appendString:@"Cartridge\n"];
-    [t appendFormat:@"  File     %s\n", cart.path[0] ? cart.path : "(none)"];
+    [text appendString:@"Cartridge\n"];
+    [text appendFormat:@"  File     %s\n", cart.path[0] ? cart.path : "(none)"];
     if (cart.name[0])
-        [t appendFormat:@"  Title    %s%@\n", cart.name, cart.year ? [NSString stringWithFormat:@", %d", cart.year] : @""];
-    [t appendFormat:@"  FujiNet  %s\n", cart.fujinet_mailbox ? "mailbox mapped at $9C00" : "no mailbox"];
-    [t appendFormat:@"  ECS      %s\n", cart.ecs ? "present" : "no"];
-    [t appendFormat:@"  JLP      %s\n", cart.jlp ? "present" : "no"];
-    [t appendString:@"\nMemory map\n"];
+        [text appendFormat:@"  Title    %s%@\n", cart.name, cart.year ? [NSString stringWithFormat:@", %d", cart.year] : @""];
+    [text appendFormat:@"  FujiNet  %s\n", cart.fujinet_mailbox ? "mailbox mapped at $9C00" : "no mailbox"];
+    [text appendFormat:@"  ECS      %s\n", cart.ecs ? "present" : "no"];
+    [text appendFormat:@"  JLP      %s\n", cart.jlp ? "present" : "no"];
+    {
+        intvdebug_io ports;
+        if (intvdebug_io_get(_dbg, &ports))
+            [text appendString:[self ioText:&ports]];
+    }
+    [text appendString:@"\nMemory map\n"];
     const int n = intvdebug_memory_map(_dbg, reg, 64);
     if (!n)
-        [t appendString:@"  Pause the machine to read its memory map.\n"];
+        [text appendString:@"  Pause the machine to read its memory map.\n"];
     for (int i = 0; i < n; i++)
-        [t appendFormat:@"  %04X-%04X  %c%c  %s\n", reg[i].lo, reg[i].hi, reg[i].readable ? 'r' : '-',
+        [text appendFormat:@"  %04X-%04X  %c%c  %s\n", reg[i].lo, reg[i].hi, reg[i].readable ? 'r' : '-',
                         reg[i].writable ? 'w' : '-', reg[i].name];
-    setText(_cartText, t, NO);
+    setText(_cartText, text, NO);
 }
 
 - (NSView *)buildHistTab:(int)idx
@@ -1815,10 +1994,10 @@ static PickTextView *makePickView(NSScrollView **scrollOut)
     uint16_t lo = 0, hi = 0xFFFF;
     int filter = 0;
 
-    for (int k = 0; k < 2; k++) {   /* both Record buttons follow the engine */
-        _hRec[k].state = on ? NSControlStateValueOn : NSControlStateValueOff;
-        _hRec[k].bezelColor = on ? accentColor() : nil;
-        _hRec[k].contentTintColor = on ? NSColor.whiteColor : nil;
+    for (int pair = 0; pair < 2; pair++) {   /* both Record buttons follow the engine */
+        _hRec[pair].state = on ? NSControlStateValueOn : NSControlStateValueOff;
+        _hRec[pair].bezelColor = on ? accentColor() : nil;
+        _hRec[pair].contentTintColor = on ? accentInk() : nil;
     }
     if (!force && count == _hSeen[idx] && (live || paused))
         return;
@@ -1842,9 +2021,9 @@ static PickTextView *makePickView(NSScrollView **scrollOut)
     NSMutableString *t = [NSMutableString string];
     if (!on && n == 0)
         [t appendString:@"History is off. Press Record, then let the machine run."];
-    for (int k = shown - 1; k >= 0; k--) {   /* oldest first */
+    for (int pair = shown - 1; pair >= 0; pair--) {   /* oldest first */
         char line[256];
-        intvdebug_history_format(&buf[hit[k]], line, sizeof(line));
+        intvdebug_history_format(&buf[hit[pair]], line, sizeof(line));
         [t appendFormat:@"%s\n", line];
     }
     setText(_hText[idx], t, YES);
@@ -1925,25 +2104,24 @@ static PickTextView *makePickView(NSScrollView **scrollOut)
     _runBtn.title = paused ? @"Continue (F5)" : @"Pause (F5)";
     /* the action on offer wears the accent: Continue while stopped */
     _runBtn.bezelColor = paused ? accentColor() : nil;
-    _runBtn.contentTintColor = paused ? NSColor.whiteColor : nil;
+    _runBtn.contentTintColor = paused ? accentInk() : nil;
     {
-        intvdebug_stop_info st;
-        NSString *why = nil;
-        if (paused && intvdebug_last_stop(_dbg, &st) && st.reason != INTVDEBUG_STOP_BREAKPOINT)
-            why = [self stopText:&st];
-        _status.stringValue = why.length ? [@"Paused: " stringByAppendingString:why]
-                                         : paused ? @"Paused" : @"Running";
+        intvdebug_snapshot snap;
+        intvdebug_stop_snapshot(_dbg, &snap);
+        NSString *why = [self stopTextOf:&snap];
+        if (why.length)
+            why = [[[why substringToIndex:1] uppercaseString] stringByAppendingString:[why substringFromIndex:1]];
+        _status.stringValue = snap.paused && why.length ? why : paused ? @"Paused" : @"Running";
     }
+    [self refreshRegs];
     if (paused) {
-        [self refreshRegs];
         [self refreshDisasm];
         [self refreshMem];
-        [self refreshStic];
     } else {
         _disasm.string = @"";
-        _regs.string = @"";
         _memView.string = @"";
     }
+    [self refreshSound];
     /* Independent of run/pause -- the symbol list reflects what's loaded,
      * not machine state, and is cheap to skip when nothing changed (see
      * refreshSymbols's own comment). */
@@ -1954,6 +2132,8 @@ static PickTextView *makePickView(NSScrollView **scrollOut)
     [self refreshCart];
     [self refreshHist:0 force:NO];
     [self refreshHist:1 force:NO];
+    if ([self tabVisible:MT_VIDEO])
+        [_video refreshForce:YES];
     if ([self fujiShowing])
         [self refreshFujinet:NO];
 }
@@ -2060,14 +2240,34 @@ static PickTextView *makePickView(NSScrollView **scrollOut)
 
 - (void)refreshRegs
 {
-    intvdebug_regs r;
-    if (!intvdebug_regs_get(_dbg, &r))
+    static uint16_t previous[REG_FIELDS];
+    static BOOL havePrevious;
+    intvdebug_regs regs;
+    if (!intvdebug_regs_get(_dbg, &regs)) {
+        for (int idx = 0; idx < REG_FIELDS; idx++) {
+            _reg[idx].stringValue = @"";
+            _reg[idx].enabled = NO;
+        }
+        _regInfo.stringValue = @"";
+        havePrevious = NO;
         return;
-    _regs.string = [NSString
-        stringWithFormat:@"R0 %04X  R1 %04X  R2 %04X  R3 %04X  R4 %04X  R5 %04X  R6(SP) %04X  R7(PC) %04X\n"
-                         @"S%d C%d O%d Z%d I%d  D%d",
-                         r.r[0], r.r[1], r.r[2], r.r[3], r.r[4], r.r[5], r.r[6], r.r[7],
-                         r.S, r.C, r.O, r.Z, r.I, r.D];
+    }
+    const int flags[6] = {regs.S, regs.Z, regs.O, regs.C, regs.I, regs.D};
+    for (int idx = 0; idx < REG_FIELDS; idx++) {
+        const unsigned value = idx < 8 ? regs.r[idx] : (flags[idx - 8] ? 1u : 0u);
+        const BOOL changed = havePrevious && previous[idx] != value;
+        previous[idx] = (uint16_t)value;
+        _reg[idx].enabled = YES;
+        _reg[idx].textColor = changed ? accentLight() : NSColor.textColor;   /* moved since the last stop */
+        if (_reg[idx].currentEditor)
+            continue;   /* being typed in */
+        _reg[idx].stringValue = idx < 8 ? [NSString stringWithFormat:@"%04X", value] : [NSString stringWithFormat:@"%u", value];
+    }
+    havePrevious = YES;
+    _regInfo.stringValue = [NSString
+        stringWithFormat:@"  INTR %d BUSRQ %d  %@%@  cycle %llu  frame %u", regs.intrq, regs.busrq,
+                         regs.interruptible ? @"interruptible" : @"not interruptible",
+                         regs.D ? @", SDBD pending" : @"", (unsigned long long)regs.cycles, regs.frame];
 }
 
 - (void)refreshMem
@@ -2085,15 +2285,20 @@ static PickTextView *makePickView(NSScrollView **scrollOut)
         [text appendFormat:@"%04X ", (unsigned)rowAddr];
         for (int col = 0; col < MEM_WORDS_PER_ROW; col++) {
             int idx = row * MEM_WORDS_PER_ROW + col;
-            const uint16_t a = (uint16_t)(rowAddr + col);
+            const uint16_t addr = (uint16_t)(rowAddr + col);
             if (idx >= n)
                 continue;
             [text appendString:@" "];
-            if (_memHl && a >= _memHlLo && a <= _memHlHi)   /* a variable, symbol or hit */
-                [marks addObject:[NSValue valueWithRange:NSMakeRange(text.length, 4)]];
-            [text appendFormat:@"%04X", words[idx]];
+            /* the scratchpad, GROM/GRAM and ECS RAM are 8 bits wide: two digits, not four */
+            const BOOL narrow = intvdebug_word_width(_dbg, addr) == 8;
+            if (_memHl && addr >= _memHlLo && addr <= _memHlHi)   /* addr variable, symbol or hit */
+                [marks addObject:[NSValue valueWithRange:NSMakeRange(text.length, narrow ? 2 : 4)]];
+            if (narrow)
+                [text appendFormat:@"%02X  ", words[idx] & 0xFF];
+            else
+                [text appendFormat:@"%04X", words[idx]];
         }
-        /* Only label the first row of a run in the same region -- see
+        /* Only label the first row of addr run in the same region -- see
          * symbols.c's k_regions and the GNOME/Windows/KDE frontends' own
          * refresh_mem/refreshMem. */
         if (region && region != lastRegion)
@@ -2105,61 +2310,44 @@ static PickTextView *makePickView(NSScrollView **scrollOut)
         initWithString:text
             attributes:@{ NSFontAttributeName : [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular],
                           NSForegroundColorAttributeName : NSColor.textColor }];
-    for (NSValue *v in marks) {
-        [styled addAttribute:NSBackgroundColorAttributeName value:accentColor() range:v.rangeValue];
-        [styled addAttribute:NSForegroundColorAttributeName value:NSColor.whiteColor range:v.rangeValue];
+    for (NSValue *span in marks) {
+        [styled addAttribute:NSBackgroundColorAttributeName value:accentColor() range:span.rangeValue];
+        [styled addAttribute:NSForegroundColorAttributeName value:accentInk() range:span.rangeValue];
     }
     setAttrText(_memView, styled);
 }
 
-- (void)refreshStic
+/* The two AY-3-8914 PSGs: the chip's registers, the voices they decode to, the
+ * noise and the envelope. Only a stopped machine can be read. */
+- (void)refreshSound
 {
-    intvstic_snapshot snap;
-    char text[2048];
-
-    intvstic_snapshot_get(_dbg, &snap);
-
-    intvstic_render_backtab(&snap, _scratch);
-    _backtabView.image = imageFromRGBA(_scratch, INTVSTIC_BACKTAB_W,
-                                       INTVSTIC_BACKTAB_H, NO);
-
-    NSMutableString *mobtext = [NSMutableString
-        stringWithString:@"## X   Y  CARD CLR SZx SZy VIS PRI GRAM COLL\n"];
-    for (int i = 0; i < INTVSTIC_MOB_COUNT; i++) {
-        intvstic_mob mob;
-        intvstic_mob_get(&snap, i, &mob);
-        intvstic_render_mob(&snap, i, _scratch);
-        _mobView[i].image = imageFromRGBA(_scratch, 16, 16, YES);
-        [mobtext appendFormat:@"%d  %3d %3d  %3d  %2d  %dx  %dx  %d   %d   "
-                              @"%d    %03X\n",
-                              i, mob.x, mob.y, mob.card, mob.color,
-                              mob.x_size, mob.y_stretch, mob.visible,
-                              mob.priority, mob.gram, mob.collision];
+    NSMutableString *text = [NSMutableString string];
+    if (!intvdebug_is_paused(_dbg)) {
+        setText(_soundText, @"Pause the machine to read the sound chips.", NO);
+        return;
     }
-    _mobInfo.string = mobtext;
-
-    int total = intvstic_card_count(&snap);
-    _cardTotal = total;
-    if (_cardFirst >= total)
-        _cardFirst = 0;
-    intvstic_render_cards(&snap, _cardFirst, CARD_ROWS_PER_PAGE, _scratch);
-    _cardsView.image = imageFromRGBA(_scratch, INTVSTIC_CARDS_PER_ROW * 8,
-                                     CARD_ROWS_PER_PAGE * 8, NO);
-    {
-        int page = INTVSTIC_CARDS_PER_ROW * CARD_ROWS_PER_PAGE;
-        int lastShown =
-            (_cardFirst + page < total ? _cardFirst + page : total) - 1;
-        _cardsRangeLabel.stringValue = [NSString
-            stringWithFormat:@"cards %d–%d of %d", _cardFirst,
-                            lastShown, total];
+    for (int unit = 0; unit < 2; unit++) {
+        intvdebug_psg psg;
+        if (!intvdebug_sound_get(_dbg, unit, &psg) || !psg.present) {
+            if (unit == 1)
+                [text appendString:@"ECS PSG: not present\n"];
+            continue;
+        }
+        [text appendFormat:@"%@ (%s)\n", unit ? @"ECS PSG" : @"Base PSG", unit ? "$00F0" : "$01F0"];
+        [text appendString:@"  Registers  "];
+        for (int idx = 0; idx < 14; idx++)
+            [text appendFormat:@"%02X ", psg.reg[idx] & 0xFF];
+        [text appendString:@"\n"];
+        for (int voice = 0; voice < 3; voice++)
+            [text appendFormat:@"  Voice %c  period %4d  %8.1f Hz  tone %@  noise %@  level %2d%@  square %d\n",
+                            'A' + voice, psg.period[voice], psg.hz[voice], psg.tone_on[voice] ? @"on " : @"off",
+                            psg.noise_on[voice] ? @"on " : @"off", psg.level[voice], psg.envelope[voice] ? @" (envelope)" : @"",
+                            psg.channel_state[voice]];
+        [text appendFormat:@"  Noise      period %d\n", psg.noise_period];
+        [text appendFormat:@"  Envelope   period %d  shape %X  level %d\n\n", psg.env_period, psg.env_shape,
+                        psg.env_level];
     }
-
-    intvstic_render_palette(_dbg, _scratch);
-    _palView.image = imageFromRGBA(_scratch, INTVSTIC_PAL_CELL * 16,
-                                   INTVSTIC_PAL_CELL, NO);
-
-    intvstic_format_state(&snap, text, (int)sizeof(text));
-    _sticState.string = [NSString stringWithUTF8String:text];
+    setText(_soundText, text, NO);
 }
 
 @end

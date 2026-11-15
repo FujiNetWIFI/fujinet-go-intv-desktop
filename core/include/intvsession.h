@@ -29,6 +29,10 @@ extern "C" {
 
 /* The dark green of the icon: the highlight for toggle buttons (white text). */
 #define INTVSESSION_ACCENT_RGB 0x1E4912
+/* Ink on the accent fill, and the accent as text or lines on a dark theme
+ * (0x1E4912 on a dark background is only ~1.5:1). */
+#define INTVSESSION_ACCENT_INK_RGB 0xFFFFFF
+#define INTVSESSION_ACCENT_LIGHT_RGB 0x7BC653
 
 /* Fixed geometry -- unlike the CoCo's, the Intellivision's STIC output does
  * not vary at runtime. See core/jzintv/intv_frame.h. */

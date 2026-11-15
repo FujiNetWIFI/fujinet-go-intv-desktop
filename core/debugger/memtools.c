@@ -11,7 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "memtools.h"
+#include "intvmemtools.h"
+#include "symbols.h"
 
 /* ---- ranges -------------------------------------------------------------------- */
 
@@ -71,7 +72,7 @@ int intvsym_parse_range(const intvsymtab *t, const char *text, uint16_t *lo,
         return 0;
     *lo = *hi = a;
     if (width)
-        *width = a >= 0x0100 && a <= 0x01EF ? 8 : 16;
+        *width = intvdebug_word_width(NULL, a);
     return 1;
 }
 
@@ -283,7 +284,7 @@ int intvsearch_next(intvdebug *d, const uint16_t *pattern, int n, uint16_t mask,
 int intvbp_describe(const intvdebug_bp *bp, const intvsymtab *t, char *dst, int dstsz)
 {
     const char *type;
-    char sym[64] = "", cond[48] = "";
+    char sym[64] = "", cond[160] = "";
     int len;
 
     switch (bp->type & (INTVDEBUG_BP_READ | INTVDEBUG_BP_WRITE)) {
@@ -297,7 +298,9 @@ int intvbp_describe(const intvdebug_bp *bp, const intvsymtab *t, char *dst, int 
         if (intvsymtab_lookup_addr(t, bp->lo, name, sizeof(name)))
             snprintf(sym, sizeof(sym), "  %s", name);
     }
-    if (bp->type & INTVDEBUG_BP_WRITE) {
+    if (bp->condition[0]) {
+        snprintf(cond, sizeof(cond), "  if %s", bp->condition);
+    } else if (bp->type & INTVDEBUG_BP_WRITE) {
         const unsigned mask = bp->mask ? bp->mask : 0xFFFF;
         if (bp->cond == INTVDEBUG_COND_CHANGED)
             snprintf(cond, sizeof(cond), "  if changed");

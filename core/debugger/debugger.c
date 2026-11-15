@@ -11,46 +11,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
-/*
- * cfg/cfg.h's cfg_t embeds every peripheral's struct directly (not through
- * pointers), so every one of these headers has to be visible before cfg.h
- * is, in the same order jzintv.c (and core/jzintv/intv_host.c) uses them.
- */
-#include "config.h"
-#include "lzoe/lzoe.h"
-#include "file/file.h"
-#include "periph/periph.h"
-#include "cp1600/cp1600.h"
-#include "mem/mem.h"
-#include "ecs/ecs.h"
-#include "icart/icart.h"
-#include "bincfg/bincfg.h"
-#include "bincfg/legacy.h"
-#include "pads/pads.h"
-#include "pads/pads_cgc.h"
-#include "pads/pads_intv2pc.h"
-#include "avi/avi.h"
-#include "gfx/gfx.h"
-#include "gfx/palette.h"
-#include "snd/snd.h"
-#include "ay8910/ay8910.h"
-#include "demo/demo.h"
-#include "stic/stic.h"
-#include "speed/speed.h"
-#include "debug/debug_.h"
-#include "debug/debug_if.h"
-#include "debug/debug_dasm1600.h"
-#include "event/event.h"
-#include "ivoice/ivoice.h"
-#include "jlp/jlp.h"
-#include "fujinet/fujibus.h"
-#include "fujinet/fujinet.h"
-#include "locutus/locutus_adapt.h"
-#include "cheat/cheat.h"
-#include "cfg/mapping.h"
-#include "cfg/cfg.h"
+/* cfg/cfg.h's cfg_t embeds every peripheral's struct directly: see machine.h. */
+#include "machine.h"
+#include "cp1600/op_decode.h"
+#include "cp1600/op_exec.h"
 
+#include "debugger_internal.h"
+#include "expr.h"
 #include "fujitrace.h"
 #include "intv_host.h"
 #include "intvdebug.h"
@@ -62,13 +31,20 @@ struct intvdebug {
     int engaged;
     pthread_mutex_t lock;
     pthread_cond_t  cond;
-    int paused;      /* the emulator thread is blocked inside the hook */
+    int paused;      /* the emulator thread is blocked inside the hook; read and
+                      * written with the helpers below, never plainly */
     int step_mode;   /* 1: step_count stays 1 (single-instruction ticks);
                       * 0: step_count is huge (only real breakpoints tick) */
     int line_mode;   /* LINE_*: a by-BASIC-line step is in flight; step_mode
                       * is 1 too, and the hook keeps going until a line starts */
     uint16_t line_r6;/* R6 when that step began */
-    uint64_t stop_serial;
+    uint64_t stop_serial;   /* atomic, see paused */
+    unsigned generation;    /* atomic: bumped by anything a UI should redraw for */
+
+    /* A one-shot breakpoint (step over/out, run to) the current run armed;
+     * any stop disarms it so it cannot fire later out of the blue. */
+    int      oneshot_armed;
+    uint16_t oneshot_addr;
 
     /* The breakpoint/watchpoint table. bp_lock guards it and the hit record
      * (the emulator thread takes it from the watch callback). */
@@ -79,6 +55,7 @@ struct intvdebug {
     unsigned bp_gen;
     int      watch_dirty;       /* the bus registration needs rebuilding */
     int      watch_hit;         /* a watchpoint fired: INTVDEBUG_STOP_WATCH_* */
+    int      exec_hit_id;       /* the execute entry that fired (0: none, or a one-shot) */
     int      pause_req;         /* intvdebug_pause asked for this stop */
     intvdebug_stop_info hit;    /* the watchpoint that fired */
     intvdebug_stop_info last;   /* why the machine last stopped */
@@ -106,25 +83,256 @@ intvdebug *intvdebug_get(void)
     return &g_debug;
 }
 
-/* Called synchronously on the EMULATOR thread, from inside cp1600_run's
- * do_instr_tick (see intvdebug.h's header comment). Blocks right here
- * until intvdebug_resume/step/step_over/step_out wakes it -- that block IS
- * the pause, there is no other place progress could be stopped.
- *
- * Engaging registers this hook, but that alone must NOT stop anything:
- * cp1600_run() reaches its do_instr_tick label -- and so calls this --
- * once per outer timeslice regardless of step_count (whenever the inner
- * instruction loop merely runs out of cycles to spend, not just when
- * steps_remaining hits 0), so a routine, nothing-actually-requested
- * invocation happens roughly every periph-tick batch even while running
- * free. Block only when there is an actual reason to: a real or one-shot
- * breakpoint just fired (cp1600->hit_breakpoint), or single-step mode is
- * active (d->step_mode, which is exactly the flag intvdebug_pause/step set
- * to force every instruction to reach here). Anything else is a no-op
- * return, and free-running costs one extra periph_t-level call per
- * timeslice -- not per instruction. */
-static void watch_apply(intvdebug *d);
-static int bp_find_exec(const intvdebug *d, uint16_t addr);
+/* ---- the fields a UI thread reads without a lock ---------------------------- */
+
+static int paused_now(const intvdebug *dbg)
+{
+    return __atomic_load_n(&dbg->paused, __ATOMIC_ACQUIRE);
+}
+
+static void paused_set(intvdebug *dbg, int value)
+{
+    __atomic_store_n(&dbg->paused, value, __ATOMIC_RELEASE);
+}
+
+static void bump(intvdebug *dbg)
+{
+    __atomic_fetch_add(&dbg->generation, 1u, __ATOMIC_RELEASE);
+}
+
+unsigned intvdebug_generation(const intvdebug *dbg)
+{
+    return __atomic_load_n(&dbg->generation, __ATOMIC_ACQUIRE);
+}
+
+/* ---- widths, and reading the bus without disturbing it ---------------------- */
+
+int intvdebug_word_width(const intvdebug *dbg, uint16_t addr)
+{
+    if (addr >= 0x0100 && addr <= 0x01FF)
+        return 8;
+    if (addr >= 0x3000 && addr <= 0x3FFF)
+        return 8;
+    if (dbg && addr >= 0x4000 && addr <= 0x47FF && intv.ecs_enable > 0)
+        return 8;   /* the ECS's RAM */
+    return 16;
+}
+
+static uint16_t width_mask(uint16_t addr)
+{
+    return intvdebug_word_width(&g_debug, addr) == 8 ? 0x00FF : 0xFFFF;
+}
+
+static periph_t g_watch;        /* answers on the bins that hold a watchpoint */
+static periph_bus_t *g_watch_bus;
+static volatile int g_quiet;    /* a debugger poke is in flight: no watchpoint sees it */
+
+/* What the devices on the bus would answer for a read at addr, asked of each
+ * directly. periph_peek() would do the same but resets bus->busy and
+ * bus->req, which is fatal in the middle of the access that is being
+ * watched, so the watch hooks and the expressions come here. The ECS UART's
+ * receive byte ($00E1) reads the tape file: it is never asked. */
+static uint32_t bus_peek(periph_bus_t *bus, uint16_t addr)
+{
+    uint32_t data = bus->data_mask;
+    const uint32_t bin = ((uint32_t)addr & bus->addr_mask) >> bus->decode_shift;
+    int col;
+
+    if (addr == 0x00E1)
+        return 0;
+    for (col = 0; col < MAX_PERIPH_BIN && bus->rd[col][bin]; col++) {
+        periph_t *const dev = bus->rd[col][bin];
+        if (dev == &g_watch || dev->busy || !dev->peek)
+            continue;
+        data &= dev->peek(dev, &bus->periph, ((uint32_t)addr - dev->addr_base) & dev->addr_mask, data);
+    }
+    return data;
+}
+
+static uint16_t machine_word(uint16_t addr)
+{
+    periph_bus_t *const bus = intv.intv;
+    return bus ? (uint16_t)(bus_peek(bus, addr) & 0xFFFF) : 0xFFFF;
+}
+
+static uint32_t frame_of(uint64_t cycles)
+{
+    const uint64_t length = intv.stic.pal ? 19968u : 14934u;
+    return (uint32_t)(cycles / length);
+}
+
+/* ---- expressions -------------------------------------------------------------- */
+
+typedef struct {
+    int check;      /* only validating: every known name answers 0, memory reads 0 */
+    int hook;       /* on the emulator thread, inside a hook: the machine may be read */
+    int access;     /* value/addr/old are defined */
+    uint16_t value, addr, old, from_pc;
+    int need_stop;  /* set when a name needed a stopped machine */
+} evalenv;
+
+static int env_readable(const evalenv *env)
+{
+    return env->check || env->hook || paused_now(&g_debug);
+}
+
+static int register_index(const char *name)
+{
+    if ((name[0] == 'r' || name[0] == 'R') && name[1] >= '0' && name[1] <= '7' && !name[2])
+        return name[1] - '0';
+    if (!strcasecmp(name, "sp"))
+        return 6;
+    if (!strcasecmp(name, "pc"))
+        return 7;
+    return -1;
+}
+
+static int expr_name(void *user, const char *name, long *out)
+{
+    evalenv *const env = user;
+    cp1600_t *const cpu = &intv.cp1600;
+    const int reg = register_index(name);
+    uint16_t label;
+
+    if (reg >= 0) {
+        if (!env_readable(env)) {
+            env->need_stop = 1;
+            return 0;
+        }
+        *out = env->check ? 0
+               : reg == 7 && env->access ? (long)env->from_pc : (long)cpu->r[reg];
+        return 1;
+    }
+    if (name[1] == '\0' && strchr("szocidSZOCID", name[0])) {
+        if (!env_readable(env)) {
+            env->need_stop = 1;
+            return 0;
+        }
+        switch (name[0] | 0x20) {
+        case 's': *out = cpu->S ? 1 : 0; break;
+        case 'z': *out = cpu->Z ? 1 : 0; break;
+        case 'o': *out = cpu->O ? 1 : 0; break;
+        case 'c': *out = cpu->C ? 1 : 0; break;
+        case 'i': *out = cpu->I ? 1 : 0; break;
+        default:  *out = cpu->D ? 1 : 0; break;
+        }
+        if (env->check)
+            *out = 0;
+        return 1;
+    }
+    if (!strcasecmp(name, "frame") || !strcasecmp(name, "cycles")) {
+        if (!env_readable(env)) {
+            env->need_stop = 1;
+            return 0;
+        }
+        *out = env->check ? 0
+               : !strcasecmp(name, "cycles") ? (long)cpu->periph.now : (long)frame_of(cpu->periph.now);
+        return 1;
+    }
+    if (env->access && !strcasecmp(name, "value")) {
+        *out = env->value;
+        return 1;
+    }
+    if (env->access && !strcasecmp(name, "addr")) {
+        *out = env->addr;
+        return 1;
+    }
+    if (env->access && !strcasecmp(name, "old")) {
+        *out = env->old;
+        return 1;
+    }
+    if (env->check && (!strcasecmp(name, "value") || !strcasecmp(name, "addr") || !strcasecmp(name, "old"))) {
+        *out = 0;
+        return 1;
+    }
+    if (intvsymtab_lookup_name(intvsymtab_shared(), name, &label)) {
+        *out = label;
+        return 1;
+    }
+    return 0;
+}
+
+static uint16_t expr_read_word(void *user, uint16_t addr)
+{
+    evalenv *const env = user;
+    if (env->check)
+        return 0;
+    if (!env_readable(env)) {
+        env->need_stop = 1;
+        return 0;
+    }
+    return machine_word(addr);
+}
+
+static int eval_env(evalenv *env, const char *text, long *out, char *err, int errsz)
+{
+    const intvexpr_ctx ctx = { expr_name, expr_read_word, env };
+    int status = intvexpr_eval(text, &ctx, out, err, errsz);
+    if (status != 0 && env->need_stop && err && errsz > 0)
+        snprintf(err, (size_t)errsz, "the machine is running (stop it first)");
+    if (status == 0 && env->need_stop) {
+        if (err && errsz > 0)
+            snprintf(err, (size_t)errsz, "the machine is running (stop it first)");
+        status = -1;
+    }
+    return status;
+}
+
+int intvdebug_eval(intvdebug *dbg, const char *text, long *out, char *err, int errsz)
+{
+    evalenv env;
+    (void)dbg;
+    memset(&env, 0, sizeof(env));
+    return eval_env(&env, text, out, err, errsz);
+}
+
+/* Does the condition parse, and name only things that exist? */
+static int condition_parses(const char *text)
+{
+    evalenv env;
+    long ignored;
+    char err[64];
+    if (!text || !text[0])
+        return 1;
+    memset(&env, 0, sizeof(env));
+    env.check = 1;
+    return eval_env(&env, text, &ignored, err, sizeof(err)) == 0;
+}
+
+/* Evaluates one entry's condition for an access (or, with access == 0, for an
+ * execute stop). A condition that fails to evaluate stops rather than hides. */
+static int condition_true(const intvdebug_bp *point, int access, uint16_t value, uint16_t old,
+                          uint16_t addr, uint16_t from_pc)
+{
+    if (point->condition[0]) {
+        evalenv env;
+        long result = 0;
+        char err[64];
+        memset(&env, 0, sizeof(env));
+        env.hook = 1;
+        env.access = access;
+        env.value = value;
+        env.old = old;
+        env.addr = addr;
+        env.from_pc = from_pc;
+        if (eval_env(&env, point->condition, &result, err, sizeof(err)) != 0)
+            return 1;
+        return result != 0;
+    }
+    if (access && point->cond != INTVDEBUG_COND_ANY) {
+        const uint16_t mask = point->mask ? point->mask : 0xFFFF;
+        if (point->cond == INTVDEBUG_COND_CHANGED)
+            return (value & mask) != (old & mask);
+        if (point->cond == INTVDEBUG_COND_EQ)
+            return (value & mask) == (point->value & mask);
+        if (point->cond == INTVDEBUG_COND_NE)
+            return (value & mask) != (point->value & mask);
+    }
+    return 1;
+}
+
+static void watch_apply(intvdebug *dbg);
+static int bp_find_exec(const intvdebug *dbg, uint16_t addr);
 
 /* Strips what dasm1600 puts in front of the mnemonic: the instruction's own
  * address and its opcode words ("   $50CD  0004 0150 00D5   JSR  R5,$50D5"). */
@@ -154,27 +362,43 @@ static const char *dasm_body(const char *t)
     return t;
 }
 
-static void hist_record(intvdebug *d)
+/* Records what the hook was just called for. A breakpoint stop (cycles < 0)
+ * is an instruction that has not run, so it records nothing; an interrupt
+ * entry records where the interrupted code was; the clock is the CPU's own
+ * (periph.now), not tot_cycle, which only catches up at the end of a
+ * timeslice. */
+static void hist_record(intvdebug *dbg, int cycles)
 {
-    cp1600_t *const cp = &intv.cp1600;
-    const uint64_t n = d->hist_count;
-    intvdebug_hist *h;
-    int i;
+    cp1600_t *const cpu = &intv.cp1600;
+    const uint64_t count = dbg->hist_count;
+    const unsigned ack = cpu->req_ack_state;
+    intvdebug_hist *entry;
+    int word;
 
-    if (!d->hist)
+    if (!dbg->hist || cycles < 0)
         return;
-    h = &d->hist[n & (INTVDEBUG_HISTORY_SIZE - 1)];
-    h->pc = (uint16_t)cp->oldpc;
-    for (i = 0; i < 3; i++)
-        h->w[i] = (uint16_t)CP1600_PK(cp, (uint16_t)(h->pc + i));
-    for (i = 0; i < 8; i++)
-        h->r[i] = cp->r[i];
-    h->flags = (uint16_t)((cp->S ? 1 : 0) | (cp->C ? 2 : 0) | (cp->O ? 4 : 0) | (cp->Z ? 8 : 0) |
-                          (cp->I ? 16 : 0) | (cp->D ? 32 : 0));
-    h->cycle = cp->tot_cycle;
-    h->event = (cp->req_ack_state & CP1600_INTAK) ? INTVDEBUG_EV_INTERRUPT
-               : (cp->req_ack_state & CP1600_BUSAK) ? INTVDEBUG_EV_BUS : INTVDEBUG_EV_NONE;
-    d->hist_count = n + 1;
+    entry = &dbg->hist[count & (INTVDEBUG_HISTORY_SIZE - 1)];
+    if (ack & CP1600_INTAK) {
+        entry->event = INTVDEBUG_EV_INTERRUPT;
+        entry->pc = machine_word((uint16_t)(cpu->r[6] - 1));   /* the PC it just pushed */
+    } else if (ack & CP1600_BUSAK) {
+        entry->event = INTVDEBUG_EV_BUS;
+        entry->pc = (uint16_t)cpu->r[7];
+    } else if (cycles == 0) {
+        return;   /* nothing ran: the reset that starts the machine */
+    } else {
+        entry->event = INTVDEBUG_EV_NONE;
+        entry->pc = (uint16_t)cpu->oldpc;
+    }
+    for (word = 0; word < 3; word++)
+        entry->w[word] = machine_word((uint16_t)(entry->pc + word));
+    for (word = 0; word < 8; word++)
+        entry->r[word] = cpu->r[word];
+    entry->flags = (uint16_t)((cpu->S ? 1 : 0) | (cpu->C ? 2 : 0) | (cpu->O ? 4 : 0) | (cpu->Z ? 8 : 0) |
+                              (cpu->I ? 16 : 0) | (cpu->D ? 32 : 0));
+    entry->cycle = cpu->periph.now;
+    entry->frame = frame_of(cpu->periph.now);
+    dbg->hist_count = count + 1;
 }
 
 /* Was the instruction that just ran a JSR? Its destination's first word is
@@ -192,20 +416,89 @@ static int prev_was_call(void)
     return strstr(text, "JSR") != NULL;
 }
 
+/* An execute breakpoint fired: does one of the entries at this PC want the
+ * stop? A false condition lets the machine run on. Counts the hit and names
+ * the entry. With no entry at all (a one-shot, or one just deleted) it stops. */
+static int exec_stop_wanted(intvdebug *dbg)
+{
+    const uint16_t stop_pc = (uint16_t)intv.cp1600.r[7];
+    int idx, found = 0, wanted = 0;
+
+    pthread_mutex_lock(&dbg->bp_lock);
+    dbg->exec_hit_id = 0;
+    for (idx = 0; idx < dbg->nbp; idx++) {
+        intvdebug_bp *const point = &dbg->bps[idx];
+        if (!(point->type & INTVDEBUG_BP_EXEC) || point->lo != stop_pc || !point->enabled)
+            continue;
+        found = 1;
+        if (condition_true(point, 0, 0, 0, stop_pc, stop_pc)) {
+            wanted = 1;
+            point->hits++;
+            if (!dbg->exec_hit_id)
+                dbg->exec_hit_id = point->id;
+        }
+    }
+    if (wanted)
+        dbg->bp_gen++;
+    pthread_mutex_unlock(&dbg->bp_lock);
+    return found ? wanted : 1;
+}
+
+static void oneshot_disarm(intvdebug *dbg)
+{
+    if (dbg->oneshot_armed)
+        cp1600_clr_breakpt(&intv.cp1600, dbg->oneshot_addr, CP1600_BKPT_ONCE);
+    dbg->oneshot_armed = 0;
+}
+
+static void oneshot_arm(intvdebug *dbg, uint16_t addr)
+{
+    oneshot_disarm(dbg);
+    cp1600_set_breakpt(&intv.cp1600, addr, CP1600_BKPT_ONCE);
+    dbg->oneshot_addr = addr;
+    dbg->oneshot_armed = 1;
+}
+
+/* Called synchronously on the EMULATOR thread, from inside cp1600_run's
+ * do_instr_tick (see intvdebug.h's header comment). Blocks right here
+ * until intvdebug_resume/step/step_over/step_out wakes it -- that block IS
+ * the pause, there is no other place progress could be stopped.
+ *
+ * Engaging registers this hook, but that alone must NOT stop anything:
+ * cp1600_run() reaches its do_instr_tick label -- and so calls this --
+ * once per outer timeslice regardless of step_count (whenever the inner
+ * instruction loop merely runs out of cycles to spend, not just when
+ * steps_remaining hits 0), so a routine, nothing-actually-requested
+ * invocation happens roughly every periph-tick batch even while running
+ * free. Block only when there is an actual reason to: a real or one-shot
+ * breakpoint just fired (cp1600->hit_breakpoint), or single-step mode is
+ * active (dbg->step_mode, which is exactly the flag intvdebug_pause/step set
+ * to force every instruction to reach here). Anything else is a no-op
+ * return, and free-running costs one extra periph_t-level call per
+ * timeslice -- not per instruction. */
 static uint32_t debug_tick(periph_t *req, uint32_t cycles)
 {
+    intvdebug *const dbg = &g_debug;
+    cp1600_t *const cpu = &intv.cp1600;
+    uint64_t serial;
     (void)req;
-    (void)cycles;
-    intvdebug *const d = &g_debug;
 
-    if (d->hist_on)
-        hist_record(d);   /* the instruction that just ran, lock-free */
+    if (dbg->hist_on)
+        hist_record(dbg, (int)cycles);   /* the instruction that just ran, lock-free */
 
-    pthread_mutex_lock(&d->lock);
-    if (d->watch_dirty)
-        watch_apply(d);   /* a watchpoint was added while running */
-    if (intv.cp1600.hit_breakpoint == BK_NONE && !d->step_mode) {
-        pthread_mutex_unlock(&d->lock);
+    pthread_mutex_lock(&dbg->lock);
+    if (dbg->watch_dirty)
+        watch_apply(dbg);   /* a watchpoint was added while running */
+    if (cpu->hit_breakpoint == BK_NONE && !dbg->step_mode) {
+        pthread_mutex_unlock(&dbg->lock);
+        return 0;
+    }
+
+    /* An execute breakpoint whose condition is false is not a stop: the
+     * instruction there has not run, so the next pass executes it. */
+    if (cpu->hit_breakpoint == BK_BREAKPOINT && !dbg->watch_hit && !exec_stop_wanted(dbg)) {
+        cpu->hit_breakpoint = BK_NONE;
+        pthread_mutex_unlock(&dbg->lock);
         return 0;
     }
 
@@ -213,84 +506,87 @@ static uint32_t debug_tick(periph_t *req, uint32_t cycles)
      * the first word of a BASIC line at an acceptable stack depth (a real
      * breakpoint still stops it, below). The stack grows upward on the
      * CP-1610, so a callee runs at a larger R6 than its caller. */
-    if (d->line_mode != LINE_NONE && intv.cp1600.hit_breakpoint == BK_NONE) {
-        const uint16_t sp = intv.cp1600.r[6];
-        int stop = intvsrcmap_is_line_start(intvsrcmap_shared(),
-                                            intv.cp1600.r[7]);
-        if (stop && d->line_mode == LINE_OVER && sp > d->line_r6)
+    if (dbg->line_mode != LINE_NONE && cpu->hit_breakpoint == BK_NONE) {
+        const uint16_t stack_top = cpu->r[6];
+        int stop = intvsrcmap_is_line_start(intvsrcmap_shared(), cpu->r[7]);
+        if (stop && dbg->line_mode == LINE_OVER && stack_top > dbg->line_r6)
             stop = 0;
-        if (stop && d->line_mode == LINE_OUT && sp >= d->line_r6)
+        if (stop && dbg->line_mode == LINE_OUT && stack_top >= dbg->line_r6)
             stop = 0;
-        if (stop && d->line_mode == LINE_OVER && prev_was_call())
+        if (stop && dbg->line_mode == LINE_OVER && prev_was_call())
             stop = 0;
         if (!stop) {
-            pthread_mutex_unlock(&d->lock);
+            pthread_mutex_unlock(&dbg->lock);
             return 0;
         }
     }
-    d->line_mode = LINE_NONE;
+    dbg->line_mode = LINE_NONE;
+    oneshot_disarm(dbg);
 
-    /* Why we are stopping, for the status line and the Breakpoints tab. */
-    pthread_mutex_lock(&d->bp_lock);
-    memset(&d->last, 0, sizeof(d->last));
-    if (d->watch_hit) {
-        d->last = d->hit;
-        d->last.reason = d->watch_hit;
-        d->watch_hit = 0;
-    } else if (intv.cp1600.hit_breakpoint != BK_NONE) {
-        const int i = bp_find_exec(d, intv.cp1600.r[7]);
-        d->last.reason = INTVDEBUG_STOP_BREAKPOINT;
-        if (i >= 0 && d->bps[i].enabled && intv.cp1600.hit_breakpoint == BK_BREAKPOINT) {
-            d->last.bp_id = d->bps[i].id;
-            d->bps[i].hits++;
-            d->bp_gen++;
-        }
-    } else if (d->pause_req) {
-        d->last.reason = INTVDEBUG_STOP_PAUSE;
+    /* Why we are stopping, for the status line and the Breakpoints tab. The
+     * reason, the PC, the serial and the paused flag are published together
+     * under bp_lock, serial first: a poller that sees paused sees all of it. */
+    pthread_mutex_lock(&dbg->bp_lock);
+    memset(&dbg->last, 0, sizeof(dbg->last));
+    if (dbg->watch_hit) {
+        dbg->last = dbg->hit;
+        dbg->last.reason = dbg->watch_hit;
+        dbg->watch_hit = 0;
+    } else if (cpu->hit_breakpoint != BK_NONE) {
+        dbg->last.reason = INTVDEBUG_STOP_BREAKPOINT;
+        if (cpu->hit_breakpoint == BK_BREAKPOINT)
+            dbg->last.bp_id = dbg->exec_hit_id;
+    } else if (dbg->pause_req) {
+        dbg->last.reason = INTVDEBUG_STOP_PAUSE;
     } else {
-        d->last.reason = INTVDEBUG_STOP_STEP;
+        dbg->last.reason = INTVDEBUG_STOP_STEP;
     }
-    d->pause_req = 0;
-    d->last.pc = intv.cp1600.r[7];
-    if (d->last.reason == INTVDEBUG_STOP_BREAKPOINT || d->last.reason == INTVDEBUG_STOP_STEP ||
-        d->last.reason == INTVDEBUG_STOP_PAUSE)
-        d->last.addr = d->last.pc;
-    d->last.serial = d->stop_serial + 1;
-    pthread_mutex_unlock(&d->bp_lock);
+    dbg->exec_hit_id = 0;
+    dbg->pause_req = 0;
+    dbg->last.pc = (uint16_t)cpu->r[7];
+    if (dbg->last.reason == INTVDEBUG_STOP_BREAKPOINT || dbg->last.reason == INTVDEBUG_STOP_STEP ||
+        dbg->last.reason == INTVDEBUG_STOP_PAUSE) {
+        dbg->last.addr = dbg->last.pc;
+        dbg->last.from_pc = dbg->last.pc;
+    }
+    serial = __atomic_load_n(&dbg->stop_serial, __ATOMIC_RELAXED) + 1;
+    dbg->last.serial = serial;
+    __atomic_store_n(&dbg->stop_serial, serial, __ATOMIC_RELEASE);
+    paused_set(dbg, 1);
+    pthread_mutex_unlock(&dbg->bp_lock);
+    bump(dbg);
 
-    d->paused = 1;
-    d->stop_serial++;
     /* Clear it now, not just at the top of the next cp1600_run() call:
      * that call resets it once per invocation, not once per do_instr_tick
      * within it, and cp1600_run can call this hook several times per
      * invocation. Leaving a stale BK_BREAKPOINT/BK_TRACEPOINT here would
      * make every do_instr_tick for the rest of that invocation look like
      * another breakpoint hit, even after resuming. */
-    intv.cp1600.hit_breakpoint = BK_NONE;
-    while (d->paused)
-        pthread_cond_wait(&d->cond, &d->lock);
+    cpu->hit_breakpoint = BK_NONE;
+    while (paused_now(dbg))
+        pthread_cond_wait(&dbg->cond, &dbg->lock);
 
     /* Set the run mode for what happens next, decided by whoever woke us
      * (intvdebug_resume clears step_mode, intvdebug_step/step_over/
      * step_out set or clear it as appropriate -- see each). */
-    intv.cp1600.step_count = (d->step_mode || d->hist_on) ? 1 : ~0U;
+    cpu->step_count = (dbg->step_mode || dbg->hist_on) ? 1 : ~0U;
     /* step_count only feeds steps_remaining when that reaches 0. Pausing out
      * of a free run leaves it at ~step_count minus whatever ran, so a Step
      * would run on until the next timeslice (or breakpoint) instead of one
      * instruction. Restart the countdown here, on the emulator thread:
      * 1 = stop after the next instruction, 0 = unlimited (cp1600_run then
      * refills it from step_count). */
-    intv.cp1600.steps_remaining = (d->step_mode || d->hist_on) ? 1 : 0;
-    pthread_mutex_unlock(&d->lock);
+    cpu->steps_remaining = (dbg->step_mode || dbg->hist_on) ? 1 : 0;
+    pthread_mutex_unlock(&dbg->lock);
 
     return 0; /* NEVER CYC_MAX -- that aborts cp1600_run's whole timeslice. */
 }
 
 static void rearm_hook(void);
 
-void intvdebug_set_engaged(intvdebug *d, int engaged)
+void intvdebug_set_engaged(intvdebug *dbg, int engaged)
 {
-    if (engaged == d->engaged)
+    if (engaged == dbg->engaged)
         return;
     /* The first time anything engages, ask the host to call us back after
      * every cfg_init (a session restart). Not installed unless a debugger is
@@ -298,32 +594,32 @@ void intvdebug_set_engaged(intvdebug *d, int engaged)
     intv_host_set_post_init_hook(rearm_hook);
 
     if (engaged) {
-        d->engaged = 1;
+        dbg->engaged = 1;
         cp1600_instr_tick(&intv.cp1600, debug_tick, NULL);
-        if (d->hist_on)
+        if (dbg->hist_on)
             intv.cp1600.step_count = 1;
     } else {
-        intvdebug_resume(d); /* never leave the emulator thread parked */
-        d->engaged = 0;
+        intvdebug_resume(dbg); /* never leave the emulator thread parked */
+        dbg->engaged = 0;
         cp1600_instr_tick(&intv.cp1600, NULL, NULL);
         intv.cp1600.step_count = ~0U;
     }
 }
 
-int intvdebug_is_engaged(const intvdebug *d)
+int intvdebug_is_engaged(const intvdebug *dbg)
 {
-    return d->engaged;
+    return dbg->engaged;
 }
 
-void intvdebug_pause(intvdebug *d)
+void intvdebug_pause(intvdebug *dbg)
 {
-    if (!d->engaged)
+    if (!dbg->engaged)
         return;
-    pthread_mutex_lock(&d->lock);
-    d->step_mode = 1;
-    d->pause_req = 1;
-    d->line_mode = LINE_NONE; /* a pause must stop a by-line step too */
-    pthread_mutex_unlock(&d->lock);
+    pthread_mutex_lock(&dbg->lock);
+    dbg->step_mode = 1;
+    dbg->pause_req = 1;
+    dbg->line_mode = LINE_NONE; /* a pause must stop a by-line step too */
+    pthread_mutex_unlock(&dbg->lock);
     /* Racing a plain int write against the emulator thread's read of
      * step_count is deliberate and harmless here: the worst case is the
      * pause landing one instruction later than requested, never
@@ -331,20 +627,21 @@ void intvdebug_pause(intvdebug *d)
     intv.cp1600.step_count = 1;
 }
 
-void intvdebug_resume(intvdebug *d)
+void intvdebug_resume(intvdebug *dbg)
 {
-    pthread_mutex_lock(&d->lock);
-    if (d->paused) {
-        d->step_mode = 0;
-        d->paused = 0;
-        pthread_cond_broadcast(&d->cond);
+    pthread_mutex_lock(&dbg->lock);
+    if (paused_now(dbg)) {
+        dbg->step_mode = 0;
+        paused_set(dbg, 0);
+        pthread_cond_broadcast(&dbg->cond);
     }
-    pthread_mutex_unlock(&d->lock);
+    pthread_mutex_unlock(&dbg->lock);
+    bump(dbg);
 }
 
-int intvdebug_is_paused(const intvdebug *d)
+int intvdebug_is_paused(const intvdebug *dbg)
 {
-    return d->paused;
+    return paused_now(dbg);
 }
 
 /* Stopping at an address a breakpoint is armed on (a step or a by-line stop
@@ -352,24 +649,25 @@ int intvdebug_is_paused(const intvdebug *d)
  * run fire it again before executing anything. cp1600_set_breakpt on the
  * current PC arms it for the instruction after this one instead. Only while
  * paused. */
-static void step_off_breakpoint(intvdebug *d)
+static void step_off_breakpoint(intvdebug *dbg)
 {
-    const uint16_t pc = intv.cp1600.r[7];
-    if (intvdebug_breakpoint_is_set(d, pc))
-        cp1600_set_breakpt(&intv.cp1600, pc, CP1600_BKPT);
+    const uint16_t here = intv.cp1600.r[7];
+    if (intvdebug_breakpoint_is_set(dbg, here))
+        cp1600_set_breakpt(&intv.cp1600, here, CP1600_BKPT);
 }
 
-void intvdebug_step(intvdebug *d)
+void intvdebug_step(intvdebug *dbg)
 {
-    if (d->paused)
-        step_off_breakpoint(d);
-    pthread_mutex_lock(&d->lock);
-    if (d->paused) {
-        d->step_mode = 1;
-        d->paused = 0;
-        pthread_cond_broadcast(&d->cond);
+    if (paused_now(dbg))
+        step_off_breakpoint(dbg);
+    pthread_mutex_lock(&dbg->lock);
+    if (paused_now(dbg)) {
+        dbg->step_mode = 1;
+        paused_set(dbg, 0);
+        pthread_cond_broadcast(&dbg->cond);
     }
-    pthread_mutex_unlock(&d->lock);
+    pthread_mutex_unlock(&dbg->lock);
+    bump(dbg);
 }
 
 /* Does `text` name a JSR-family instruction? All four variants
@@ -384,132 +682,184 @@ static int is_call_mnemonic(const char *text)
     return strstr(text, "JSR") != NULL;
 }
 
-void intvdebug_step_over(intvdebug *d)
+/* Runs free until the one-shot breakpoint (or a real one) stops it. */
+static void run_free(intvdebug *dbg)
+{
+    pthread_mutex_lock(&dbg->lock);
+    dbg->step_mode = 0;
+    paused_set(dbg, 0);
+    pthread_cond_broadcast(&dbg->cond);
+    pthread_mutex_unlock(&dbg->lock);
+    bump(dbg);
+}
+
+void intvdebug_step_over(intvdebug *dbg)
 {
     intvdebug_dasm_line line;
 
-    if (!d->paused)
+    if (!paused_now(dbg))
         return;
-    step_off_breakpoint(d);
-    if (intvdebug_disassemble(d, intv.cp1600.r[7], intv.cp1600.D, &line, 1) != 1 ||
+    step_off_breakpoint(dbg);
+    if (intvdebug_disassemble(dbg, intv.cp1600.r[7], intv.cp1600.D, &line, 1) != 1 ||
         !is_call_mnemonic(line.text)) {
-        intvdebug_step(d);
+        intvdebug_step(dbg);
         return;
     }
 
-    cp1600_set_breakpt(&intv.cp1600,
-                       (uint16_t)(intv.cp1600.r[7] + line.length),
-                       CP1600_BKPT_ONCE);
-
-    pthread_mutex_lock(&d->lock);
-    d->step_mode = 0; /* run free until the one-shot breakpoint fires */
-    d->paused = 0;
-    pthread_cond_broadcast(&d->cond);
-    pthread_mutex_unlock(&d->lock);
+    oneshot_arm(dbg, (uint16_t)(intv.cp1600.r[7] + line.length));
+    run_free(dbg);
 }
 
-void intvdebug_step_out(intvdebug *d)
+void intvdebug_step_out(intvdebug *dbg)
 {
-    if (!d->paused)
+    if (!paused_now(dbg))
         return;
-    step_off_breakpoint(d);
+    step_off_breakpoint(dbg);
 
     /* Best-effort; see intvdebug.h's own comment on why R5 and why this
      * can silently fail to stop rather than stop somewhere wrong. */
-    cp1600_set_breakpt(&intv.cp1600, intv.cp1600.r[5], CP1600_BKPT_ONCE);
-
-    pthread_mutex_lock(&d->lock);
-    d->step_mode = 0;
-    d->paused = 0;
-    pthread_cond_broadcast(&d->cond);
-    pthread_mutex_unlock(&d->lock);
+    oneshot_arm(dbg, (uint16_t)intv.cp1600.r[5]);
+    run_free(dbg);
 }
 
-static void begin_line_step(intvdebug *d, int mode)
+void intvdebug_run_to(intvdebug *dbg, uint16_t addr)
 {
-    if (d->paused)
-        step_off_breakpoint(d);
-    pthread_mutex_lock(&d->lock);
-    if (d->paused) {
-        d->line_r6 = intv.cp1600.r[6];
+    if (!paused_now(dbg))
+        return;
+    step_off_breakpoint(dbg);
+    oneshot_arm(dbg, addr);
+    run_free(dbg);
+}
+
+static void begin_line_step(intvdebug *dbg, int mode)
+{
+    if (paused_now(dbg))
+        step_off_breakpoint(dbg);
+    pthread_mutex_lock(&dbg->lock);
+    if (paused_now(dbg)) {
+        dbg->line_r6 = intv.cp1600.r[6];
         /* Stopped on a callee's first word, straight after its JSR: the
          * PSHR R5 that opens an IntyBASIC procedure hasn't run, so the
          * stack is one shallower than the body will be. Count the body as
          * this routine's own level, or Over would skip all of it and Out
          * would not stop until the caller's caller. */
         if (mode != LINE_INTO && prev_was_call())
-            d->line_r6++;
-        d->line_mode = mode;
-        d->step_mode = 1;
-        d->paused = 0;
-        pthread_cond_broadcast(&d->cond);
+            dbg->line_r6++;
+        dbg->line_mode = mode;
+        dbg->step_mode = 1;
+        paused_set(dbg, 0);
+        pthread_cond_broadcast(&dbg->cond);
     }
-    pthread_mutex_unlock(&d->lock);
+    pthread_mutex_unlock(&dbg->lock);
+    bump(dbg);
 }
 
-void intvdebug_step_line(intvdebug *d)
+void intvdebug_step_line(intvdebug *dbg)
 {
-    begin_line_step(d, LINE_INTO);
+    begin_line_step(dbg, LINE_INTO);
 }
 
-void intvdebug_step_line_over(intvdebug *d)
+void intvdebug_step_line_over(intvdebug *dbg)
 {
-    begin_line_step(d, LINE_OVER);
+    begin_line_step(dbg, LINE_OVER);
 }
 
-void intvdebug_step_line_out(intvdebug *d)
+void intvdebug_step_line_out(intvdebug *dbg)
 {
-    begin_line_step(d, LINE_OUT);
+    begin_line_step(dbg, LINE_OUT);
 }
 
-uint64_t intvdebug_stop_serial(const intvdebug *d)
+uint64_t intvdebug_stop_serial(const intvdebug *dbg)
 {
-    return d->stop_serial;
+    return __atomic_load_n(&dbg->stop_serial, __ATOMIC_ACQUIRE);
 }
 
-int intvdebug_regs_get(intvdebug *d, intvdebug_regs *out)
+void intvdebug_touch(intvdebug *dbg)
 {
-    if (!d->paused)
+    bump(dbg);
+}
+
+int intvdebug_regs_get(intvdebug *dbg, intvdebug_regs *out)
+{
+    cp1600_t *const cpu = &intv.cp1600;
+
+    if (!paused_now(dbg))
         return 0;
 
-    memcpy(out->r, intv.cp1600.r, sizeof(out->r));
-    out->pc = intv.cp1600.r[7];
-    out->S = intv.cp1600.S;
-    out->C = intv.cp1600.C;
-    out->O = intv.cp1600.O;
-    out->Z = intv.cp1600.Z;
-    out->I = intv.cp1600.I;
-    out->D = intv.cp1600.D;
+    memcpy(out->r, cpu->r, sizeof(out->r));
+    out->pc = cpu->r[7];
+    out->S = cpu->S;
+    out->C = cpu->C;
+    out->O = cpu->O;
+    out->Z = cpu->Z;
+    out->I = cpu->I;
+    out->D = cpu->D;
+    out->interruptible = cpu->I && !cpu->D;
+    out->intrq = (cpu->req_ack_state & CP1600_INTRQ) != 0;
+    out->busrq = (cpu->req_ack_state & CP1600_BUSRQ) != 0;
+    out->cycles = cpu->periph.now;
+    out->frame = frame_of(cpu->periph.now);
     return 1;
 }
 
-int intvdebug_read(intvdebug *d, uint16_t addr, uint16_t *dst, int n)
+int intvdebug_regs_set(intvdebug *dbg, int reg, unsigned value)
 {
-    cp1600_t *const cp = &intv.cp1600; /* CP1600_PK/_WR substitute their
-                                        * argument textually into `c->...`,
-                                        * so &intv.cp1600 (an expression, not
-                                        * a plain identifier) would parse as
-                                        * &(intv.cp1600->...) -- wrong
-                                        * precedence. A local pointer var is
-                                        * what every other CP1600_* call site
-                                        * in the staged tree uses too. */
-    int i;
-    if (!d->paused)
+    cp1600_t *const cpu = &intv.cp1600;
+
+    if (!paused_now(dbg) || reg < 0 || reg >= INTVDEBUG_REG_COUNT)
         return 0;
-    for (i = 0; i < n; i++)
-        dst[i] = (uint16_t)CP1600_PK(cp, (uint16_t)(addr + i));
-    return n;
+    switch (reg) {
+    case INTVDEBUG_REG_S: cpu->S = value ? 1 : 0; break;
+    case INTVDEBUG_REG_Z: cpu->Z = value ? 1 : 0; break;
+    case INTVDEBUG_REG_O: cpu->O = value ? 1 : 0; break;
+    case INTVDEBUG_REG_C: cpu->C = value ? 1 : 0; break;
+    case INTVDEBUG_REG_I: cpu->I = value ? 1 : 0; break;
+    case INTVDEBUG_REG_D: cpu->D = value ? 1 : 0; break;   /* 1: SDBD pending for the next instruction */
+    default:
+        cpu->r[reg] = (uint16_t)(value & 0xFFFF);
+        /* Landing on an armed breakpoint by hand is not a hit: the next run
+         * executes that instruction, as it would after a Step. */
+        if (reg == INTVDEBUG_REG_PC)
+            step_off_breakpoint(dbg);
+        break;
+    }
+    bump(dbg);
+    return 1;
 }
 
-int intvdebug_write(intvdebug *d, uint16_t addr, const uint16_t *src, int n)
+int intvdebug_read(intvdebug *dbg, uint16_t addr, uint16_t *dst, int count)
 {
-    cp1600_t *const cp = &intv.cp1600;
-    int i;
-    if (!d->paused)
+    cp1600_t *const cpu = &intv.cp1600; /* CP1600_PK/_WR substitute their
+                                         * argument textually into `c->...`,
+                                         * so &intv.cp1600 (an expression, not
+                                         * a plain identifier) would parse as
+                                         * &(intv.cp1600->...) -- wrong
+                                         * precedence. A local pointer var is
+                                         * what every other CP1600_* call site
+                                         * in the staged tree uses too. */
+    int idx;
+    if (!paused_now(dbg))
         return 0;
-    for (i = 0; i < n; i++)
-        CP1600_WR(cp, (uint16_t)(addr + i), src[i]);
-    return n;
+    for (idx = 0; idx < count; idx++) {
+        const uint16_t where = (uint16_t)(addr + idx);
+        /* the ECS UART's receive byte reads the tape file */
+        dst[idx] = where == 0x00E1 ? 0 : (uint16_t)CP1600_PK(cpu, where);
+    }
+    return count;
+}
+
+int intvdebug_write(intvdebug *dbg, uint16_t addr, const uint16_t *src, int count)
+{
+    cp1600_t *const cpu = &intv.cp1600;
+    int idx;
+    if (!paused_now(dbg))
+        return 0;
+    g_quiet = 1;   /* a poke is not an access the watchpoints should see */
+    for (idx = 0; idx < count; idx++)
+        CP1600_WR(cpu, (uint16_t)(addr + idx), src[idx]);
+    g_quiet = 0;
+    bump(dbg);
+    return count;
 }
 
 static uint16_t fold_ascii(uint16_t w)
@@ -518,21 +868,21 @@ static uint16_t fold_ascii(uint16_t w)
     return c >= 'a' && c <= 'z' ? (uint16_t)((w & 0xFF00) | (c - 32)) : w;
 }
 
-int intvdebug_search(intvdebug *d, const uint16_t *pattern, int n, uint16_t mask, int flags,
-                     uint16_t from, uint16_t to, uint16_t *out, int max)
+int intvdebug_search(intvdebug *dbg, const uint16_t *pattern, int n, uint16_t mask, int flags,
+                     uint16_t from, uint16_t shown, uint16_t *out, int max)
 {
     uint16_t buf[512 + 64];
-    uint32_t base, last = to;
+    uint32_t base, last = shown;
     int found = 0, i;
 
-    if (!d->paused)
+    if (!paused_now(dbg))
         return -1;
-    if (n < 1 || n > 64 || to < from)
+    if (n < 1 || n > 64 || shown < from)
         return 0;
     for (base = from; base <= last && found < max; base += 512) {
         /* a chunk and enough words past it for a match that straddles the end */
         const int want = (int)(last - base + 1) < 512 + n - 1 ? (int)(last - base + 1) : 512 + n - 1;
-        int got = intvdebug_read(d, (uint16_t)base, buf, want);
+        int got = intvdebug_read(dbg, (uint16_t)base, buf, want);
         for (i = 0; i < 512 && i < got && base + (uint32_t)i <= last && found < max; i++) {
             int k;
             if (i + n > got)
@@ -553,13 +903,13 @@ int intvdebug_search(intvdebug *d, const uint16_t *pattern, int n, uint16_t mask
     return found;
 }
 
-int intvdebug_disassemble(intvdebug *d, uint16_t addr, int dbd,
+int intvdebug_disassemble(intvdebug *dbg, uint16_t addr, int dbd,
                           intvdebug_dasm_line *out, int max)
 {
     cp1600_t *const cp = &intv.cp1600;
     int produced = 0;
 
-    if (!d->paused)
+    if (!paused_now(dbg))
         return 0;
 
     while (produced < max) {
@@ -587,78 +937,110 @@ int intvdebug_disassemble(intvdebug *d, uint16_t addr, int dbd,
 /* One 16-word bin of the bus is the grain of address decode. */
 #define WATCH_BINS 4096
 
-static periph_t g_watch;        /* answers on the bins that hold a watchpoint */
-static periph_bus_t *g_watch_bus;
-static uint16_t g_shadow[65536];/* the last value written, for CHANGED */
-
-static int bp_find(const intvdebug *d, int id)
+static int bp_find(const intvdebug *dbg, int id)
 {
-    int i;
-    for (i = 0; i < d->nbp; i++)
-        if (d->bps[i].id == id)
-            return i;
+    int idx;
+    for (idx = 0; idx < dbg->nbp; idx++)
+        if (dbg->bps[idx].id == id)
+            return idx;
     return -1;
 }
 
-static int bp_find_exec(const intvdebug *d, uint16_t addr)
+static int bp_find_exec(const intvdebug *dbg, uint16_t addr)
 {
-    int i;
-    for (i = 0; i < d->nbp; i++)
-        if ((d->bps[i].type & INTVDEBUG_BP_EXEC) && d->bps[i].lo == addr)
-            return i;
+    int idx;
+    for (idx = 0; idx < dbg->nbp; idx++)
+        if ((dbg->bps[idx].type & INTVDEBUG_BP_EXEC) && dbg->bps[idx].lo == addr)
+            return idx;
     return -1;
 }
 
 /* Arms or clears jzIntv's own breakpoint for an EXEC entry. Safe while
- * running (the long-standing behaviour of the toggle). */
-static void bp_arm_exec(const intvdebug_bp *bp)
+ * running (the long-standing behaviour of the toggle). Arming at the PC the
+ * CPU is stopped on arms it for the instruction after this one. */
+static void bp_arm_exec(const intvdebug_bp *point)
 {
-    if (bp->enabled)
-        cp1600_set_breakpt(&intv.cp1600, bp->lo, CP1600_BKPT);
+    if (point->enabled)
+        cp1600_set_breakpt(&intv.cp1600, point->lo, CP1600_BKPT);
     else
-        cp1600_clr_breakpt(&intv.cp1600, bp->lo, CP1600_BKPT);
+        cp1600_clr_breakpt(&intv.cp1600, point->lo, CP1600_BKPT);
 }
 
-static uint32_t watch_rd(periph_t *p, periph_t *bus, uint32_t addr, uint32_t data);
-static void watch_wr(periph_t *p, periph_t *bus, uint32_t addr, uint32_t data);
-
-static uint32_t watch_peek(periph_t *p, periph_t *bus, uint32_t addr, uint32_t data)
+/* Arms an EXEC entry so that it fires the first time the PC gets there, even
+ * when the PC happens to be there now. A freshly built CPU sits at the reset
+ * vector ($1000) before it has run anything, and an entry armed there with
+ * bp_arm_exec would be skipped once, as if the machine were stopped on it. */
+static void bp_arm_exec_fresh(const intvdebug_bp *point)
 {
-    (void)p; (void)bus; (void)addr; (void)data;
+    cp1600_t *const cpu = &intv.cp1600;
+    const uint16_t saved = cpu->r[7];
+    cpu->r[7] = (uint16_t)(point->lo ^ 0xFFFFu);   /* anywhere but the breakpoint */
+    bp_arm_exec(point);
+    cpu->r[7] = saved;
+}
+
+static uint32_t watch_rd(periph_t *dev, periph_t *bus, uint32_t addr, uint32_t data);
+static void watch_wr(periph_t *dev, periph_t *bus, uint32_t addr, uint32_t data);
+
+static uint32_t watch_peek(periph_t *dev, periph_t *bus, uint32_t addr, uint32_t data)
+{
+    (void)dev; (void)bus; (void)addr; (void)data;
     return ~0U;   /* a peek must not be seen, and must not drive the bus */
 }
 
-static void watch_poke(periph_t *p, periph_t *bus, uint32_t addr, uint32_t data)
+static void watch_poke(periph_t *dev, periph_t *bus, uint32_t addr, uint32_t data)
 {
-    (void)p; (void)bus; (void)addr; (void)data;
+    (void)dev; (void)bus; (void)addr; (void)data;
+}
+
+/* Puts the watch device first in every bin it answers, so it runs before the
+ * store or the read it is watching: `old` is then read from the devices as
+ * they were, whatever order the cartridge (re)registered in. */
+static void watch_to_front(periph_bus_t *bus, const uint8_t *bins)
+{
+    uint32_t bin;
+    int col, shift;
+
+    for (bin = 0; bin < WATCH_BINS; bin++) {
+        if (!bins[bin])
+            continue;
+        for (col = 1; col < MAX_PERIPH_BIN && bus->rd[col][bin]; col++)
+            if (bus->rd[col][bin] == &g_watch) {
+                for (shift = col; shift > 0; shift--)
+                    bus->rd[shift][bin] = bus->rd[shift - 1][bin];
+                bus->rd[0][bin] = &g_watch;
+                break;
+            }
+        for (col = 1; col < MAX_PERIPH_BIN && bus->wr[col][bin]; col++)
+            if (bus->wr[col][bin] == &g_watch) {
+                for (shift = col; shift > 0; shift--)
+                    bus->wr[shift][bin] = bus->wr[shift - 1][bin];
+                bus->wr[0][bin] = &g_watch;
+                break;
+            }
+    }
 }
 
 /* Rebuilds which bins our device answers on. Only while the emulator thread
  * is parked or is the caller (the bins are walked by every bus access). */
-static void watch_apply(intvdebug *d)
+static void watch_apply(intvdebug *dbg)
 {
     static uint8_t bins[WATCH_BINS];
     periph_bus_t *bus = intv.intv;
-    int i, b, any = 0;
+    int idx, bin, any = 0;
 
-    pthread_mutex_lock(&d->bp_lock);
-    d->watch_dirty = 0;
+    pthread_mutex_lock(&dbg->bp_lock);
+    dbg->watch_dirty = 0;
     memset(bins, 0, sizeof(bins));
-    for (i = 0; i < d->nbp; i++) {
-        const intvdebug_bp *bp = &d->bps[i];
-        if (!bp->enabled || !(bp->type & (INTVDEBUG_BP_READ | INTVDEBUG_BP_WRITE)))
+    for (idx = 0; idx < dbg->nbp; idx++) {
+        const intvdebug_bp *point = &dbg->bps[idx];
+        if (!point->enabled || !(point->type & (INTVDEBUG_BP_READ | INTVDEBUG_BP_WRITE)))
             continue;
-        for (b = bp->lo >> 4; b <= bp->hi >> 4; b++)
-            bins[b] = 1;
+        for (bin = point->lo >> 4; bin <= point->hi >> 4; bin++)
+            bins[bin] = 1;
         any = 1;
-        if (bp->cond == INTVDEBUG_COND_CHANGED) { /* seed the old values */
-            cp1600_t *const cp = &intv.cp1600;
-            int a;
-            for (a = bp->lo; a <= bp->hi; a++)
-                g_shadow[a] = (uint16_t)CP1600_PK(cp, (uint16_t)a);
-        }
     }
-    pthread_mutex_unlock(&d->bp_lock);
+    pthread_mutex_unlock(&dbg->bp_lock);
 
     if (!bus)
         return;
@@ -676,15 +1058,16 @@ static void watch_apply(intvdebug *d)
     }
     if (!any)
         return;
-    for (b = 0; b < WATCH_BINS; b++) {   /* one registration per run of bins */
-        int e = b;
-        if (!bins[b])
+    for (bin = 0; bin < WATCH_BINS; bin++) {   /* one registration per run of bins */
+        int last = bin;
+        if (!bins[bin])
             continue;
-        while (e + 1 < WATCH_BINS && bins[e + 1])
-            e++;
-        periph_register(bus, &g_watch, (uint32_t)b << 4, ((uint32_t)e << 4) | 15, "watch");
-        b = e;
+        while (last + 1 < WATCH_BINS && bins[last + 1])
+            last++;
+        periph_register(bus, &g_watch, (uint32_t)bin << 4, ((uint32_t)last << 4) | 15, "watch");
+        bin = last;
     }
+    watch_to_front(bus, bins);
 }
 
 /* jzIntv's reload path (jzintv.c `reload:`) tears the machine down and runs
@@ -694,26 +1077,28 @@ static void watch_apply(intvdebug *d)
  * from the tables. Runs on the emulator thread, right after cfg_init, via the
  * hook the jzIntv patch adds; also callable by a host that rebuilt the machine
  * some other way. */
-void intvdebug_rearm(intvdebug *d)
+void intvdebug_rearm(intvdebug *dbg)
 {
     int idx;
 
-    if (d->engaged) {
+    if (dbg->engaged) {
         cp1600_instr_tick(&intv.cp1600, debug_tick, NULL);
-        intv.cp1600.step_count = (d->hist_on || d->step_mode) ? 1 : ~0U;
-        intv.cp1600.steps_remaining = (d->hist_on || d->step_mode) ? 1 : 0;
+        intv.cp1600.step_count = (dbg->hist_on || dbg->step_mode) ? 1 : ~0U;
+        intv.cp1600.steps_remaining = (dbg->hist_on || dbg->step_mode) ? 1 : 0;
     }
-    d->line_mode = LINE_NONE;      /* a by-line step cannot survive a reboot */
-    d->hist_count = 0;             /* the old instructions belong to a dead machine */
+    dbg->line_mode = LINE_NONE;      /* a by-line step cannot survive a reboot */
+    dbg->oneshot_armed = 0;          /* the CPU that held it is gone */
+    dbg->hist_count = 0;             /* the old instructions belong to a dead machine */
 
-    pthread_mutex_lock(&d->bp_lock);
-    for (idx = 0; idx < d->nbp; idx++)
-        if (d->bps[idx].type & INTVDEBUG_BP_EXEC)
-            bp_arm_exec(&d->bps[idx]);
-    pthread_mutex_unlock(&d->bp_lock);
+    pthread_mutex_lock(&dbg->bp_lock);
+    for (idx = 0; idx < dbg->nbp; idx++)
+        if (dbg->bps[idx].type & INTVDEBUG_BP_EXEC)
+            bp_arm_exec_fresh(&dbg->bps[idx]);
+    pthread_mutex_unlock(&dbg->bp_lock);
 
     g_watch_bus = NULL;            /* the old bus is freed; forget the registration */
-    watch_apply(d);
+    watch_apply(dbg);
+    bump(dbg);
 }
 
 static void rearm_hook(void)
@@ -721,309 +1106,418 @@ static void rearm_hook(void)
     intvdebug_rearm(&g_debug);
 }
 
-/* Called on the emulator thread for each CPU data access on a watched bin. */
-static void watch_hit(periph_t *bus, uint32_t addr, uint32_t data, int is_write)
+/* The decoder reads an instruction's words through the bus like any read when
+ * the page is not cached (cartridge RAM, ECS/JLP RAM), and when a breakpoint
+ * sits on the instruction. Those are fetches, not data accesses: they sit
+ * within the instruction's own three words while its execute slot still holds
+ * a decode function. A data read of the instruction's own neighbourhood by an
+ * uncached instruction is indistinguishable, and is dropped with them. */
+static int is_decode_fetch(uint16_t addr)
 {
-    intvdebug *const d = &g_debug;
-    const uint16_t a = (uint16_t)addr, v = (uint16_t)data;
-    int i;
+    cp1600_t *const cpu = &intv.cp1600;
+    const uint16_t offset = (uint16_t)(addr - cpu->oldpc);
+    cp1600_ins_t *slot;
 
-    if (!d->engaged || !bus || bus->req != &intv.cp1600.periph)
-        return;   /* only the CPU's own accesses, and only while engaged */
-    pthread_mutex_lock(&d->bp_lock);
-    for (i = 0; i < d->nbp; i++) {
-        intvdebug_bp *bp = &d->bps[i];
-        const int kind = is_write ? INTVDEBUG_BP_WRITE : INTVDEBUG_BP_READ;
-        const uint16_t mask = bp->mask ? bp->mask : 0xFFFF;
-        int fire = 1;
-
-        if (!bp->enabled || !(bp->type & kind) || a < bp->lo || a > bp->hi)
-            continue;
-        if (is_write) {
-            if (bp->cond == INTVDEBUG_COND_CHANGED)
-                fire = (v & mask) != (g_shadow[a] & mask);
-            else if (bp->cond == INTVDEBUG_COND_EQ)
-                fire = (v & mask) == (bp->value & mask);
-            else if (bp->cond == INTVDEBUG_COND_NE)
-                fire = (v & mask) != (bp->value & mask);
-        }
-        if (!fire)
-            continue;
-        bp->hits++;
-        d->bp_gen++;
-        if (!d->watch_hit) {   /* the first hit of the instruction names the stop */
-            d->watch_hit = is_write ? INTVDEBUG_STOP_WATCH_WRITE : INTVDEBUG_STOP_WATCH_READ;
-            d->hit.bp_id = bp->id;
-            d->hit.addr = a;
-            d->hit.value = v;
-            d->hit.old_value = g_shadow[a];
-        }
-    }
-    if (is_write)
-        g_shadow[a] = v;
-    if (d->watch_hit) {
-        intv.cp1600.hit_breakpoint = BK_BREAKPOINT;
-        intv.cp1600.steps_remaining = 1;   /* stop after this instruction */
-    }
-    pthread_mutex_unlock(&d->bp_lock);
+    if (offset > 2)
+        return 0;
+    slot = cpu->execute[cpu->oldpc];
+    return slot == fn_decode || slot == fn_decode_1st || slot == fn_decode_bkpt || slot == fn_breakpt;
 }
 
-static uint32_t watch_rd(periph_t *p, periph_t *bus, uint32_t addr, uint32_t data)
+/* Called on the emulator thread for each CPU data access on a watched bin,
+ * before the access itself (the watch device is first on the bus). */
+static void watch_hit(periph_t *bus, uint32_t addr, uint32_t data, int is_write)
 {
-    (void)p; (void)data;
+    intvdebug *const dbg = &g_debug;
+    cp1600_t *const cpu = &intv.cp1600;
+    const uint16_t where = (uint16_t)addr;
+    const int kind = is_write ? INTVDEBUG_BP_WRITE : INTVDEBUG_BP_READ;
+    uint16_t value = 0, old = 0;
+    int idx, known = 0;
+
+    if (g_quiet || !dbg->engaged || !bus || bus->req != &cpu->periph)
+        return;   /* only the CPU's own accesses, and only while engaged */
+    if (!is_write && is_decode_fetch(where))
+        return;
+    pthread_mutex_lock(&dbg->bp_lock);
+    for (idx = 0; idx < dbg->nbp; idx++) {
+        intvdebug_bp *const point = &dbg->bps[idx];
+
+        if (!point->enabled || !(point->type & kind) || where < point->lo || where > point->hi)
+            continue;
+        if (!known) {   /* the word as it is now: before the store, or what the read returns */
+            const uint16_t mask = width_mask(where);
+            old = (uint16_t)(bus_peek((periph_bus_t *)bus, where) & mask);
+            value = is_write ? (uint16_t)(data & mask) : old;
+            known = 1;
+        }
+        if (!condition_true(point, 1, value, old, where, (uint16_t)cpu->oldpc))
+            continue;
+        point->hits++;
+        dbg->bp_gen++;
+        if (!dbg->watch_hit) {   /* the first hit of the instruction names the stop */
+            dbg->watch_hit = is_write ? INTVDEBUG_STOP_WATCH_WRITE : INTVDEBUG_STOP_WATCH_READ;
+            dbg->hit.bp_id = point->id;
+            dbg->hit.addr = where;
+            dbg->hit.value = value;
+            dbg->hit.old_value = old;
+            dbg->hit.from_pc = (uint16_t)cpu->oldpc;
+        }
+    }
+    if (dbg->watch_hit) {
+        cpu->hit_breakpoint = BK_BREAKPOINT;
+        cpu->steps_remaining = 1;   /* stop after this instruction */
+    }
+    pthread_mutex_unlock(&dbg->bp_lock);
+}
+
+static uint32_t watch_rd(periph_t *dev, periph_t *bus, uint32_t addr, uint32_t data)
+{
+    (void)dev; (void)data;
     watch_hit(bus, addr, 0, 0);
     return ~0U;   /* merely listening: leave the bus value alone */
 }
 
-static void watch_wr(periph_t *p, periph_t *bus, uint32_t addr, uint32_t data)
+static void watch_wr(periph_t *dev, periph_t *bus, uint32_t addr, uint32_t data)
 {
-    (void)p;
+    (void)dev;
     watch_hit(bus, addr, data, 1);
 }
 
 /* A table change: apply the bus side now if the machine is parked, else the
  * emulator thread does it at its next hook. */
-static void bp_changed(intvdebug *d, int bus_side)
+static void bp_changed(intvdebug *dbg, int bus_side)
 {
-    d->bp_gen++;
+    dbg->bp_gen++;
+    bump(dbg);
     if (!bus_side)
         return;
-    if (d->paused)
-        watch_apply(d);
+    if (paused_now(dbg))
+        watch_apply(dbg);
     else
-        d->watch_dirty = 1;
+        dbg->watch_dirty = 1;
 }
 
-int intvdebug_bp_add(intvdebug *d, const intvdebug_bp *spec)
+int intvdebug_bp_add(intvdebug *dbg, const intvdebug_bp *spec)
 {
-    intvdebug_bp bp;
+    intvdebug_bp point;
     int id;
 
     if (!spec || !(spec->type & (INTVDEBUG_BP_EXEC | INTVDEBUG_BP_READ | INTVDEBUG_BP_WRITE)))
         return -1;
-    pthread_mutex_lock(&d->bp_lock);
-    if (d->nbp >= INTVDEBUG_MAX_BREAKPOINTS) {
-        pthread_mutex_unlock(&d->bp_lock);
+    point = *spec;
+    point.condition[sizeof(point.condition) - 1] = '\0';
+    if (!condition_parses(point.condition))
+        return -1;
+    pthread_mutex_lock(&dbg->bp_lock);
+    if (dbg->nbp >= INTVDEBUG_MAX_BREAKPOINTS) {
+        pthread_mutex_unlock(&dbg->bp_lock);
         return -1;
     }
-    bp = *spec;
-    if (bp.type & INTVDEBUG_BP_EXEC) {
-        bp.type = INTVDEBUG_BP_EXEC;   /* code stops are exact addresses */
-        bp.hi = bp.lo;
-        bp.cond = INTVDEBUG_COND_ANY;
-    } else if (bp.hi < bp.lo) {
-        const uint16_t t = bp.lo;
-        bp.lo = bp.hi;
-        bp.hi = t;
+    if (point.type & INTVDEBUG_BP_EXEC) {
+        point.type = INTVDEBUG_BP_EXEC;   /* code stops are exact addresses */
+        point.hi = point.lo;
+        point.cond = INTVDEBUG_COND_ANY;
+    } else if (point.hi < point.lo) {
+        const uint16_t swap = point.lo;
+        point.lo = point.hi;
+        point.hi = swap;
     }
-    if (!(bp.type & INTVDEBUG_BP_WRITE))
-        bp.cond = INTVDEBUG_COND_ANY;
-    bp.id = id = d->next_bp_id++;
-    bp.enabled = 1;
-    bp.hits = 0;
-    d->bps[d->nbp++] = bp;
-    pthread_mutex_unlock(&d->bp_lock);
+    if (!(point.type & INTVDEBUG_BP_WRITE) || point.condition[0])
+        point.cond = INTVDEBUG_COND_ANY;
+    point.id = id = dbg->next_bp_id++;
+    point.enabled = 1;
+    point.hits = 0;
+    dbg->bps[dbg->nbp++] = point;
+    pthread_mutex_unlock(&dbg->bp_lock);
 
-    if (bp.type & INTVDEBUG_BP_EXEC)
-        bp_arm_exec(&bp);
-    bp_changed(d, !(bp.type & INTVDEBUG_BP_EXEC));
+    if (point.type & INTVDEBUG_BP_EXEC)
+        bp_arm_exec(&point);
+    bp_changed(dbg, !(point.type & INTVDEBUG_BP_EXEC));
     return id;
 }
 
-int intvdebug_bp_remove(intvdebug *d, int id)
+int intvdebug_bp_set_condition(intvdebug *dbg, int id, const char *condition)
 {
-    intvdebug_bp gone;
-    int i, bus_side;
+    int idx;
 
-    pthread_mutex_lock(&d->bp_lock);
-    i = bp_find(d, id);
-    if (i < 0) {
-        pthread_mutex_unlock(&d->bp_lock);
+    if (!condition)
+        condition = "";
+    if (strlen(condition) >= sizeof(dbg->bps[0].condition) || !condition_parses(condition))
+        return 0;
+    pthread_mutex_lock(&dbg->bp_lock);
+    idx = bp_find(dbg, id);
+    if (idx < 0) {
+        pthread_mutex_unlock(&dbg->bp_lock);
         return 0;
     }
-    gone = d->bps[i];
-    memmove(&d->bps[i], &d->bps[i + 1], (size_t)(d->nbp - i - 1) * sizeof(d->bps[0]));
-    d->nbp--;
-    pthread_mutex_unlock(&d->bp_lock);
+    snprintf(dbg->bps[idx].condition, sizeof(dbg->bps[idx].condition), "%s", condition);
+    dbg->bps[idx].cond = INTVDEBUG_COND_ANY;
+    pthread_mutex_unlock(&dbg->bp_lock);
+    bp_changed(dbg, 0);
+    return 1;
+}
+
+int intvdebug_bp_remove(intvdebug *dbg, int id)
+{
+    intvdebug_bp gone;
+    int idx, bus_side;
+
+    pthread_mutex_lock(&dbg->bp_lock);
+    idx = bp_find(dbg, id);
+    if (idx < 0) {
+        pthread_mutex_unlock(&dbg->bp_lock);
+        return 0;
+    }
+    gone = dbg->bps[idx];
+    memmove(&dbg->bps[idx], &dbg->bps[idx + 1], (size_t)(dbg->nbp - idx - 1) * sizeof(dbg->bps[0]));
+    dbg->nbp--;
+    pthread_mutex_unlock(&dbg->bp_lock);
 
     bus_side = !(gone.type & INTVDEBUG_BP_EXEC);
     if (gone.type & INTVDEBUG_BP_EXEC) {
         gone.enabled = 0;
-        if (bp_find_exec(d, gone.lo) < 0)
+        if (bp_find_exec(dbg, gone.lo) < 0)
             bp_arm_exec(&gone);
     }
-    bp_changed(d, bus_side);
+    bp_changed(dbg, bus_side);
     return 1;
 }
 
-int intvdebug_bp_enable(intvdebug *d, int id, int enabled)
+int intvdebug_bp_enable(intvdebug *dbg, int id, int enabled)
 {
-    intvdebug_bp bp;
-    int i;
+    intvdebug_bp point;
+    int idx;
 
-    pthread_mutex_lock(&d->bp_lock);
-    i = bp_find(d, id);
-    if (i < 0) {
-        pthread_mutex_unlock(&d->bp_lock);
+    pthread_mutex_lock(&dbg->bp_lock);
+    idx = bp_find(dbg, id);
+    if (idx < 0) {
+        pthread_mutex_unlock(&dbg->bp_lock);
         return 0;
     }
-    d->bps[i].enabled = enabled ? 1 : 0;
-    bp = d->bps[i];
-    pthread_mutex_unlock(&d->bp_lock);
-    if (bp.type & INTVDEBUG_BP_EXEC)
-        bp_arm_exec(&bp);
-    bp_changed(d, !(bp.type & INTVDEBUG_BP_EXEC));
+    dbg->bps[idx].enabled = enabled ? 1 : 0;
+    point = dbg->bps[idx];
+    pthread_mutex_unlock(&dbg->bp_lock);
+    if (point.type & INTVDEBUG_BP_EXEC)
+        bp_arm_exec(&point);
+    bp_changed(dbg, !(point.type & INTVDEBUG_BP_EXEC));
     return 1;
 }
 
-int intvdebug_bp_clear_hits(intvdebug *d)
+int intvdebug_bp_clear_hits(intvdebug *dbg)
 {
-    int i;
-    pthread_mutex_lock(&d->bp_lock);
-    for (i = 0; i < d->nbp; i++)
-        d->bps[i].hits = 0;
-    d->bp_gen++;
-    pthread_mutex_unlock(&d->bp_lock);
+    int idx;
+    pthread_mutex_lock(&dbg->bp_lock);
+    for (idx = 0; idx < dbg->nbp; idx++)
+        dbg->bps[idx].hits = 0;
+    dbg->bp_gen++;
+    pthread_mutex_unlock(&dbg->bp_lock);
+    bump(dbg);
     return 1;
 }
 
-int intvdebug_bp_list(intvdebug *d, intvdebug_bp *out, int max)
+int intvdebug_bp_list(intvdebug *dbg, intvdebug_bp *out, int max)
 {
-    int n;
-    pthread_mutex_lock(&d->bp_lock);
-    n = d->nbp < max ? d->nbp : max;
-    memcpy(out, d->bps, (size_t)n * sizeof(out[0]));
-    pthread_mutex_unlock(&d->bp_lock);
-    return n;
+    int count;
+    pthread_mutex_lock(&dbg->bp_lock);
+    count = dbg->nbp < max ? dbg->nbp : max;
+    memcpy(out, dbg->bps, (size_t)count * sizeof(out[0]));
+    pthread_mutex_unlock(&dbg->bp_lock);
+    return count;
 }
 
-unsigned intvdebug_bp_generation(const intvdebug *d)
+unsigned intvdebug_bp_generation(const intvdebug *dbg)
 {
-    return d->bp_gen;
+    return dbg->bp_gen;
 }
 
-int intvdebug_breakpoint_toggle(intvdebug *d, uint16_t addr)
+int intvdebug_breakpoint_toggle(intvdebug *dbg, uint16_t addr)
 {
-    int i;
+    int idx;
     intvdebug_bp spec;
 
-    pthread_mutex_lock(&d->bp_lock);
-    i = bp_find_exec(d, addr);
-    if (i >= 0) {
-        const int id = d->bps[i].id;
-        pthread_mutex_unlock(&d->bp_lock);
-        intvdebug_bp_remove(d, id);
+    pthread_mutex_lock(&dbg->bp_lock);
+    idx = bp_find_exec(dbg, addr);
+    if (idx >= 0) {
+        const int id = dbg->bps[idx].id;
+        pthread_mutex_unlock(&dbg->bp_lock);
+        intvdebug_bp_remove(dbg, id);
         return 0;
     }
-    pthread_mutex_unlock(&d->bp_lock);
+    pthread_mutex_unlock(&dbg->bp_lock);
     memset(&spec, 0, sizeof(spec));
     spec.type = INTVDEBUG_BP_EXEC;
     spec.lo = spec.hi = addr;
-    return intvdebug_bp_add(d, &spec) < 0 ? -1 : 1;
+    return intvdebug_bp_add(dbg, &spec) < 0 ? -1 : 1;
 }
 
-int intvdebug_breakpoint_state(intvdebug *d, uint16_t addr)
+int intvdebug_breakpoint_state(intvdebug *dbg, uint16_t addr)
 {
-    int i, state = 0;
-    pthread_mutex_lock(&d->bp_lock);
-    i = bp_find_exec(d, addr);
-    if (i >= 0)
-        state = d->bps[i].enabled ? 1 : 2;
-    pthread_mutex_unlock(&d->bp_lock);
+    int idx, state = 0;
+    pthread_mutex_lock(&dbg->bp_lock);
+    idx = bp_find_exec(dbg, addr);
+    if (idx >= 0)
+        state = dbg->bps[idx].enabled ? 1 : 2;
+    pthread_mutex_unlock(&dbg->bp_lock);
     return state;
 }
 
-int intvdebug_breakpoint_is_set(intvdebug *d, uint16_t addr)
+int intvdebug_breakpoint_is_set(intvdebug *dbg, uint16_t addr)
 {
-    return intvdebug_breakpoint_state(d, addr) == 1;
+    return intvdebug_breakpoint_state(dbg, addr) == 1;
 }
 
-void intvdebug_breakpoint_clear_all(intvdebug *d)
+void intvdebug_breakpoint_clear_all(intvdebug *dbg)
 {
-    int i;
-    pthread_mutex_lock(&d->bp_lock);
-    for (i = 0; i < d->nbp; i++)
-        if (d->bps[i].type & INTVDEBUG_BP_EXEC)
-            cp1600_clr_breakpt(&intv.cp1600, d->bps[i].lo, CP1600_BKPT);
-    d->nbp = 0;
-    pthread_mutex_unlock(&d->bp_lock);
-    bp_changed(d, 1);
+    int idx;
+    pthread_mutex_lock(&dbg->bp_lock);
+    for (idx = 0; idx < dbg->nbp; idx++)
+        if (dbg->bps[idx].type & INTVDEBUG_BP_EXEC)
+            cp1600_clr_breakpt(&intv.cp1600, dbg->bps[idx].lo, CP1600_BKPT);
+    dbg->nbp = 0;
+    pthread_mutex_unlock(&dbg->bp_lock);
+    bp_changed(dbg, 1);
 }
 
-int intvdebug_breakpoint_list(intvdebug *d, uint16_t *out, int max)
+int intvdebug_breakpoint_list(intvdebug *dbg, uint16_t *out, int max)
 {
-    int i, n = 0;
-    pthread_mutex_lock(&d->bp_lock);
-    for (i = 0; i < d->nbp && n < max; i++)
-        if ((d->bps[i].type & INTVDEBUG_BP_EXEC) && d->bps[i].enabled) {
-            int k = n++;
-            while (k > 0 && out[k - 1] > d->bps[i].lo) { /* ascending */
-                out[k] = out[k - 1];
-                k--;
+    int idx, count = 0;
+    pthread_mutex_lock(&dbg->bp_lock);
+    for (idx = 0; idx < dbg->nbp && count < max; idx++)
+        if ((dbg->bps[idx].type & INTVDEBUG_BP_EXEC) && dbg->bps[idx].enabled) {
+            int slot = count++;
+            while (slot > 0 && out[slot - 1] > dbg->bps[idx].lo) { /* ascending */
+                out[slot] = out[slot - 1];
+                slot--;
             }
-            out[k] = d->bps[i].lo;
+            out[slot] = dbg->bps[idx].lo;
         }
-    pthread_mutex_unlock(&d->bp_lock);
-    return n;
+    pthread_mutex_unlock(&dbg->bp_lock);
+    return count;
 }
 
-int intvdebug_last_stop(intvdebug *d, intvdebug_stop_info *out)
+int intvdebug_last_stop(intvdebug *dbg, intvdebug_stop_info *out)
 {
-    pthread_mutex_lock(&d->bp_lock);
-    *out = d->last;
-    pthread_mutex_unlock(&d->bp_lock);
+    pthread_mutex_lock(&dbg->bp_lock);
+    *out = dbg->last;
+    pthread_mutex_unlock(&dbg->bp_lock);
     return out->reason != INTVDEBUG_STOP_NONE;
+}
+
+/* ---- why it stopped ------------------------------------------------------------- */
+
+static int describe_stop(const intvdebug *dbg, const intvdebug_stop_info *stop, char *dst, int dstsz)
+{
+    const int wide = intvdebug_word_width(dbg, stop->addr) == 16;
+
+    switch (stop->reason) {
+    case INTVDEBUG_STOP_PAUSE:
+        return snprintf(dst, (size_t)dstsz, "paused at $%04X", stop->pc);
+    case INTVDEBUG_STOP_STEP:
+        return snprintf(dst, (size_t)dstsz, "step at $%04X", stop->pc);
+    case INTVDEBUG_STOP_BREAKPOINT:
+        if (stop->bp_id > 0)
+            return snprintf(dst, (size_t)dstsz, "breakpoint: exec $%04X", stop->pc);
+        return snprintf(dst, (size_t)dstsz, "stopped at $%04X", stop->pc);
+    case INTVDEBUG_STOP_WATCH_READ:
+        return snprintf(dst, (size_t)dstsz, wide ? "read $%04X = $%04X at $%04X" : "read $%04X = $%02X at $%04X",
+                        stop->addr, stop->value, stop->from_pc);
+    case INTVDEBUG_STOP_WATCH_WRITE:
+        return snprintf(dst, (size_t)dstsz,
+                        wide ? "wrote $%04X = $%04X (was $%04X) at $%04X"
+                             : "wrote $%04X = $%02X (was $%02X) at $%04X",
+                        stop->addr, stop->value, stop->old_value, stop->from_pc);
+    default:
+        return snprintf(dst, (size_t)dstsz, "stopped at $%04X", stop->pc);
+    }
+}
+
+int intvdebug_stop_text(intvdebug *dbg, char *dst, int dstsz, int *address)
+{
+    intvdebug_snapshot snap;
+    int len;
+
+    if (!dst || dstsz <= 0)
+        return 0;
+    intvdebug_stop_snapshot(dbg, &snap);
+    len = (int)strlen(snap.text);
+    snprintf(dst, (size_t)dstsz, "%s", snap.text);
+    if (address)
+        *address = snap.address;
+    return len < dstsz ? len : dstsz - 1;
+}
+
+int intvdebug_stop_snapshot(intvdebug *dbg, intvdebug_snapshot *out)
+{
+    memset(out, 0, sizeof(*out));
+    pthread_mutex_lock(&dbg->lock);
+    pthread_mutex_lock(&dbg->bp_lock);
+    out->paused = paused_now(dbg);
+    out->serial = __atomic_load_n(&dbg->stop_serial, __ATOMIC_ACQUIRE);
+    out->stop = dbg->last;
+    pthread_mutex_unlock(&dbg->bp_lock);
+    pthread_mutex_unlock(&dbg->lock);
+    if (out->paused && out->stop.reason != INTVDEBUG_STOP_NONE) {
+        describe_stop(dbg, &out->stop, out->text, (int)sizeof(out->text));
+        out->address = out->stop.pc;
+    } else {
+        snprintf(out->text, sizeof(out->text), "running");
+        out->address = -1;
+    }
+    return out->paused;
 }
 
 /* ---- history ---------------------------------------------------------------- */
 
-void intvdebug_history_enable(intvdebug *d, int on)
+void intvdebug_history_enable(intvdebug *dbg, int on)
 {
-    if (on && !d->hist)
-        d->hist = calloc(INTVDEBUG_HISTORY_SIZE, sizeof(intvdebug_hist));
-    if (on && !d->hist)
+    if (on && !dbg->hist)
+        dbg->hist = calloc(INTVDEBUG_HISTORY_SIZE, sizeof(intvdebug_hist));
+    if (on && !dbg->hist)
         return;
-    d->hist_on = on ? 1 : 0;
-    if (d->engaged) {
+    dbg->hist_on = on ? 1 : 0;
+    if (dbg->engaged) {
         /* every instruction must reach the hook while it records */
-        intv.cp1600.step_count = (on || d->step_mode) ? 1 : ~0U;
+        intv.cp1600.step_count = (on || dbg->step_mode) ? 1 : ~0U;
     }
 }
 
-int intvdebug_history_enabled(const intvdebug *d)
+int intvdebug_history_enabled(const intvdebug *dbg)
 {
-    return d->hist_on;
+    return dbg->hist_on;
 }
 
-void intvdebug_history_clear(intvdebug *d)
+void intvdebug_history_clear(intvdebug *dbg)
 {
-    d->hist_count = 0;
+    dbg->hist_count = 0;
 }
 
-uint64_t intvdebug_history_count(const intvdebug *d)
+uint64_t intvdebug_history_count(const intvdebug *dbg)
 {
-    return d->hist_count;
+    return dbg->hist_count;
 }
 
-int intvdebug_history_copy(intvdebug *d, intvdebug_hist *out, int max)
+int intvdebug_history_copy(intvdebug *dbg, intvdebug_hist *out, int max)
 {
-    const uint64_t total = d->hist_count;
+    const uint64_t total = dbg->hist_count;
     uint64_t have = total < INTVDEBUG_HISTORY_SIZE ? total : INTVDEBUG_HISTORY_SIZE, first;
-    int n, i;
+    int count, idx;
 
-    if (!d->hist || max < 1)
+    if (!dbg->hist || max < 1)
         return 0;
-    n = have < (uint64_t)max ? (int)have : max;
-    first = total - (uint64_t)n;
-    for (i = 0; i < n; i++)
-        out[i] = d->hist[(first + (uint64_t)i) & (INTVDEBUG_HISTORY_SIZE - 1)];
-    return n;
+    count = have < (uint64_t)max ? (int)have : max;
+    first = total - (uint64_t)count;
+    for (idx = 0; idx < count; idx++)
+        out[idx] = dbg->hist[(first + (uint64_t)idx) & (INTVDEBUG_HISTORY_SIZE - 1)];
+    return count;
 }
 
-static int hist_text(const intvdebug_hist *h, char *dst, int dstsz)
+static int hist_text(const intvdebug_hist *h, char *dst, int dstsz, int dbd, int *length)
 {
     char buf[64];
-    dasm1600(buf, h->pc, 0, h->w[0], h->w[1], h->w[2]);
+    const int words = dasm1600(buf, h->pc, dbd, h->w[0], h->w[1], h->w[2]);
+    if (length)
+        *length = words < 1 ? 1 : words;
     snprintf(dst, (size_t)dstsz, "%s", dasm_body(buf));
     return (int)strlen(dst);
 }
@@ -1035,7 +1529,7 @@ int intvdebug_history_format(const intvdebug_hist *h, char *dst, int dstsz)
         return snprintf(dst, (size_t)dstsz, "%04X  (interrupt)", h->pc);
     if (h->event == INTVDEBUG_EV_BUS)
         return snprintf(dst, (size_t)dstsz, "%04X  (bus grant)", h->pc);
-    hist_text(h, text, sizeof(text));
+    hist_text(h, text, sizeof(text), 0, NULL);
     return snprintf(dst, (size_t)dstsz,
                     "%04X  %-22s R0 %04X R1 %04X R2 %04X R3 %04X R4 %04X R5 %04X R6 %04X  S%d C%d O%d Z%d I%d",
                     h->pc, text, h->r[0], h->r[1], h->r[2], h->r[3], h->r[4], h->r[5], h->r[6],
@@ -1043,81 +1537,184 @@ int intvdebug_history_format(const intvdebug_hist *h, char *dst, int dstsz)
                     (h->flags >> 4) & 1);
 }
 
+/* A branch, jump or call by what it did, not by its name: anything that left
+ * the PC somewhere other than the next instruction (PULR R7, MVI@ Rx,R7,
+ * MVII ..,R7, ADDR/INCR R7 included), plus the conditional branches that
+ * fell through. An immediate after SDBD is one word longer, so both lengths
+ * count as falling through. */
+static int hist_is_branch(const intvdebug_hist *h)
+{
+    char text[64];
+    int plain, doubled;
+
+    hist_text(h, text, sizeof(text), 0, &plain);
+    hist_text(h, text, sizeof(text), 1, &doubled);
+    if (h->r[7] != (uint16_t)(h->pc + plain) && h->r[7] != (uint16_t)(h->pc + doubled))
+        return 1;
+    hist_text(h, text, sizeof(text), 0, NULL);
+    return text[0] == 'B' || text[0] == 'J';   /* B, BC, BEXT, ... J, JR, JSR ... not taken */
+}
+
 int intvdebug_history_match(const intvdebug_hist *h, int filter, uint16_t lo, uint16_t hi)
 {
     if ((filter & INTVDEBUG_HIST_RANGE) && (h->pc < lo || h->pc > hi))
         return 0;
     if (filter & INTVDEBUG_HIST_BRANCHES) {
-        char text[64];
-        const char *m;
         if (h->event)
             return 0;
-        hist_text(h, text, sizeof(text));
-        m = text;
-        /* B, BC, BEXT, J, JR, JSR, ... and the conditional branches */
-        return m[0] == 'B' || m[0] == 'J';
+        return hist_is_branch(h);
     }
     return 1;
 }
 
+void intvdebug_trace_enable(intvdebug *dbg, int on)
+{
+    intvdebug_history_enable(dbg, on);
+}
+
+int intvdebug_trace_enabled(const intvdebug *dbg)
+{
+    return intvdebug_history_enabled(dbg);
+}
+
+void intvdebug_trace_clear(intvdebug *dbg)
+{
+    intvdebug_history_clear(dbg);
+}
+
+int intvdebug_trace_count(const intvdebug *dbg)
+{
+    const uint64_t total = dbg->hist_count;
+    return (int)(total < INTVDEBUG_HISTORY_SIZE ? total : INTVDEBUG_HISTORY_SIZE);
+}
+
+int intvdebug_trace_read(intvdebug *dbg, intvdebug_trace *out, int max)
+{
+    const uint64_t total = dbg->hist_count;
+    int count, idx;
+
+    if (!dbg->hist || max < 1)
+        return 0;
+    count = intvdebug_trace_count(dbg) < max ? intvdebug_trace_count(dbg) : max;
+    for (idx = 0; idx < count; idx++)
+        out[idx] = dbg->hist[(total - 1 - (uint64_t)idx) & (INTVDEBUG_HISTORY_SIZE - 1)];
+    return count;
+}
+
+int intvdebug_trace_format(const intvdebug_trace *entry, char *dst, int dstsz)
+{
+    return intvdebug_history_format(entry, dst, dstsz);
+}
+
+int intvdebug_trace_match(const intvdebug_trace *entry, int filter, uint16_t lo, uint16_t hi)
+{
+    return intvdebug_history_match(entry, filter, lo, hi);
+}
+
 /* ---- the memory map and the cartridge ---------------------------------------------- */
 
-int intvdebug_memory_map(intvdebug *d, intvdebug_region *out, int max)
+/* What a device is called in the map: its function, not its registration. */
+static const char *map_name(const char *name)
+{
+    static const struct { const char *from, *shown; } names[] = {
+        { "PSG0 AY8914", "PSG0" },     { "PSG1 AY8914", "ECS PSG1" },
+        { "Pad Pair 0", "Pads" },      { "Pad Pair 1", "ECS pads" },
+        { "INTV2PC #0", "Pads" },      { "INTV2PC #1", "ECS pads" },
+        { "CGC #0", "Pads" },          { "CGC #1", "ECS pads" },
+        { "Int. Voice", "Intellivoice" }, { "Scratch RAM", "Scratch RAM" },
+    };
+    size_t idx;
+    for (idx = 0; idx < sizeof(names) / sizeof(names[0]); idx++)
+        if (!strcmp(name, names[idx].from))
+            return names[idx].shown;
+    return name;
+}
+
+/* Is `name` already one of the " + "-joined parts of `joined`? */
+static int has_part(const char *joined, const char *name)
+{
+    const size_t length = strlen(name);
+    const char *where = joined;
+    while ((where = strstr(where, name)) != NULL) {
+        const int starts = where == joined || where[-1] == ' ';
+        const int ends = where[length] == '\0' || where[length] == ' ';
+        if (starts && ends)
+            return 1;
+        where += length;
+    }
+    return 0;
+}
+
+/* The devices that answer in one bin, named and joined ("PSG0 + Pads"); the
+ * hooks of the machine itself ([Graphics], [Event] ...), the CPU's cache
+ * snoop and our own watch device are not memory. */
+static void bin_signature(const periph_bus_t *bus, uint32_t bin, char *dst, int dstsz,
+                          int *readable, int *writable)
+{
+    char joined[128] = "";
+    int col, pass, parts = 0;
+
+    *readable = *writable = 0;
+    for (pass = 0; pass < 2; pass++)
+        for (col = 0; col < MAX_PERIPH_BIN; col++) {
+            const periph_t *const dev = pass == 0 ? bus->rd[col][bin] : bus->wr[col][bin];
+            const char *name;
+            if (!dev)
+                break;
+            if (dev == &g_watch || dev->name[0] == '[' || !strncmp(dev->name, "CP-1610", 7))
+                continue;
+            if (pass == 0)
+                *readable = 1;
+            else
+                *writable = 1;
+            name = map_name(dev->name);
+            if (has_part(joined, name) || parts >= 3)
+                continue;
+            snprintf(joined + strlen(joined), sizeof(joined) - strlen(joined), "%s%s", parts ? " + " : "", name);
+            parts++;
+        }
+    snprintf(dst, (size_t)dstsz, "%.31s", joined[0] ? joined : "unmapped");
+}
+
+int intvdebug_memory_map(intvdebug *dbg, intvdebug_region *out, int max)
 {
     periph_bus_t *const bus = intv.intv;
     const uint32_t bins = bus ? (bus->addr_mask >> bus->decode_shift) + 1 : 0;
-    uint32_t b, start = 0;
-    int n = 0, have = 0;
-    const periph_t *prd = NULL, *pwr = NULL;
-    int prcount = 0, pwcount = 0;
+    char name[32], run_name[32] = "";
+    int readable, writable, run_read = 0, run_write = 0, count = 0, have = 0;
+    uint32_t bin, start = 0;
 
-    if (!d->paused || !bus || bins > 4096)
+    if (!paused_now(dbg) || !bus || bins > 4096)
         return 0;
-    for (b = 0; b <= bins; b++) {
-        const periph_t *rd = NULL, *wr = NULL;
-        int rc = 0, wc = 0, i;
-        if (b < bins) {
-            for (i = 0; i < MAX_PERIPH_BIN && bus->rd[i][b]; i++)
-                if (bus->rd[i][b] != &g_watch) {
-                    if (!rd)
-                        rd = bus->rd[i][b];
-                    rc++;
-                }
-            for (i = 0; i < MAX_PERIPH_BIN && bus->wr[i][b]; i++)
-                if (bus->wr[i][b] != &g_watch) {
-                    if (!wr)
-                        wr = bus->wr[i][b];
-                    wc++;
-                }
-        }
+    for (bin = 0; bin <= bins; bin++) {
+        if (bin < bins)
+            bin_signature(bus, bin, name, (int)sizeof(name), &readable, &writable);
         /* a run ends when what answers changes (or the map does) */
-        if (have && (b == bins || rd != prd || wr != pwr || rc != prcount || wc != pwcount)) {
-            if ((prd || pwr) && n < max) {
-                const periph_t *p = prd ? prd : pwr;
-                out[n].lo = (uint16_t)(start << bus->decode_shift);
-                out[n].hi = (uint16_t)((b << bus->decode_shift) - 1);
-                out[n].readable = prd != NULL;
-                out[n].writable = pwr != NULL;
-                snprintf(out[n].name, sizeof(out[n].name), "%.31s", p->name);
-                n++;
+        if (have && (bin == bins || strcmp(name, run_name) || readable != run_read || writable != run_write)) {
+            if (count < max) {
+                out[count].lo = (uint16_t)(start << bus->decode_shift);
+                out[count].hi = (uint16_t)((bin << bus->decode_shift) - 1);
+                out[count].readable = (uint8_t)run_read;
+                out[count].writable = (uint8_t)run_write;
+                snprintf(out[count].name, sizeof(out[count].name), "%s", run_name);
+                count++;
             }
             have = 0;
         }
-        if (b < bins && !have) {
+        if (bin < bins && !have) {
             have = 1;
-            start = b;
-            prd = rd;
-            pwr = wr;
-            prcount = rc;
-            pwcount = wc;
+            start = bin;
+            run_read = readable;
+            run_write = writable;
+            snprintf(run_name, sizeof(run_name), "%s", name);
         }
     }
-    return n;
+    return count;
 }
 
-void intvdebug_cart_info(intvdebug *d, intvdebug_cart *out)
+void intvdebug_cart_info(intvdebug *dbg, intvdebug_cart *out)
 {
-    (void)d;
+    (void)dbg;
     memset(out, 0, sizeof(*out));
     snprintf(out->path, sizeof(out->path), "%s", intv.fn_game ? intv.fn_game : "");
     snprintf(out->name, sizeof(out->name), "%s", intv.cart_name ? intv.cart_name : "");
@@ -1125,6 +1722,104 @@ void intvdebug_cart_info(intvdebug *d, intvdebug_cart *out)
     out->fujinet_mailbox = intv.fujinet.mailbox_active ? 1 : 0;
     out->ecs = intv.ecs_enable > 0 ? 1 : 0;   /* -1 is "automatic", and resolves to off unless the cart asks */
     out->jlp = intv.jlp.periph.bus != NULL;
+    out->ivoice = intv.ivoice.periph.bus != NULL;
+    out->pal = intv.stic.pal ? 1 : 0;
+}
+
+int intvdebug_cart_summary(intvdebug *dbg, char *dst, int dstsz)
+{
+    intvdebug_cart cart;
+    const char *slash;
+    int len;
+
+    intvdebug_cart_info(dbg, &cart);
+    slash = strrchr(cart.path, '/');
+    if (!slash)
+        slash = strrchr(cart.path, '\\');
+    len = snprintf(dst, (size_t)dstsz, "Cartridge: %s", cart.name[0] ? cart.name : slash ? slash + 1
+                                                       : cart.path[0] ? cart.path : "(none)");
+    if (cart.year > 0 && len < dstsz)
+        len += snprintf(dst + len, (size_t)(dstsz - len), " (%d)", cart.year);
+    if (len < dstsz)
+        len += snprintf(dst + len, (size_t)(dstsz - len), "%s%s%s%s%s", cart.ecs ? ", ECS" : "",
+                        cart.jlp ? ", JLP" : "", cart.ivoice ? ", Intellivoice" : "",
+                        cart.fujinet_mailbox ? ", FujiNet mailbox" : "", cart.pal ? ", PAL" : ", NTSC");
+    return len < dstsz ? len : dstsz - 1;
+}
+
+/* ---- symbols ----------------------------------------------------------------------- */
+
+typedef struct { uint16_t addr; char name[48]; int index; } sym_pick;
+
+static int sym_pick_cmp(const void *lhs_ptr, const void *rhs_ptr)
+{
+    const sym_pick *lhs = lhs_ptr, *rhs = rhs_ptr;
+    if (lhs->addr != rhs->addr)
+        return lhs->addr < rhs->addr ? -1 : 1;
+    return strcasecmp(lhs->name, rhs->name);
+}
+
+static int contains_nocase(const char *hay, const char *needle)
+{
+    const size_t len = strlen(needle);
+    if (!len)
+        return 1;
+    for (; *hay; hay++)
+        if (!strncasecmp(hay, needle, len))
+            return 1;
+    return 0;
+}
+
+int intvdebug_symbols_filter(intvdebug *dbg, const char *text, int *out, int max)
+{
+    intvsymtab *const table = intvsymtab_shared();
+    const int total = table ? intvsymtab_count(table) : 0;
+    sym_pick *pick;
+    int count = 0, idx;
+
+    (void)dbg;
+    if (!out || max <= 0 || total <= 0)
+        return 0;
+    pick = malloc((size_t)total * sizeof(*pick));
+    if (!pick)
+        return 0;
+    for (idx = 0; idx < total; idx++) {
+        uint16_t addr;
+        char name[48];
+        if (intvsymtab_enum(table, idx, &addr, name, sizeof(name), NULL, 0) &&
+            contains_nocase(name, text ? text : "")) {
+            pick[count].addr = addr;
+            snprintf(pick[count].name, sizeof(pick[count].name), "%s", name);
+            pick[count].index = idx;
+            count++;
+        }
+    }
+    qsort(pick, (size_t)count, sizeof(*pick), sym_pick_cmp);
+    if (count > max)
+        count = max;
+    for (idx = 0; idx < count; idx++)
+        out[idx] = pick[idx].index;
+    free(pick);
+    return count;
+}
+
+/* ---- hooks the prompt and the Video tab share ----------------------------------------- */
+
+const char *const intvdebug_reg_names[] = {
+    "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "pc", "sp", "s", "z", "o", "c", "i", "d",
+    "frame", "cycles", "value", "addr", "old", NULL,
+};
+
+static const char *(*g_video_text)(const char *section);
+
+void intvdebug_set_video_text(const char *(*callback)(const char *section))
+{
+    g_video_text = callback;
+}
+
+const char *(*intvdebug_video_text_hook(void))(const char *section)
+{
+    return g_video_text;
 }
 
 /* ---- FujiNet trace ------------------------------------------------------- */
@@ -1165,7 +1860,7 @@ void intvdebug_fujinet_trace_clear(intvdebug *d)
 
 /* Reads the peripheral without stopping the machine: single bytes and ints,
  * shown, never acted on, so a torn read costs one stale line. */
-#define MB(x) (fn->ram[(x) - FUJI_MB_BASE])
+#define MB(x) (callback->ram[(x) - FUJI_MB_BASE])
 int intvdebug_fujinet_state(intvdebug *d, char *dst, int dstsz)
 {
     static const char *const link_names[] = {
@@ -1179,8 +1874,8 @@ int intvdebug_fujinet_state(intvdebug *d, char *dst, int dstsz)
     static const char *const boot_names[] = {
         "idle", "opening", "transferring", "mapping",
     };
-    const fujinet_t *const fn = &intv.fujinet;
-    const unsigned state = (unsigned)fn->state;
+    const fujinet_t *const callback = &intv.fujinet;
+    const unsigned state = (unsigned)callback->state;
     const unsigned status = MB(FUJI_MB_STATUS);
     const unsigned err = MB(FUJI_MB_ERR);
     const unsigned boot = MB(FUJI_MB_BOOT_STATE);
@@ -1192,7 +1887,7 @@ int intvdebug_fujinet_state(intvdebug *d, char *dst, int dstsz)
 
     if (!intv_host_is_running())
         return snprintf(dst, (size_t)dstsz, "The Intellivision is off.\n");
-    if (!fn->periph.tick)
+    if (!callback->periph.tick)
         return snprintf(dst, (size_t)dstsz, "No FujiNet mailbox this session.\n");
 
     if (boot == FUJI_BOOT_FAILED)
@@ -1204,9 +1899,9 @@ int intvdebug_fujinet_state(intvdebug *d, char *dst, int dstsz)
     else
         snprintf(boot_text, sizeof(boot_text), "%02X", boot);
     /* The guest sent it: printable ASCII only. */
-    for (i = 0; i < (int)sizeof(path) - 1 && fn->last_boot_path[i]; i++)
-        path[i] = fn->last_boot_path[i] >= 0x20 && fn->last_boot_path[i] < 0x7F
-                      ? fn->last_boot_path[i] : '.';
+    for (i = 0; i < (int)sizeof(path) - 1 && callback->last_boot_path[i]; i++)
+        path[i] = callback->last_boot_path[i] >= 0x20 && callback->last_boot_path[i] < 0x7F
+                      ? callback->last_boot_path[i] : '.';
     path[i] = '\0';
 
     return snprintf(dst, (size_t)dstsz,
@@ -1231,8 +1926,8 @@ int intvdebug_fujinet_state(intvdebug *d, char *dst, int dstsz)
         "Boot        %s\n"
         "Boot path   %s\n",
         state < sizeof(link_names) / sizeof(link_names[0]) ? link_names[state] : "?",
-        fn->port,
-        fn->mailbox_active ? "active" : "off (the cart's memory map covers it)",
+        callback->port,
+        callback->mailbox_active ? "active" : "off (the cart's memory map covers it)",
         m0 >= 0x20 && m0 < 0x7F ? (int)m0 : '.',
         m1 >= 0x20 && m1 < 0x7F ? (int)m1 : '.',
         (unsigned)MB(FUJI_MB_PROTO_VER),

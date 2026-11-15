@@ -5,11 +5,10 @@
  * staged tree's src/cp1600/cp1600.h) offers cp1600_instr_tick(), a callback
  * invoked between instructions whenever cp1600->steps_remaining reaches 0
  * and gets refilled from cp1600->step_count. jzIntv's own console debugger
- * (src/debug/debug.c) already registers itself there unconditionally at
- * cfg_init() time; intvdebug_set_engaged(d, 1) simply re-registers OUR OWN
- * hook in its place (a single function pointer, not a chain) -- safe,
- * because the console debugger is never reachable here (nothing offers it
- * a stdin to read commands from).
+ * (src/debug/debug.c) is never initialised in this build (nothing offers it
+ * a stdin, and cfg->debugging stays 0), so the tick is ours alone:
+ * intvdebug_set_engaged(d, 1) registers it (a single function pointer, not
+ * a chain).
  *
  * Disengaged, step_count is set huge so the hook fires rarely -- a session
  * that never opens the debugger pays almost nothing. Engaged, step_count is
@@ -56,8 +55,28 @@ typedef struct {
                         * names in cp1600.h) */
     int D;           /* Double-Byte-Data countdown (a CP-1610 quirk for
                       * split immediate encoding); mostly of interest to
-                      * the disassembler, exposed for completeness. */
+                      * the disassembler, exposed for completeness.
+                      * Non-zero: SDBD is pending for the next instruction. */
+    int interruptible; /* the next instruction boundary would accept an
+                        * interrupt: I is set and no SDBD is pending */
+    int intrq, busrq;  /* the STIC's INTRQ / BUSRQ request is asserted */
+    uint64_t cycles;   /* the machine's clock (CPU cycles) */
+    uint32_t frame;    /* STIC frames since power-on, from the clock */
 } intvdebug_regs;
+
+/* The registers intvdebug_regs_set can change. */
+enum {
+    INTVDEBUG_REG_R0 = 0,   /* ... INTVDEBUG_REG_R0 + 7 */
+    INTVDEBUG_REG_SP = 6,   /* R6 */
+    INTVDEBUG_REG_PC = 7,   /* R7 */
+    INTVDEBUG_REG_S = 8,
+    INTVDEBUG_REG_Z,
+    INTVDEBUG_REG_O,
+    INTVDEBUG_REG_C,
+    INTVDEBUG_REG_I,
+    INTVDEBUG_REG_D,        /* any non-zero value sets SDBD pending */
+    INTVDEBUG_REG_COUNT
+};
 
 /* Engage or release the debugger. See this file's header for exactly what
  * engaging costs and why releasing is safe even mid-session. Releasing
@@ -98,6 +117,10 @@ void intvdebug_step_over(intvdebug *d);
  * meaningful while paused. */
 void intvdebug_step_out(intvdebug *d);
 
+/* Run until the PC reaches addr (a one-shot breakpoint), then pause. Only
+ * meaningful while paused. A real breakpoint on the way stops first. */
+void intvdebug_run_to(intvdebug *d, uint16_t addr);
+
 /* ---- stepping by IntyBASIC line ------------------------------------------
  * These use the shared source map (core/debugger/srcmap.h): they run until
  * the PC reaches the first word of a BASIC line, then pause. Code with no
@@ -118,10 +141,18 @@ void intvdebug_step_line_out(intvdebug *d);
  * and refreshes when it changes, rather than being called back on the
  * emulator thread. */
 uint64_t intvdebug_stop_serial(const intvdebug *d);
+/* Bumped whenever the machine stopped or resumed, a command ran, the
+ * breakpoint table or a hit count changed: a UI refreshes when it moves. */
+unsigned intvdebug_generation(const intvdebug *d);
 
 /* ---- inspection: valid only while paused --------------------------------
  * Each returns 0 and touches nothing when the machine is running. */
 int intvdebug_regs_get(intvdebug *d, intvdebug_regs *out);
+/* Changes one register or flag (INTVDEBUG_REG_*; a register takes the low 16
+ * bits, a flag any non-zero value). Only while paused: returns 1, or 0 when
+ * running or the register is unknown. Setting the PC onto an address that
+ * holds a breakpoint does not re-fire it on the next run. */
+int intvdebug_regs_set(intvdebug *d, int reg, unsigned value);
 
 /* Reads n words starting at addr (16-bit address space) through
  * periph_peek -- the same non-destructive read path jzIntv's own debugger
@@ -167,18 +198,27 @@ int intvdebug_disassemble(intvdebug *d, uint16_t addr, int dbd,
  * jzIntv's own breakpoint). A READ or WRITE entry watches the words lo..hi
  * and stops AFTER the instruction that touched them (PC is then on the next
  * instruction); intvdebug_last_stop says what was touched. Only the CPU's own
- * data accesses are seen: an instruction fetch never goes through the bus, so
- * a READ entry cannot catch code being fetched (use EXEC for that), and the
+ * data accesses are seen: the decoder's instruction fetches are filtered out
+ * (a READ entry cannot catch code being fetched; use EXEC for that), and the
  * STIC's and DMA's reads are not counted. Ids are never reused.
  *
- * A WRITE entry may carry a condition on the value written; the scratchpad
- * ($0100-$01EF) is 8 bits wide, so compare with a mask. Safe to call while
- * running: the bus change is applied by the emulator thread at its next
- * hook (or at once when paused). */
-#define INTVDEBUG_BP_EXEC  1
-#define INTVDEBUG_BP_READ  2
-#define INTVDEBUG_BP_WRITE 4
+ * An entry may carry a condition, an expression (core/debugger/expr.h):
+ * numbers ($5000 0x5000 5000h 20480 %1010), r0-r7 pc sp, the flags s z o c i
+ * d, labels, [addr] (the word at addr), frame cycles, C operators, and for
+ * an access `value`, `addr` and `old` (the word before a write; for a read
+ * `old` is the value). The scratchpad, GROM, GRAM and ECS RAM are 8 bits
+ * wide: their values are masked to 8 bits. A condition that does not parse
+ * is refused by intvdebug_bp_add; one that no longer evaluates stops rather
+ * than hiding. Safe to call while running: the bus change is applied by the
+ * emulator thread at its next hook (or at once when paused). */
+#define INTVDEBUG_BP_EXEC   1
+#define INTVDEBUG_BP_READ   2
+#define INTVDEBUG_BP_WRITE  4
+#define INTVDEBUG_BP_ACCESS 6   /* READ | WRITE as one entry */
 
+/* The older fixed conditions, kept working: an entry with `cond` set and no
+ * condition text behaves as the expression `value != old`, `(value & mask)
+ * == (cond value & mask)` or `!=`. A WRITE entry only. */
 enum {
     INTVDEBUG_COND_ANY = 0,
     INTVDEBUG_COND_CHANGED,  /* the value written differs from the old one */
@@ -192,13 +232,18 @@ typedef struct {
     uint16_t lo, hi;      /* hi == lo for EXEC */
     int      enabled;
     unsigned hits;
-    int      cond;        /* INTVDEBUG_COND_*, WRITE only */
+    int      cond;        /* INTVDEBUG_COND_*, WRITE only (see above) */
     uint16_t value, mask; /* for COND_EQ / COND_NE */
+    char     condition[128]; /* an expression, "" for none; wins over cond */
 } intvdebug_bp;
 
-/* Adds an entry (type, lo, hi, cond, value, mask are read; mask 0 = 0xFFFF).
- * Returns its id, or -1 when the table is full or the spec is empty. */
+/* Adds an entry (type, lo, hi, condition, cond, value, mask are read; mask
+ * 0 = 0xFFFF). Returns its id, or -1 when the table is full, the spec is
+ * empty or its condition does not parse. */
 int  intvdebug_bp_add(intvdebug *d, const intvdebug_bp *spec);
+/* Replaces an entry's condition ("" clears it, and the older cond too).
+ * Returns 1, or 0 when there is no such entry or the text does not parse. */
+int  intvdebug_bp_set_condition(intvdebug *d, int id, const char *condition);
 int  intvdebug_bp_remove(intvdebug *d, int id);
 int  intvdebug_bp_enable(intvdebug *d, int id, int enabled);
 int  intvdebug_bp_clear_hits(intvdebug *d);
@@ -234,13 +279,45 @@ typedef struct {
     int      reason;
     int      bp_id;      /* the entry that fired, 0 if none */
     uint16_t addr;       /* the word touched (watch), or the PC (breakpoint) */
-    uint16_t value;      /* the value written (WRITE) */
-    uint16_t old_value;  /* the value before it (WRITE, when known) */
+    uint16_t value;      /* the value written or read, masked to the word's width */
+    uint16_t old_value;  /* the value before a write */
     uint16_t pc;         /* the instruction after the access / the one stopped at */
+    uint16_t from_pc;    /* the instruction that made the access (watch) */
     uint64_t serial;     /* intvdebug_stop_serial at the stop */
 } intvdebug_stop_info;
 
 int  intvdebug_last_stop(intvdebug *d, intvdebug_stop_info *out);
+
+/* Why the machine last stopped, worded by the core so every window agrees
+ * and the width is right ($1234 for a system RAM word, $34 for the
+ * scratchpad): "paused at $5012", "step at $5012", "breakpoint: exec $5012"
+ * (a one-shot from Over/Out/Run to says "stopped at $5012"),
+ * "wrote $0200 = $1234 (was $1233) at $5012", "read $0200 = $1234 at $5012".
+ * While running it says "running". *address gets the PC to show, -1 when
+ * running. Returns the length. */
+int  intvdebug_stop_text(intvdebug *d, char *dst, int dstsz, int *address);
+
+/* Everything about the current stop read in one critical section, so a
+ * poller never sees a stop with the old serial or the old reason: paused,
+ * the serial, the stop info and its text agree. Returns paused. */
+typedef struct {
+    int      paused;
+    uint64_t serial;
+    intvdebug_stop_info stop;
+    char     text[160];
+    int      address;     /* the PC to show, -1 when running */
+} intvdebug_snapshot;
+int  intvdebug_stop_snapshot(intvdebug *d, intvdebug_snapshot *out);
+
+/* The width of the word at addr in bits: 8 for the scratchpad and the
+ * controller/PSG registers ($0100-$01FF), GROM/GRAM ($3000-$3FFF) and, with
+ * the ECS, its RAM ($4000-$47FF); else 16. d may be NULL (no ECS check). */
+int  intvdebug_word_width(const intvdebug *d, uint16_t addr);
+
+/* Evaluates an expression (the grammar above) in the machine's context; 0
+ * and *out, or -1 and a message. Registers and [addr] need the machine
+ * stopped. value/addr/old are only defined inside a condition. */
+int  intvdebug_eval(intvdebug *d, const char *text, long *out, char *err, int errsz);
 
 /* ---- instruction history and trace -------------------------------------------
  * With history on, every instruction the CPU runs is recorded into a ring of
@@ -254,8 +331,9 @@ int  intvdebug_last_stop(intvdebug *d, intvdebug_stop_info *out);
 enum { INTVDEBUG_EV_NONE = 0, INTVDEBUG_EV_INTERRUPT = 1, INTVDEBUG_EV_BUS = 2 };
 
 typedef struct {
-    uint64_t cycle;
-    uint16_t pc;        /* the instruction's address */
+    uint64_t cycle;     /* the machine's clock after the instruction */
+    uint32_t frame;     /* STIC frames since power-on at that point */
+    uint16_t pc;        /* the instruction's address (an interrupt: where it was taken) */
     uint16_t w[3];      /* its opcode words */
     uint16_t r[8];      /* registers AFTER it ran */
     uint16_t flags;     /* bit0 S, 1 C, 2 O, 3 Z, 4 I, 5 D (double-byte-data pending) */
@@ -271,12 +349,30 @@ uint64_t intvdebug_history_count(const intvdebug *d);
 /* Copies up to max of the newest entries, oldest first; returns how many. */
 int  intvdebug_history_copy(intvdebug *d, intvdebug_hist *out, int max);
 
-#define INTVDEBUG_HIST_BRANCHES 1   /* only branches, jumps and calls */
+#define INTVDEBUG_HIST_BRANCHES 1   /* only instructions that changed the PC (taken
+                                     * branches, jumps, calls, returns, a write to R7)
+                                     * and the conditional branches not taken */
 #define INTVDEBUG_HIST_RANGE    2   /* only pc in lo..hi */
 /* One display line for an entry: "50CD  JSR  R5,$50D5   R0 0001 ... S0 C0 O0 Z0 I1". */
 int  intvdebug_history_format(const intvdebug_hist *h, char *dst, int dstsz);
 /* True when the entry passes the filter. */
 int  intvdebug_history_match(const intvdebug_hist *h, int filter, uint16_t lo, uint16_t hi);
+
+/* The same ring under the names the sibling debuggers' Trace tabs use. The
+ * one difference: intvdebug_trace_read returns the NEWEST entries first. */
+typedef intvdebug_hist intvdebug_trace;
+#define INTVDEBUG_TRACE_ALL      0
+#define INTVDEBUG_TRACE_BRANCHES INTVDEBUG_HIST_BRANCHES
+#define INTVDEBUG_TRACE_RANGE    INTVDEBUG_HIST_RANGE
+void intvdebug_trace_enable(intvdebug *d, int on);
+int  intvdebug_trace_enabled(const intvdebug *d);
+/* Up to max entries, newest first; returns how many. */
+int  intvdebug_trace_read(intvdebug *d, intvdebug_trace *out, int max);
+void intvdebug_trace_clear(intvdebug *d);
+/* Entries held (at most INTVDEBUG_HISTORY_SIZE). */
+int  intvdebug_trace_count(const intvdebug *d);
+int  intvdebug_trace_format(const intvdebug_trace *t, char *dst, int dstsz);
+int  intvdebug_trace_match(const intvdebug_trace *t, int filter, uint16_t lo, uint16_t hi);
 
 /* ---- the cartridge and the memory map: valid only while paused ----------- */
 typedef struct {
@@ -285,8 +381,10 @@ typedef struct {
     char     name[32];    /* what answers there: "System RAM", "EXEC ROM", "STIC" ... */
 } intvdebug_region;
 
-/* The address map as the bus decodes it, runs of 16-word bins with the same
- * devices merged. Returns how many regions (up to max). */
+/* The address map as the bus decodes it, ordered and gap-free from $0000 to
+ * $FFFF: runs of 16-word bins that the same devices answer, named by
+ * function ("PSG0 + Pads"), with the holes as "unmapped". Returns how many
+ * regions (up to max; about 25 for a console with a cartridge). */
 int  intvdebug_memory_map(intvdebug *d, intvdebug_region *out, int max);
 
 typedef struct {
@@ -296,9 +394,95 @@ typedef struct {
     int  fujinet_mailbox; /* the FujiNet mailbox is mapped */
     int  ecs;             /* ECS present */
     int  jlp;             /* JLP accelerator / flash */
+    int  ivoice;          /* Intellivoice present */
+    int  pal;             /* PAL timing (else NTSC) */
 } intvdebug_cart;
 
 void intvdebug_cart_info(intvdebug *d, intvdebug_cart *out);
+/* One line: "Cartridge: Astrosmash (1981), ECS, JLP, FujiNet mailbox". */
+int  intvdebug_cart_summary(intvdebug *d, char *dst, int dstsz);
+
+/* ---- Cart & I/O: the controllers, PSG I/O ports, ECS keyboard, Intellivoice,
+ * JLP and the bank switches. Plain reads of the machine's state: valid while
+ * paused, and a torn value while running is only a stale display. Returns 0
+ * (and fills nothing) when the machine is not running at all. */
+typedef struct {
+    int      present;       /* this pad pair exists (pad 1 needs the ECS) */
+    uint8_t  side[2];       /* last value read/written on each side's port ($01FE/$01FF; ECS $00FE/$00FF) */
+    uint8_t  output[2];     /* each side is set for output (ECS pads only) */
+    uint32_t left[18], right[18]; /* event inputs to the left and right controllers
+                             * (keypad, disc, action buttons; 0 = idle) */
+    uint32_t keys[8];       /* the ECS keyboard's eight scan rows (pad 1) */
+} intvdebug_pad;
+
+typedef struct {
+    intvdebug_pad pad[2];   /* base pair, then the ECS pair */
+    int      ecs;
+    int      ecs_page[3];   /* the page each ECS ROM window ($2xxx $7xxx $Exxx) has selected */
+    int      ecs_page_own[3];/* the page that window belongs to */
+    int      ivoice;
+    int      ivoice_lrq;    /* SP0256 load request: 0 = it can take a command */
+    int      ivoice_ald;    /* address-load pending (-1 none) */
+    int      ivoice_pc, ivoice_halted, ivoice_fifo_sel;
+    uint32_t ivoice_mode, ivoice_page;
+    uint32_t ivoice_fifo_head, ivoice_fifo_tail;
+    uint16_t ivoice_fifo[64];
+    int      jlp;
+    int      jlp_mb_hole;   /* the FujiNet mailbox owns $9C00-$9F3F inside JLP's window */
+    int      jlp_flash;     /* a save-game flash image is open */
+    uint32_t jlp_flash_bytes;
+    int      jlp_accel;     /* the $9F80-$9FFF accelerators answer */
+    int      locutus;       /* the Locutus mapper owns the cartridge space */
+    int      fujinet_mailbox;
+} intvdebug_io;
+int  intvdebug_io_get(intvdebug *d, intvdebug_io *out);
+
+/* ---- Sound: the AY-3-8914 PSGs. Only while paused (read straight out of the
+ * chip), else 0. unit 0 is the base PSG at $01F0, unit 1 the ECS's at $00F0
+ * (present only with the ECS). */
+typedef struct {
+    int      present;
+    uint16_t reg[14];       /* the chip's registers; the mixer, 8, is active-low (a set bit turns the voice OFF) */
+    int      period[3];     /* tone periods A-C, 12 bits */
+    double   hz[3];         /* the tone each makes: 111860.8 / period */
+    int      tone_on[3], noise_on[3];   /* decoded from the mixer */
+    int      level[3];      /* 0-15 */
+    int      envelope[3];   /* the voice follows the envelope instead of its level */
+    int      noise_period;  /* 5 bits */
+    int      env_period;    /* 16 bits */
+    int      env_shape;     /* reg 10, low 4 bits: continue attack alternate hold */
+    int      env_level;     /* the envelope's current volume, 0-15 */
+    int      channel_state[3];  /* each tone's square wave right now */
+} intvdebug_psg;
+int  intvdebug_sound_get(intvdebug *d, int unit, intvdebug_psg *out);
+
+/* ---- symbols (for a Symbols tab) ----------------------------------------------
+ * Indices into the shared symbol table's intvsymtab_enum order (the built-in
+ * names, a loaded .sym and user labels) whose name contains `text`
+ * (case-insensitive; empty matches all), ordered by address then name.
+ * Returns the count written. */
+int  intvdebug_symbols_filter(intvdebug *d, const char *text, int *out, int max);
+
+/* ---- the prompt ------------------------------------------------------------------
+ * Runs one command line and writes its output into dst: step [n], over, out,
+ * line, overline, lineout, run, stop, runto <addr>, break <addr>[-<end>]
+ * [cond], bpr/bpw/bpa <addr>[-<end>] [cond], delete <id>, enable/disable
+ * <id>, clear, hits, breaks, print <expr>, regs, set <reg> <expr>, mem
+ * <addr> [len], poke <addr> <word...>, disasm [addr] [n], trace [on|off|clear|n],
+ * watch [expr], unwatch <n|all>, find [hex] <words> | find text <string>,
+ * symbols [text], label <addr> <name>, labels [file], source, locals, map, io,
+ * cart, sound, save <ram|gram|regs|trace> <file>, help. Registers: r0-r7 pc
+ * sp s z o c i d; [addr] reads the word at addr; in a breakpoint condition
+ * value, addr and old name the access. Returns the length. */
+int  intvdebug_command(intvdebug *d, const char *command, char *dst, int dstsz);
+/* Completions for a prefix (commands, registers and labels), one per line.
+ * Returns the count. */
+int  intvdebug_completions(intvdebug *d, const char *prefix, char *dst, int dstsz);
+
+/* The Video tab's text for the console `video` command. fn gets a section
+ * name (or "") and returns text that stays valid until its next call, NULL
+ * when there is no frame yet. Set by whoever owns the Video controller. */
+void intvdebug_set_video_text(const char *(*fn)(const char *section));
 
 /* ---- FujiNet: the mailbox's BoIP bytes, as FujiBus packets ---------------
  * A tap on the staged tree's fn_sock (fn_sock_set_trace) feeds this from

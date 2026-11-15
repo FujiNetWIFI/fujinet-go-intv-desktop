@@ -79,6 +79,10 @@ typedef struct {
                     * writes go to stic->p_mode and take effect next
                     * frame, see stic_ctrl_wr_internal) */
     int gram_size;  /* 0 = 64 cards, 1 = 128, 2 = 256 (TutorVision) */
+    uint8_t palette[16][3]; /* the colours the renderers use when has_palette
+                            * is set (a capture carries its own); otherwise
+                            * they read the machine's intv.gfx.palette */
+    int has_palette;
     uint16_t gram_mask; /* stic->gram_mask -- masks GRAM card indices to
                         * what gram_size actually provides; copied rather
                         * than recomputed so this can never drift from
@@ -86,6 +90,11 @@ typedef struct {
 } intvstic_snapshot;
 
 void intvstic_snapshot_get(intvdebug *d, intvstic_snapshot *out);
+
+/* The same view from a Video-tab capture (intvvidcap.h): needs neither a
+ * paused machine nor the machine at all, and carries the capture's palette. */
+struct intvvid_capture;
+void intvstic_snapshot_from_capture(const struct intvvid_capture *cap, intvstic_snapshot *out);
 
 /* ---- registers / mode --------------------------------------------------
  * One decoded text line per register/field. Returns the length written. */

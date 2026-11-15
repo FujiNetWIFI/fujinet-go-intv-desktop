@@ -175,12 +175,20 @@ list(APPEND JZINTV_CORE_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/jzintv/intv_audio.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/jzintv/intv_host.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/debugger.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/debugger/expr.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/fujitrace.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/debugger/iostate.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/memtools.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/debugger/prompt.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/srcmap.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/sticview.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/debugger/symbols.c"
 )
+
+# ---- VIDEO agent: the Video tab's controller (intvvidtab.h) ----------------
+list(APPEND JZINTV_CORE_SOURCES
+  "${CMAKE_CURRENT_SOURCE_DIR}/debugger/vidtab.c")
+# ---- end VIDEO agent ---------------------------------------------------------
 
 add_library(jzintv_core STATIC ${JZINTV_CORE_SOURCES})
 set_target_properties(jzintv_core PROPERTIES
@@ -453,6 +461,13 @@ add_executable(symtab_test tests/symtab_test.c)
 target_link_libraries(symtab_test jzintv_core)
 target_include_directories(symtab_test PRIVATE debugger)
 
+# The engine's newer parts on a real machine (needs the embedded ROMs).
+add_executable(engine_test tests/engine_test.c)
+target_link_libraries(engine_test jzintv_core)
+target_include_directories(engine_test PRIVATE src debugger)
+target_compile_definitions(engine_test PRIVATE
+  SRCMAP_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/srcmap")
+
 # Pure test of the IntyBASIC source map; the fixtures are real intybasic +
 # as1600 output.
 add_executable(srcmap_test tests/srcmap_test.c)
@@ -467,6 +482,16 @@ target_link_libraries(linestep_test jzintv_core)
 target_include_directories(linestep_test PRIVATE src debugger)
 target_compile_definitions(linestep_test PRIVATE
   SRCMAP_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/srcmap")
+
+# Pure: the breakpoint-condition / prompt expression evaluator.
+add_executable(expr_test tests/expr_test.c)
+target_link_libraries(expr_test jzintv_core)
+target_include_directories(expr_test PRIVATE debugger)
+
+# Pure: the prompt, expressions and breakpoint conditions with no machine.
+add_executable(prompt_test tests/prompt_test.c)
+target_link_libraries(prompt_test jzintv_core)
+target_include_directories(prompt_test PRIVATE debugger)
 
 # Pure: watch list, range parsing, search queries, breakpoint descriptions.
 add_executable(memtools_test tests/memtools_test.c)
@@ -520,10 +545,31 @@ add_test(NAME srcmap COMMAND srcmap_test)
 add_test(NAME linestep COMMAND linestep_test)
 set_tests_properties(linestep PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
 add_test(NAME memtools COMMAND memtools_test)
+add_test(NAME expr COMMAND expr_test)
+add_test(NAME prompt COMMAND prompt_test)
+add_test(NAME engine COMMAND engine_test)
+set_tests_properties(engine PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 add_test(NAME watch COMMAND watch_test)
 set_tests_properties(watch PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
 add_test(NAME fujitrace COMMAND fujitrace_test)
 add_test(NAME periph COMMAND periph_test)
+
+# ---- VIDEO agent: Video tab tests -------------------------------------------
+# Pure: synthetic captures fed to the controller, plus fuzz. No ROMs.
+add_executable(vidtab_test tests/vidtab_test.c)
+target_link_libraries(vidtab_test jzintv_core)
+target_include_directories(vidtab_test PRIVATE src debugger)
+add_test(NAME vidtab COMMAND vidtab_test)
+
+# A real machine: Display equals the published frame at a stop (needs the ROMs).
+add_executable(vidtab_live_test tests/vidtab_live_test.c)
+target_link_libraries(vidtab_live_test jzintv_core)
+target_include_directories(vidtab_live_test PRIVATE src debugger)
+target_compile_definitions(vidtab_live_test PRIVATE
+  SRCMAP_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/srcmap")
+add_test(NAME vidtab_live COMMAND vidtab_live_test)
+set_tests_properties(vidtab_live PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+# ---- end VIDEO agent ---------------------------------------------------------
 add_test(NAME rom_import COMMAND rom_import_test)
 set_tests_properties(fujibus_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
                      RUN_SERIAL ON)

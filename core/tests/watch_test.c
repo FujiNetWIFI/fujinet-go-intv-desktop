@@ -244,7 +244,9 @@ int main(void)
                 continue;
             saw_branch = 1;
             intvdebug_history_format(&h[k], line, sizeof(line));
-            check("a branch line shows its mnemonic", strstr(line, " B") || strstr(line, " J"));
+            /* by what it did: a branch or jump, or anything else that wrote R7 (PULR R7, MVII ..,R7) */
+            check("a branch line is a branch, a jump or a write to R7",
+                  strstr(line, " B") || strstr(line, " J") || strstr(line, "R7"));
         }
         check("the history has branches in it", saw_branch);
         for (k = 0; k < n; k++)

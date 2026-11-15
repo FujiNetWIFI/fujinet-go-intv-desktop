@@ -28,6 +28,36 @@
 
 #include "../intv_frame.h"
 
+/* The Video tab's per-frame capture (intvvidcap.h) reads the STIC through
+ * the machine struct, whose header chain is the same one the debugger uses. */
+#include <pthread.h>
+#include <stdatomic.h>
+#include "cp1600/cp1600.h"
+#include "mem/mem.h"
+#include "ecs/ecs.h"
+#include "icart/icart.h"
+#include "bincfg/bincfg.h"
+#include "bincfg/legacy.h"
+#include "pads/pads.h"
+#include "pads/pads_cgc.h"
+#include "pads/pads_intv2pc.h"
+#include "snd/snd.h"
+#include "ay8910/ay8910.h"
+#include "demo/demo.h"
+#include "stic/stic.h"
+#include "speed/speed.h"
+#include "debug/debug_.h"
+#include "debug/debug_if.h"
+#include "event/event.h"
+#include "ivoice/ivoice.h"
+#include "jlp/jlp.h"
+#include "fujinet/fujinet.h"
+#include "locutus/locutus_adapt.h"
+#include "cheat/cheat.h"
+#include "cfg/mapping.h"
+#include "cfg/cfg.h"
+#include "../../include/intvvidcap.h"
+
 typedef struct gfx_pvt_t
 {
     int         vid_enable;         /*  Video enable flag.                  */
@@ -193,6 +223,80 @@ void gfx_refresh(gfx_t *const gfx)
     gfx->b_dirty = 0;
 }
 
+/* ======================================================================== */
+/*  The Video tab's capture: one copy of the STIC per published frame, made */
+/*  on the emulator thread right after stic_update, only while a tab wants  */
+/*  it. The gfx pvt is private to this file, so the fill lives here too.    */
+/* ======================================================================== */
+static pthread_mutex_t s_vidcap_lock = PTHREAD_MUTEX_INITIALIZER;
+static intvvid_capture s_vidcap;
+static atomic_int s_vidcap_users = 0;
+
+static void vidcap_take(intvvid_capture *dst, const gfx_t *gfx)
+{
+    const stic_t *stic = &intv.stic;
+
+    memcpy(dst->raw, stic->raw, sizeof dst->raw);
+    memcpy(dst->gmem, stic->gmem, sizeof dst->gmem);
+    memcpy(dst->mob_bmp, stic->mob_bmp, sizeof dst->mob_bmp);
+    memcpy(dst->btab, stic->btab, sizeof dst->btab);
+    memcpy(dst->btab_sr, stic->btab_sr, sizeof dst->btab_sr);
+    memcpy(dst->vid, gfx->vid, sizeof dst->vid);
+    memcpy(dst->palette, gfx->palette.color, sizeof dst->palette);
+    dst->vid_enable = gfx->pvt->vid_enable & 1;
+    dst->mode = stic->mode;
+    dst->p_mode = stic->p_mode;
+    dst->gram_size = stic->gram_size;
+    dst->gram_mask = stic->gram_mask;
+    dst->pal = stic->pal;
+    dst->cycle = stic->eff_cycle;
+    dst->last_intrq = stic->last_frame_intrq;
+    dst->next_intrq = stic->next_frame_intrq;
+    dst->busrq_count = stic->busrq_count;
+    dst->fifo_wr_ptr = stic->fifo_wr_ptr;
+}
+
+void intv_host_capture_enable(int on)
+{
+    if (on)
+    {
+        atomic_fetch_add(&s_vidcap_users, 1);
+    } else if (atomic_load(&s_vidcap_users) > 0)
+    {
+        atomic_fetch_sub(&s_vidcap_users, 1);
+    }
+}
+
+int intv_host_capture_get(intvvid_capture *dst, uint64_t *serial_inout)
+{
+    int changed;
+
+    pthread_mutex_lock(&s_vidcap_lock);
+    changed = s_vidcap.serial != 0 && *serial_inout != s_vidcap.serial;
+    if (changed)
+    {
+        memcpy(dst, &s_vidcap, sizeof *dst);
+        *serial_inout = s_vidcap.serial;
+    }
+    pthread_mutex_unlock(&s_vidcap_lock);
+    return changed;
+}
+
+void intv_host_capture_fill(intvvid_capture *dst)
+{
+    uint64_t serial;
+
+    pthread_mutex_lock(&s_vidcap_lock);
+    serial = s_vidcap.serial;
+    dst->frame = s_vidcap.frame;
+    pthread_mutex_unlock(&s_vidcap_lock);
+
+    vidcap_take(dst, &intv.gfx);
+    dst->cycle = intv.cp1600.periph.now;
+    dst->serial = serial;
+    dst->live = 1;
+}
+
 void gfx_stic_tick(gfx_t *const gfx)
 {
     gfx->tot_frames++;
@@ -212,6 +316,16 @@ void gfx_stic_tick(gfx_t *const gfx)
     }
 
     gfx_refresh(gfx);
+
+    if (atomic_load(&s_vidcap_users) > 0)
+    {
+        pthread_mutex_lock(&s_vidcap_lock);
+        vidcap_take(&s_vidcap, gfx);
+        s_vidcap.live = 0;
+        s_vidcap.frame++;
+        s_vidcap.serial++;
+        pthread_mutex_unlock(&s_vidcap_lock);
+    }
 
     if (gfx->scrshot & GFX_SHOT)
     {

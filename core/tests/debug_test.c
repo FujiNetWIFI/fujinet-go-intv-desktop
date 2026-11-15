@@ -207,6 +207,44 @@ int main(void)
     usleep(20000);
     check("runs on after the restart", !intvdebug_is_paused(d));
 
+    /* ---- the reset vector itself: a freshly built CPU already sits at
+     * $1000, and a breakpoint armed there used to be skipped as if the
+     * machine were stopped on it ---- */
+    boot_bp.lo = boot_bp.hi = 0x1000;
+    boot_bp_id = intvdebug_bp_add(d, &boot_bp);
+    check("reset-vector breakpoint added", boot_bp_id > 0);
+    __atomic_store_n(&intv.do_reload, 1u, __ATOMIC_RELAXED);
+    check("the reset-vector breakpoint fires after a restart", wait_paused(d, 5000));
+    check("regs_get at the reset vector", intvdebug_regs_get(d, &restarted) == 1 && restarted.pc == 0x1000);
+    check("it is the breakpoint", intvdebug_last_stop(d, &stop) == 1 &&
+                                      stop.reason == INTVDEBUG_STOP_BREAKPOINT && stop.bp_id == boot_bp_id);
+    intvdebug_bp_remove(d, boot_bp_id);
+    intvdebug_resume(d);
+    usleep(20000);
+    check("runs on from the reset vector", !intvdebug_is_paused(d));
+
+    /* ---- the stop reason is complete the moment the machine is paused ---- */
+    {
+        int round, torn = 0;
+        memset(&boot_bp, 0, sizeof(boot_bp));
+        boot_bp.type = INTVDEBUG_BP_EXEC;
+        boot_bp.lo = boot_bp.hi = 0x1004;   /* the interrupt vector: every frame */
+        boot_bp_id = intvdebug_bp_add(d, &boot_bp);
+        for (round = 0; round < 10; round++) {
+            usleep(1000);
+            intvdebug_resume(d);
+            while (!intvdebug_is_paused(d))
+                ;
+            if (!(intvdebug_last_stop(d, &stop) && stop.serial == intvdebug_stop_serial(d) &&
+                  stop.reason == INTVDEBUG_STOP_BREAKPOINT && stop.pc == 0x1004))
+                torn++;
+        }
+        check("reason, PC and serial are ready when paused is", torn == 0);
+        intvdebug_bp_remove(d, boot_bp_id);
+        intvdebug_resume(d);
+        usleep(20000);
+    }
+
     /* ---- disengage must leave the emulator thread free-running, not
      * parked -- confirmed by the session stopping cleanly below. ---- */
     intvdebug_set_engaged(d, 0);

@@ -47,6 +47,29 @@
 #include "cfg/cfg.h"
 
 #include "intvstic.h"
+#include "intvvidcap.h"
+
+/* One palette colour channel: the snapshot's own palette when it carries one
+ * (a capture does), else the machine's. */
+static uint8_t pal_channel(const intvstic_snapshot *s, int index, int channel)
+{
+    return s->has_palette ? s->palette[index & 15][channel]
+                          : intv.gfx.palette.color[index & 15][channel];
+}
+
+void intvstic_snapshot_from_capture(const struct intvvid_capture *cap, intvstic_snapshot *out)
+{
+    memset(out, 0, sizeof(*out));
+    memcpy(out->raw, cap->raw, sizeof(out->raw));
+    memcpy(out->gmem, cap->gmem, sizeof(out->gmem));
+    memcpy(out->mob_bmp, cap->mob_bmp, sizeof(out->mob_bmp));
+    memcpy(out->btab, cap->btab, sizeof(out->btab));
+    memcpy(out->palette, cap->palette, sizeof(out->palette));
+    out->has_palette = 1;
+    out->mode = cap->mode;
+    out->gram_size = cap->gram_size;
+    out->gram_mask = cap->gram_mask;
+}
 
 void intvstic_snapshot_get(intvdebug *d, intvstic_snapshot *out)
 {
@@ -55,6 +78,7 @@ void intvstic_snapshot_get(intvdebug *d, intvstic_snapshot *out)
         return;
     }
 
+    memset(out, 0, sizeof(*out));
     memcpy(out->raw, intv.stic.raw, sizeof(out->raw));
     memcpy(out->gmem, intv.stic.gmem, sizeof(out->gmem));
     memcpy(out->mob_bmp, intv.stic.mob_bmp, sizeof(out->mob_bmp));
@@ -168,9 +192,9 @@ void intvstic_render_mob(const intvstic_snapshot *s, int index,
      * often than STIC registers and reading it needs no pause -- it is set
      * once at gfx_init and only reset on a palette-switch request), read
      * directly here. */
-    r = intv.gfx.palette.color[mob.color][0];
-    g = intv.gfx.palette.color[mob.color][1];
-    b = intv.gfx.palette.color[mob.color][2];
+    r = pal_channel(s, mob.color, 0);
+    g = pal_channel(s, mob.color, 1);
+    b = pal_channel(s, mob.color, 2);
 
     for (y = 0; y < 16; y++) {
         const uint16_t bits = s->mob_bmp[index][y];
@@ -185,12 +209,12 @@ void intvstic_render_mob(const intvstic_snapshot *s, int index,
     }
 }
 
-static void put_px(uint8_t *rgba, int x, int y, int color_idx)
+static void put_px(const intvstic_snapshot *s, uint8_t *rgba, int x, int y, int color_idx)
 {
     uint8_t *px = &rgba[(y * INTVSTIC_BACKTAB_W + x) * 4];
-    px[0] = intv.gfx.palette.color[color_idx][0];
-    px[1] = intv.gfx.palette.color[color_idx][1];
-    px[2] = intv.gfx.palette.color[color_idx][2];
+    px[0] = pal_channel(s, color_idx, 0);
+    px[1] = pal_channel(s, color_idx, 1);
+    px[2] = pal_channel(s, color_idx, 2);
     px[3] = 0xFF;
 }
 
@@ -208,7 +232,7 @@ static void blit_card(const intvstic_snapshot *s, int col, int row,
             const int set = (byte >> (7 - xx)) & 1; /* MSB = leftmost,
                                                       * same convention as
                                                       * intvstic_render_cards */
-            put_px(rgba, col * 8 + xx, row * 8 + yy, set ? fg_idx : bg_idx);
+            put_px(s, rgba, col * 8 + xx, row * 8 + yy, set ? fg_idx : bg_idx);
         }
     }
 }
@@ -246,7 +270,7 @@ void intvstic_render_backtab(const intvstic_snapshot *s, uint8_t *rgba)
                     int py, px;
                     for (py = 0; py < 4; py++)
                         for (px = 0; px < 4; px++)
-                            put_px(rgba, col * 8 + qx * 4 + px,
+                            put_px(s, rgba, col * 8 + qx * 4 + px,
                                   row * 8 + qy * 4 + py, csq[quadrant]);
                 }
         } else if (s->mode == 0) {

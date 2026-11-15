@@ -29,6 +29,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#include <pthread.h>
+
 #include "symbols.h"
 
 #include <ctype.h>
@@ -44,6 +46,10 @@ typedef struct {
     char name[SYM_NAME_MAX];
     char note[SYM_NOTE_MAX]; /* may be empty; only ever set for built-ins */
 } sym_entry;
+
+/* The emulator thread resolves names in breakpoint conditions while a window
+ * may be loading symbols: adding, clearing and the by-name lookup take this. */
+static pthread_mutex_t g_symtab_lock = PTHREAD_MUTEX_INITIALIZER;
 
 struct intvsymtab {
     sym_entry *entries;
@@ -227,14 +233,18 @@ int intvsymtab_add(intvsymtab *t, uint16_t addr, const char *name)
 {
     if (!t || !name || !name[0])
         return 0;
-    if (!ensure_cap(t, t->count + 1))
+    pthread_mutex_lock(&g_symtab_lock);
+    if (!ensure_cap(t, t->count + 1)) {
+        pthread_mutex_unlock(&g_symtab_lock);
         return 0;
+    }
     t->entries[t->count].addr = addr;
     snprintf(t->entries[t->count].name, SYM_NAME_MAX, "%s", name);
     t->entries[t->count].note[0] = 0; /* notes are a built-in-only detail */
     t->count++;
     t->index_dirty = 1;
     t->generation++;
+    pthread_mutex_unlock(&g_symtab_lock);
     return 1;
 }
 
@@ -242,9 +252,11 @@ void intvsymtab_clear_user(intvsymtab *t)
 {
     if (!t)
         return;
+    pthread_mutex_lock(&g_symtab_lock);
     t->count = t->builtin_count;
     t->index_dirty = 1;
     t->generation++;
+    pthread_mutex_unlock(&g_symtab_lock);
 }
 
 /* < 0 if entry ia sorts before ib: by addr, ties broken by entry index (so
@@ -354,13 +366,16 @@ int intvsymtab_lookup_name(const intvsymtab *t, const char *name,
     int i;
     if (!t || !name)
         return 0;
+    pthread_mutex_lock(&g_symtab_lock);
     for (i = t->count - 1; i >= 0; i--) {
         if (strcmp(t->entries[i].name, name) == 0) {
             if (addr_out)
                 *addr_out = t->entries[i].addr;
+            pthread_mutex_unlock(&g_symtab_lock);
             return 1;
         }
     }
+    pthread_mutex_unlock(&g_symtab_lock);
     return 0;
 }
 

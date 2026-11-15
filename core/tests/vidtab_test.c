@@ -98,7 +98,7 @@ int main(void)
     check(tab != NULL, "tab");
     check(intvvid_tab_view(tab) == INTVVID_V_DISPLAY, "starts on Display (no env set)");
     check(intvvid_tab_zoom(tab) == 0, "starts on Fit");
-    check(intvvid_tab_overlays(tab) == (INTVVID_OV_MOBS | INTVVID_OV_BEAM), "default overlays");
+    check(intvvid_tab_overlays(tab) == INTVVID_OV_MOBS, "default overlays");
     {
         int count;
         const intvvid_overlay_info *info = intvvid_overlays(&count);

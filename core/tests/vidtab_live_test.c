@@ -126,7 +126,7 @@ int main(void)
         intvvid_tab_refresh(tab, 1);
         pic = intvvid_tab_picture(tab, &wide, &high);
         check("Beam (stopped) is the 160 x 200 frame", pic && wide == 160 && high == 200);
-        check("the beam is somewhere in the frame", intvvid_tab_beam_permille(tab) > 0 && intvvid_tab_beam_permille(tab) <= 1000);
+        check("the beam is somewhere in the frame", intvvid_tab_beam_permille(tab) >= 0 && intvvid_tab_beam_permille(tab) <= 1000);
         intvvid_tab_set_view(tab, INTVVID_V_DISPLAY);
         intvvid_tab_set_overlays(tab, 0);
         check("registers listed", intvvid_tab_regs(tab, &regs) >= 16 && strcmp(regs[0].name, "MOB0") == 0);

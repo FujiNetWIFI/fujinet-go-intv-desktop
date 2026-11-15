@@ -340,7 +340,7 @@ intvvid_tab *intvvid_tab_new(intvdebug *dbg)
     }
     tab->view = INTVVID_V_DISPLAY;
     tab->source = INTVVID_SRC_CARDS;
-    tab->ovl = INTVVID_OV_MOBS | INTVVID_OV_BEAM;
+    tab->ovl = INTVVID_OV_MOBS;
     tab->zoom = 0;
     tab->vieww = FRAME_W * 2;
     tab->viewh = FRAME_H * 2;
@@ -1278,7 +1278,9 @@ int intvvid_tab_timing(const intvvid_tab *tab, const char *const **lines)
 int intvvid_tab_beam_permille(const intvvid_tab *tab)
 {
     if (!tab || !tab->have || !tab->cap->live) return 0;
-    return beam_scan(tab->cap) * 1000 / frame_lines(tab->cap);
+    int permille = beam_scan(tab->cap) * 1000 / frame_lines(tab->cap);
+    /* stopped past the frame's end, before the next INTRQ is seen */
+    return permille > 1000 ? 1000 : permille;
 }
 
 int intvvid_tab_text(intvvid_tab *tab, int section, char *dst, int dstsz)

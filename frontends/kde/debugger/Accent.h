@@ -29,3 +29,19 @@ inline QColor intvAccentTextColor(const QWidget *w)
         return intvRgb(INTVSESSION_ACCENT_LIGHT_RGB);
     return intvAccentColor();
 }
+
+/* A highlight fill and the ink on it: the dark green with white ink on a light
+ * theme; on a dark one the dark green barely shows, so the light green with
+ * black ink. */
+inline bool intvDarkTheme(const QWidget *w)
+{
+    return w && w->palette().color(QPalette::Window).lightness() < 128;
+}
+inline QColor intvAccentFill(const QWidget *w)
+{
+    return intvDarkTheme(w) ? intvRgb(INTVSESSION_ACCENT_LIGHT_RGB) : intvAccentColor();
+}
+inline QColor intvAccentFillInk(const QWidget *w)
+{
+    return intvDarkTheme(w) ? QColor(Qt::black) : intvAccentInk();
+}

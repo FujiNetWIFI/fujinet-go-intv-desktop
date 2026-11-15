@@ -35,11 +35,6 @@ extern "C" {
 
 namespace {
 
-QColor accentColor()
-{
-    return intvAccentColor();
-}
-
 QLabel *monoLabel()
 {
     auto *l = new QLabel;
@@ -80,8 +75,8 @@ void setCell(QTableWidget *t, int row, int col, const QString &text, bool hot)
         t->setItem(row, col, it);
     }
     it->setText(text);
-    it->setBackground(hot ? QBrush(accentColor()) : QBrush());
-    it->setForeground(hot ? QBrush(intvAccentInk()) : QBrush());
+    it->setBackground(hot ? QBrush(intvAccentFill(t)) : QBrush());
+    it->setForeground(hot ? QBrush(intvAccentFillInk(t)) : QBrush());
 }
 
 } // namespace

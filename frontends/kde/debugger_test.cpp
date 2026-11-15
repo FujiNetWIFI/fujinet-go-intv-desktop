@@ -25,6 +25,7 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QTabWidget>
+#include <QStyleHints>
 #include <QTemporaryDir>
 
 #include "intvdebug.h"
@@ -120,6 +121,10 @@ private slots:
     {
         QVERIFY(m_dir.isValid());
         qputenv("SDL_AUDIODRIVER", "dummy");
+#if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
+        if (qEnvironmentVariableIsSet("DBG_TEST_DARK"))
+            QGuiApplication::styleHints()->setColorScheme(Qt::ColorScheme::Dark);
+#endif
         intvsession_paths paths = {};
         const QByteArray dir = m_dir.path().toUtf8();
         paths.config_dir = dir.constData();
@@ -194,6 +199,18 @@ private slots:
             if (top->windowTitle() == QLatin1String("Intellivision Debugger")) m_win = qobject_cast<QMainWindow *>(top);
         QVERIFY(m_win);
         m_tabs = m_win->findChild<QTabWidget *>();
+    }
+
+    /* DBG_TEST_SHOTS=<dir>: a PNG of every tab (DBG_TEST_DARK=1: in the dark scheme) */
+    void shots()
+    {
+        const QString dir = qEnvironmentVariable("DBG_TEST_SHOTS");
+        if (dir.isEmpty()) QSKIP("DBG_TEST_SHOTS not set");
+        for (int i = 0; i < m_tabs->count(); ++i) {
+            m_tabs->setCurrentIndex(i);
+            QTest::qWait(150);
+            QVERIFY(m_win->grab().save(QStringLiteral("%1/tab%2.png").arg(dir).arg(i)));
+        }
     }
 
     void helpContexts()

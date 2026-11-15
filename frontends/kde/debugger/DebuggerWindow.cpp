@@ -184,7 +184,7 @@ void pcBar(QList<QTextEdit::ExtraSelection> &out, QPlainTextEdit *v, int &prev, 
     prev = -1;
     if (block < 0)
         return;
-    setBg(block, intvAccentColor());
+    setBg(block, intvAccentFill(v));
     prev = block;
 
     QTextEdit::ExtraSelection text;
@@ -192,7 +192,7 @@ void pcBar(QList<QTextEdit::ExtraSelection> &out, QPlainTextEdit *v, int &prev, 
     text.cursor = QTextCursor(b);
     text.cursor.setPosition(b.position() + 1);
     text.cursor.setPosition(b.position() + b.length() - 1, QTextCursor::KeepAnchor);
-    text.format.setForeground(intvAccentInk());
+    text.format.setForeground(intvAccentFillInk(v));
     out.append(text);
 }
 
@@ -2014,8 +2014,8 @@ void DebuggerWindow::refreshMem()
                 sel.cursor = QTextCursor(m_memView->document());
                 sel.cursor.setPosition(b.position() + 6 + col * 5);
                 sel.cursor.setPosition(b.position() + 6 + col * 5 + 4, QTextCursor::KeepAnchor);
-                sel.format.setBackground(intvAccentColor());
-                sel.format.setForeground(intvAccentInk());
+                sel.format.setBackground(intvAccentFill(m_memView));
+                sel.format.setForeground(intvAccentFillInk(m_memView));
                 sels.append(sel);
             }
         }

@@ -946,6 +946,7 @@ static void pop_out(debugger *d, int page)
     pop = CreateWindowExA(0, "IntvDbgPop", title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 820, 580,
                           d->hwnd, NULL, inst, NULL);
     SetWindowLongPtrA(pop, GWLP_USERDATA, page);
+    intv_help_set_context(pop, k_tab_contexts[page], 1);   /* F1 in the window opens its tab's section */
     {
         HWND dock = CreateWindowExA(0, "BUTTON", "Dock", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 4, 4, 70, 26,
                                     pop, (HMENU)(INT_PTR)IDC_DOCK, inst, NULL);
@@ -1997,8 +1998,7 @@ static void on_poke(debugger *d)
     d->mem_base = (uint16_t)(addr & 0xFFF8);
     d->mem_hl = 1;
     d->mem_hl_lo = d->mem_hl_hi = addr;
-    d->seen_serial = 0;
-    refresh_mem(d);
+    refresh_mem(d);   /* not a full refresh: it would replace the status line */
 }
 
 /* ---- Breakpoints, Watches, memory search ------------------------------------ */

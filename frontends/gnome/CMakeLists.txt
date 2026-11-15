@@ -20,6 +20,7 @@ set(GNOME_SOURCES
   prefs.c
   help/help_window.c
   debugger/dbg_window.c
+  debugger/dbg_video.c
   keypad/keypad_window.c
   ecskbd/ecskbd_window.c
 )

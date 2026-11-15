@@ -51,7 +51,8 @@ void intv_window_toast(IntvWindow *self, const char *message)
 /* ---- the display CSS ------------------------------------------------------
  * One display-wide provider, installed at startup so the keypad and ECS
  * windows get it too: checked toggles and highlighted buttons in the icon's
- * dark green (INTVSESSION_ACCENT_RGB) with white text, in light and dark. */
+ * dark green (INTVSESSION_ACCENT_RGB) with its ink (INTVSESSION_ACCENT_INK_RGB), in light
+ * and dark. */
 
 void intv_css_install(void)
 {
@@ -66,16 +67,18 @@ void intv_css_install(void)
     css = g_strdup_printf(
         "button.intv-toggle:checked, button.intv-accent,\n"
         "togglebutton.intv-toggle:checked {\n"
-        "  background: #%06X; background-image: none; color: #ffffff;\n"
+        "  background: #%06X; background-image: none; color: #%06X;\n"
         "}\n"
         "button.intv-toggle:checked:hover, button.intv-accent:hover {\n"
-        "  background: #2A6A19; background-image: none; color: #ffffff;\n"
+        "  background: #2A6A19; background-image: none; color: #%06X;\n"
         "}\n"
-        /* the debugger's current line: a bar in the accent, white text */
+        /* the debugger's current line: a bar in the accent, in its ink */
         "row.intv-pcrow, row.intv-pcrow label {\n"
-        "  background: #%06X; background-image: none; color: #ffffff;\n"
+        "  background: #%06X; background-image: none; color: #%06X;\n"
         "}\n",
-        (unsigned)INTVSESSION_ACCENT_RGB, (unsigned)INTVSESSION_ACCENT_RGB);
+        (unsigned)INTVSESSION_ACCENT_RGB, (unsigned)INTVSESSION_ACCENT_INK_RGB,
+        (unsigned)INTVSESSION_ACCENT_INK_RGB, (unsigned)INTVSESSION_ACCENT_RGB,
+        (unsigned)INTVSESSION_ACCENT_INK_RGB);
     provider = gtk_css_provider_new();
     gtk_css_provider_load_from_string(provider, css);
     gtk_style_context_add_provider_for_display(

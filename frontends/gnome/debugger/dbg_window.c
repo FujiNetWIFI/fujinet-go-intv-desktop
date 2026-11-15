@@ -1,11 +1,12 @@
 /*
  * The CP-1610/STIC debugger window (GTK4/libadwaita), modelled on the CoCo
  * port's own dbg_window.c (poll-based stop tracking: cocodebug_stop_serial
- * there, intvdebug_stop_serial here -- see that file's header for why this
- * is a poll and not a callback) with a STIC tab laid out like the MSX
- * port's VDP tab (nametable/pattern/sprite/palette pictures plus decoded
- * register text), retargeted to the STIC's own BACKTAB/MOB/GRAM-GROM-card/
- * palette views from intvstic.h.
+ * there, intvdebug_stop_snapshot here -- see that file's header for why this
+ * is a poll and not a callback). Thirteen tabs: Console, Disassembly, BASIC,
+ * Memory (with a Poke bar), Breakpoints (conditions are expressions),
+ * Watches, Cart & I/O, Trace, History, Video (dbg_video.c; the old STIC panes
+ * are its Decoded sources), Sound, Symbols and FujiNet, with an editable
+ * register strip under all of them.
  *
  * A FujiNet tab, last, shows every FujiBus packet between the machine and
  * FujiNet (intvdebug_fujinet_trace, always on) beside the mailbox's state.
@@ -36,23 +37,38 @@
 #include <string.h>
 
 #include "intvdebug.h"
-#include "intvstic.h"
 #include "memtools.h"
 #include "srcmap.h"
 #include "symbols.h"
 #include "../help/help_window.h"
+#include "debugger/dbg_video.h"
 
 #define DISASM_LINES 32
 #define MEM_WORDS_PER_ROW 8
 #define MEM_ROWS 16
-#define CARD_ROWS_PER_PAGE 8 /* 128 cards/page at CARDS_PER_ROW=16 */
+#define POKE_MAX 32
 #define FUJI_REFRESH_US 500000 /* the FujiNet tab, while it shows */
 
-enum { TAB_CPU, TAB_BASIC, TAB_MEMORY, TAB_BREAKS, TAB_WATCHES, TAB_CART, TAB_TRACE, TAB_HISTORY,
-       TAB_STIC, TAB_SYMBOLS, TAB_FUJINET, TAB_COUNT };
+enum { TAB_CONSOLE, TAB_DISASM, TAB_BASIC, TAB_MEMORY, TAB_BREAKS, TAB_WATCHES, TAB_CART,
+       TAB_TRACE, TAB_HISTORY, TAB_VIDEO, TAB_SOUND, TAB_SYMBOLS, TAB_FUJINET, TAB_COUNT };
 
 /* The notebook's pages, in order. */
-static const char *const k_tab_names[] = { "CPU", "BASIC", "Memory", "Breakpoints", "Watches", "Cart", "Trace", "History", "STIC", "Symbols", "FujiNet" };
+static const char *const k_tab_names[] = { "Console", "Disassembly", "BASIC", "Memory", "Breakpoints",
+    "Watches", "Cart & I/O", "Trace", "History", "Video", "Sound", "Symbols", "FujiNet" };
+
+/* Names INTV_DEBUGGER_TAB and INTV_POPOUT also take: the tabs' older names. */
+static const struct { const char *name; int tab; } k_tab_aliases[] = {
+    { "cpu", TAB_DISASM }, { "stic", TAB_VIDEO }, { "cart", TAB_CART }, { "io", TAB_CART },
+    { "i/o", TAB_CART }, { "psg", TAB_SOUND },
+};
+
+/* The register strip: R0-R7 (R6 is the stack, growing up; R7 is the PC) and the flags. */
+#define REG_COUNT 8
+#define FLAG_COUNT 5
+static const struct { const char *name; int reg; } k_flags[FLAG_COUNT] = {
+    { "S", INTVDEBUG_REG_S }, { "Z", INTVDEBUG_REG_Z }, { "O", INTVDEBUG_REG_O },
+    { "C", INTVDEBUG_REG_C }, { "I", INTVDEBUG_REG_I },
+};
 
 /* A breakpoint in a gutter: a red dot. */
 #define BP_DOT "<span foreground=\"#e01b24\">\xe2\x97\x8f</span>"
@@ -66,11 +82,24 @@ typedef struct {
     intvsymtab *symtab;
 
     GtkLabel *status;
+    AdwToastOverlay *toasts;
     GtkButton *run_pause;
     GtkListBox *disasm;
-    GtkLabel *regs;
+
+    /* Console tab */
+    GtkTextView *console_out;
+    GtkEntry *console_in;
+    GPtrArray *history;
+    guint history_pos;
+
+    /* the register strip under every tab */
+    GtkEntry *reg[REG_COUNT];
+    GtkEntry *flag[FLAG_COUNT];
+    GtkLabel *dflag, *intr;
+    gboolean force_entries;   /* a refresh may overwrite a focused entry */
 
     GtkEntry *mem_addr;
+    GtkEntry *poke_entry;
     GtkLabel *mem;
     uint16_t mem_view_addr;
     GtkEntry *break_addr;
@@ -80,16 +109,6 @@ typedef struct {
     GtkLabel *sym_count;
     unsigned sym_seen_gen;
     char sym_filter_text[64];
-
-    GtkPicture *pic_backtab;
-    GtkPicture *pic_mob[INTVSTIC_MOB_COUNT];
-    GtkLabel *mob_info;
-    GtkPicture *pic_cards;
-    GtkLabel *cards_range;
-    GtkPicture *pic_pal;
-    GtkTextView *stic_state;
-    int card_first;
-    int card_total;
 
     /* BASIC tab */
     intvsrcmap *srcmap;
@@ -113,8 +132,8 @@ typedef struct {
     GtkLabel *srch_note;
 
     /* Breakpoints tab */
-    GtkDropDown *bp_type, *bp_cond;
-    GtkEntry *bp_addr, *bp_value;
+    GtkDropDown *bp_type;
+    GtkEntry *bp_addr, *bp_cond;
     GtkListBox *bp_list;
     GtkLabel *bp_stop;
     unsigned bp_gen;
@@ -123,8 +142,8 @@ typedef struct {
     GtkEntry *wt_entry;
     GtkListBox *wt_list;
 
-    /* Cart tab */
-    GtkTextView *cart_text;
+    /* Cart & I/O and Sound tabs */
+    GtkTextView *cart_text, *io_text, *sound_text;
 
     /* Trace (0, live) and History (1, when stopped) pages share one ring */
     GtkToggleButton *h_rec[2];
@@ -153,6 +172,7 @@ typedef struct {
     int kick;            /* ticks to keep running while paused after an action */
     gulong map_id, unmap_id, susp_id;
     uint64_t seen_serial;
+    unsigned seen_gen;   /* intvdebug_generation at the last refresh */
     int was_paused;
 } DbgWin;
 
@@ -192,25 +212,6 @@ static void invalidate(DbgWin *w)
 {
     w->seen_serial = 0;
     kick(w);
-}
-
-/* All intvstic_render_* outputs are RGBA8888, alpha always 0xFF except
- * intvstic_render_mob (which uses alpha for transparency) -- both are the
- * same memory layout GDK_MEMORY_R8G8B8A8 expects either way. */
-static GdkTexture *texture_from_rgba(const uint8_t *rgba, int w, int h)
-{
-    GBytes *bytes = g_bytes_new(rgba, (gsize)w * h * 4);
-    GdkTexture *tex =
-        gdk_memory_texture_new(w, h, GDK_MEMORY_R8G8B8A8, bytes, (gsize)w * 4);
-    g_bytes_unref(bytes);
-    return tex;
-}
-
-static void set_picture(GtkPicture *pic, const uint8_t *rgba, int w, int h)
-{
-    GdkTexture *tex = texture_from_rgba(rgba, w, h);
-    gtk_picture_set_paintable(pic, GDK_PAINTABLE(tex));
-    g_object_unref(tex);
 }
 
 /* ---- logs ------------------------------------------------------------------ */
@@ -296,21 +297,128 @@ static void set_text_at(GtkTextView *view, const char *text, gboolean follow)
 
 /* ---- refreshers ----------------------------------------------------------- */
 
+/* ---- text helpers and messages -------------------------------------------- */
+
+static void append_text(GtkTextView *view, const char *text, gboolean force_follow)
+{
+    GtkTextBuffer *b = gtk_text_view_get_buffer(view);
+    GtkTextIter end;
+    char *clean = g_utf8_make_valid(text, -1);
+    log_note_reader(view);
+    if (force_follow)
+        g_object_set_data(G_OBJECT(view), "follow", GINT_TO_POINTER(1));
+    gtk_text_buffer_get_end_iter(b, &end);
+    gtk_text_buffer_insert(b, &end, clean, -1);
+    g_free(clean);
+}
+
+/* A number as typed: hex by default, $ or 0x or a trailing h for hex, # for decimal. */
+static int parse_num(const char *text, long *out)
+{
+    char buf[64], *end;
+    size_t n;
+    long val;
+    while (*text == ' ') text++;
+    g_strlcpy(buf, text, sizeof buf);
+    n = strlen(buf);
+    while (n && buf[n - 1] == ' ') buf[--n] = '\0';
+    if (!n) return 0;
+    if (buf[0] == '$') val = strtol(buf + 1, &end, 16);
+    else if (buf[0] == '0' && (buf[1] == 'x' || buf[1] == 'X')) val = strtol(buf + 2, &end, 16);
+    else if (buf[0] == '#') val = strtol(buf + 1, &end, 10);
+    else if (buf[n - 1] == 'h' || buf[n - 1] == 'H') { buf[n - 1] = '\0'; val = strtol(buf, &end, 16); }
+    else val = strtol(buf, &end, 16);
+    if (end == buf || *end) return 0;
+    *out = val;
+    return 1;
+}
+
+/* A message that must outlast the next refresh (the status label is rewritten by it). */
+static void toast(DbgWin *w, const char *msg)
+{
+    adw_toast_overlay_add_toast(w->toasts, adw_toast_new(msg));
+}
+
+/* ---- registers --------------------------------------------------------------- */
+
+/* The register entries show what the engine has, but a refresh leaves an entry
+ * alone while it has the focus and holds something else (a half-typed value),
+ * until Enter (force_entries) ends the edit. */
+static void set_entry(DbgWin *w, GtkEntry *entry, const char *text)
+{
+    const char *shown = gtk_editable_get_text(GTK_EDITABLE(entry));
+    gboolean focus = gtk_widget_has_focus(GTK_WIDGET(entry)) ||
+                     gtk_widget_is_focus(GTK_WIDGET(entry)) ||
+                     gtk_widget_has_focus(gtk_widget_get_first_child(GTK_WIDGET(entry)));
+    const char *last = g_object_get_data(G_OBJECT(entry), "shown");
+
+    if (focus && !w->force_entries && last && strcmp(shown, last) != 0)
+        return;
+    if (strcmp(shown, text) != 0)
+        gtk_editable_set_text(GTK_EDITABLE(entry), text);
+    g_object_set_data_full(G_OBJECT(entry), "shown", g_strdup(text), g_free);
+}
+
 static void refresh_regs(DbgWin *w)
 {
     intvdebug_regs r;
-    g_autofree char *text = NULL;
+    int i;
+    char buf[16];
+    gboolean paused = intvdebug_regs_get(w->dbg, &r) != 0;
 
-    if (!intvdebug_regs_get(w->dbg, &r)) {
-        gtk_label_set_text(w->regs, "");
+    for (i = 0; i < REG_COUNT; i++)
+        gtk_widget_set_sensitive(GTK_WIDGET(w->reg[i]), paused);
+    for (i = 0; i < FLAG_COUNT; i++)
+        gtk_widget_set_sensitive(GTK_WIDGET(w->flag[i]), paused);
+    if (!paused) {
+        for (i = 0; i < REG_COUNT; i++)
+            set_entry(w, w->reg[i], "");
+        for (i = 0; i < FLAG_COUNT; i++)
+            set_entry(w, w->flag[i], "");
+        gtk_label_set_text(w->dflag, "D -");
+        gtk_label_set_text(w->intr, "");
         return;
     }
-    text = g_strdup_printf(
-        "R0 %04X  R1 %04X  R2 %04X  R3 %04X  R4 %04X  R5 %04X  R6(SP) %04X  R7(PC) %04X\n"
-        "S%d C%d O%d Z%d I%d  D%d",
-        r.r[0], r.r[1], r.r[2], r.r[3], r.r[4], r.r[5], r.r[6], r.pc, r.S,
-        r.C, r.O, r.Z, r.I, r.D);
-    gtk_label_set_text(w->regs, text);
+    for (i = 0; i < REG_COUNT; i++) {
+        g_snprintf(buf, sizeof buf, "%04X", r.r[i]);
+        set_entry(w, w->reg[i], buf);
+    }
+    {
+        const int values[FLAG_COUNT] = { r.S, r.Z, r.O, r.C, r.I };
+        for (i = 0; i < FLAG_COUNT; i++) {
+            g_snprintf(buf, sizeof buf, "%d", values[i] ? 1 : 0);
+            set_entry(w, w->flag[i], buf);
+        }
+    }
+    g_snprintf(buf, sizeof buf, "D %d%s", r.D ? 1 : 0, r.D ? " (SDBD pending)" : "");
+    gtk_label_set_text(w->dflag, buf);
+    {
+        char text[96];
+        g_snprintf(text, sizeof text, "%s   INTRQ %d  BUSRQ %d   frame %u   cycle %" G_GUINT64_FORMAT,
+                   r.interruptible ? "interruptible" : "not interruptible", r.intrq, r.busrq, r.frame, r.cycles);
+        gtk_label_set_text(w->intr, text);
+    }
+}
+
+static void refresh_all(DbgWin *w);
+
+/* Enter in a register entry sets it while the machine is stopped. */
+static void on_reg_activate(GtkEntry *entry, gpointer user_data)
+{
+    DbgWin *w = user_data;
+    const int reg = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(entry), "reg"));
+    long val;
+
+    if (!intvdebug_is_paused(w->dbg))
+        toast(w, "Stop the machine to edit the registers");
+    else if (!parse_num(gtk_editable_get_text(GTK_EDITABLE(entry)), &val))
+        toast(w, "A register takes a number: hex by default, # for decimal");
+    else if (!intvdebug_regs_set(w->dbg, reg, (unsigned)val))
+        toast(w, "That register could not be set");
+    /* Enter ends the edit: show the engine's value, or put the old one back */
+    w->force_entries = TRUE;
+    refresh_all(w);
+    w->force_entries = FALSE;
 }
 
 static void on_row_activated(GtkListBox *box, GtkListBoxRow *row,
@@ -373,6 +481,8 @@ static void refresh_disasm(DbgWin *w)
     }
 }
 
+/* Words are 16 bits wide, but the scratchpad, GROM, GRAM and the ECS RAM are
+ * 8: those show two digits, padded so the columns line up. */
 static void refresh_mem(DbgWin *w)
 {
     uint16_t words[MEM_WORDS_PER_ROW * MEM_ROWS];
@@ -390,13 +500,20 @@ static void refresh_mem(DbgWin *w)
         for (col = 0; col < MEM_WORDS_PER_ROW; col++) {
             int idx = row * MEM_WORDS_PER_ROW + col;
             const uint16_t a = (uint16_t)(row_addr + col);
+            const gboolean narrow = intvdebug_word_width(w->dbg, a) == 8;
+            char cell[16];
             if (idx >= n)
                 break;
+            if (narrow)
+                g_snprintf(cell, sizeof cell, "  %02X", words[idx] & 0xFF);
+            else
+                g_snprintf(cell, sizeof cell, "%04X", words[idx]);
             if (w->mem_hl && a >= w->mem_hl_lo && a <= w->mem_hl_hi)   /* a variable, symbol or hit */
                 g_string_append_printf(text,
-                    " <span background=\"#1E4912\" foreground=\"#ffffff\">%04X</span>", words[idx]);
+                    " <span background=\"#%06X\" foreground=\"#%06X\">%s</span>",
+                    (unsigned)INTVSESSION_ACCENT_RGB, (unsigned)INTVSESSION_ACCENT_INK_RGB, cell);
             else
-                g_string_append_printf(text, " %04X", words[idx]);
+                g_string_append_printf(text, " %s", cell);
         }
         /* Only label the first row of a run in the same region -- repeating
          * it on every row would just be noise (see PORTING.md's region
@@ -482,68 +599,8 @@ static void refresh_symbols(DbgWin *w)
     gtk_label_set_text(w->sym_count, text);
 }
 
-static void on_sym_filter_changed(GtkEditable *e, gpointer user_data)
-{ (void)e; refresh_symbols((DbgWin *)user_data); }
-
-static void refresh_stic(DbgWin *w)
-{
-    static intvstic_snapshot snap;
-    static uint8_t backtab_rgba[INTVSTIC_BACKTAB_W * INTVSTIC_BACKTAB_H * 4];
-    static uint8_t mob_rgba[16 * 16 * 4];
-    static uint8_t cards_rgba[INTVSTIC_CARDS_PER_ROW * 8 *
-                              CARD_ROWS_PER_PAGE * 8 * 4];
-    static uint8_t pal_rgba[INTVSTIC_PAL_CELL * 16 * INTVSTIC_PAL_CELL * 4];
-    char text[2048];
-    GString *mobtext;
-    int i, total, rows;
-
-    intvstic_snapshot_get(w->dbg, &snap);
-
-    intvstic_render_backtab(&snap, backtab_rgba);
-    set_picture(w->pic_backtab, backtab_rgba, INTVSTIC_BACKTAB_W,
-               INTVSTIC_BACKTAB_H);
-
-    mobtext = g_string_new("## X    Y  CARD CLR SZx SZy VIS PRI GRAM COLL\n");
-    for (i = 0; i < INTVSTIC_MOB_COUNT; i++) {
-        intvstic_mob mob;
-        intvstic_mob_get(&snap, i, &mob);
-        intvstic_render_mob(&snap, i, mob_rgba);
-        set_picture(w->pic_mob[i], mob_rgba, 16, 16);
-        g_string_append_printf(
-            mobtext, "%d  %3d  %3d  %3d  %2d  %dx  %dx  %d   %d   %d    %03X\n",
-            i, mob.x, mob.y, mob.card, mob.color, mob.x_size, mob.y_stretch,
-            mob.visible, mob.priority, mob.gram, mob.collision);
-    }
-    gtk_label_set_text(w->mob_info, mobtext->str);
-    g_string_free(mobtext, TRUE);
-
-    total = intvstic_card_count(&snap);
-    w->card_total = total;
-    rows = CARD_ROWS_PER_PAGE;
-    if (w->card_first >= total)
-        w->card_first = 0;
-    intvstic_render_cards(&snap, w->card_first, rows, cards_rgba);
-    set_picture(w->pic_cards, cards_rgba, INTVSTIC_CARDS_PER_ROW * 8,
-               rows * 8);
-    {
-        int page = INTVSTIC_CARDS_PER_ROW * rows;
-        int last_shown = (w->card_first + page < total ? w->card_first + page
-                                                        : total) -
-                        1;
-        char range_text[64];
-        snprintf(range_text, sizeof(range_text), "cards %d\xe2\x80\x93%d of %d",
-                w->card_first, last_shown, total);
-        gtk_label_set_text(w->cards_range, range_text);
-    }
-
-    intvstic_render_palette(w->dbg, pal_rgba);
-    set_picture(w->pic_pal, pal_rgba, INTVSTIC_PAL_CELL * 16,
-               INTVSTIC_PAL_CELL);
-
-    intvstic_format_state(&snap, text, (int)sizeof(text));
-    gtk_text_buffer_set_text(gtk_text_view_get_buffer(w->stic_state), text,
-                             -1);
-}
+static void on_sym_filter_changed(GtkEditable *entry, gpointer user_data)
+{ (void)entry; refresh_symbols((DbgWin *)user_data); }
 
 /* Tabs can be moved into windows of their own, so a page's place in the
  * notebook is not its identity: each carries its original index. */
@@ -828,7 +885,7 @@ static void on_bas_row_activated(GtkListBox *box, GtkListBoxRow *row,
     (void)box;
 
     if (addr < 0) {   /* a message, not a refresh: see go_to_mem_addr */
-        gtk_label_set_text(w->status, "No code on that line");
+        toast(w, "No code on that line");
         return;
     }
     intvdebug_breakpoint_toggle(w->dbg, (uint16_t)addr);
@@ -839,23 +896,16 @@ static void on_bas_row_activated(GtkListBox *box, GtkListBoxRow *row,
 
 static void show_in_memory(DbgWin *w, uint16_t lo, uint16_t hi);
 
-/* One line on why the machine stopped. */
-static void stop_text(const intvdebug_stop_info *st, char *dst, size_t n)
+/* One line on why the machine stopped, from the core (so the width of a word
+ * written is right): "Wrote $0200 = $1234 (was $1233) at $5012". */
+static void stop_line(const intvdebug_snapshot *snap, char *dst, size_t n)
 {
-    switch (st->reason) {
-    case INTVDEBUG_STOP_WATCH_WRITE:
-        snprintf(dst, n, "wrote $%04X = $%02X (was $%02X), now at $%04X", st->addr,
-                 st->value & 0xFF, st->old_value & 0xFF, st->pc);
-        break;
-    case INTVDEBUG_STOP_WATCH_READ:
-        snprintf(dst, n, "read $%04X, now at $%04X", st->addr, st->pc);
-        break;
-    case INTVDEBUG_STOP_BREAKPOINT:
-        snprintf(dst, n, "breakpoint at $%04X", st->pc);
-        break;
-    default:
-        dst[0] = '\0';
+    if (!snap->paused) {
+        g_strlcpy(dst, "Running", n);
+        return;
     }
+    g_strlcpy(dst, snap->text[0] ? snap->text : "paused", n);
+    dst[0] = (char)g_ascii_toupper(dst[0]);
 }
 
 static void on_bp_enable_toggled(GtkCheckButton *cb, gpointer user_data)
@@ -913,28 +963,27 @@ static void bp_rebuild(DbgWin *w)
 static void bp_refresh(DbgWin *w)
 {
     const unsigned gen = intvdebug_bp_generation(w->dbg);
-    intvdebug_stop_info st;
-    char text[160], line[200];
+    intvdebug_snapshot snap;
+    char text[200];
 
     if (gen != w->bp_gen) {
         w->bp_gen = gen;
         bp_rebuild(w);
     }
-    if (intvdebug_is_paused(w->dbg) && intvdebug_last_stop(w->dbg, &st)) {
-        stop_text(&st, text, sizeof(text));
-        snprintf(line, sizeof(line), "Stopped: %s", text[0] ? text : "paused");
-    } else {
-        snprintf(line, sizeof(line), "%s", intvdebug_is_paused(w->dbg) ? "Paused." : "Running.");
-    }
-    gtk_label_set_text(w->bp_stop, line);
+    intvdebug_stop_snapshot(w->dbg, &snap);
+    stop_line(&snap, text, sizeof text);
+    if (snap.paused)
+        gtk_label_set_text(w->bp_stop, text);
+    else
+        gtk_label_set_text(w->bp_stop, "Running.");
 }
 
 static void on_bp_add(GtkButton *button, gpointer user_data)
 {
     DbgWin *w = user_data;
     const guint type = gtk_drop_down_get_selected(w->bp_type);
-    const guint cond = gtk_drop_down_get_selected(w->bp_cond);
     const char *text = gtk_editable_get_text(GTK_EDITABLE(w->bp_addr));
+    const char *cond = gtk_editable_get_text(GTK_EDITABLE(w->bp_cond));
     intvdebug_bp bp;
     uint16_t lo, hi;
     (void)button;
@@ -944,22 +993,22 @@ static void on_bp_add(GtkButton *button, gpointer user_data)
                   : !intvsym_parse_range(w->symtab, text, &lo, &hi, NULL)) {
         char msg[96];
         snprintf(msg, sizeof(msg), "No such symbol, variable or address: %s", text);
-        gtk_label_set_text(w->status, msg);
+        toast(w, msg);
         return;
     }
     if (type == 0)
         hi = lo;
     bp.type = type == 0 ? INTVDEBUG_BP_EXEC : type == 1 ? INTVDEBUG_BP_READ
-              : type == 2 ? INTVDEBUG_BP_WRITE : (INTVDEBUG_BP_READ | INTVDEBUG_BP_WRITE);
+              : type == 2 ? INTVDEBUG_BP_WRITE : INTVDEBUG_BP_ACCESS;
     bp.lo = lo;
     bp.hi = hi;
-    bp.cond = (int)cond;   /* any, changed, =, != in the dropdown's order */
-    bp.value = (uint16_t)strtoul(gtk_editable_get_text(GTK_EDITABLE(w->bp_value)) +
-                                     (gtk_editable_get_text(GTK_EDITABLE(w->bp_value))[0] == '$' ? 1 : 0),
-                                 NULL, 16);
-    bp.mask = lo >= 0x0100 && hi <= 0x01EF ? 0x00FF : 0xFFFF;   /* the scratchpad is 8 bits */
+    g_strlcpy(bp.condition, cond, sizeof bp.condition);
+    g_strstrip(bp.condition);
     if (intvdebug_bp_add(w->dbg, &bp) < 0) {
-        gtk_label_set_text(w->status, "The breakpoint table is full");
+        intvdebug_bp all[INTVDEBUG_MAX_BREAKPOINTS];
+        toast(w, intvdebug_bp_list(w->dbg, all, INTVDEBUG_MAX_BREAKPOINTS) >= INTVDEBUG_MAX_BREAKPOINTS
+                     ? "The breakpoint table is full"
+                     : "The condition does not parse (try: value != old, r0 == $12, [$0200] > 5)");
         return;
     }
     gtk_editable_set_text(GTK_EDITABLE(w->bp_addr), "");
@@ -1018,10 +1067,9 @@ static void on_wt_break(GtkButton *b, gpointer user_data)
     bp.type = INTVDEBUG_BP_WRITE;
     bp.lo = lo;
     bp.hi = hi;
-    bp.cond = INTVDEBUG_COND_CHANGED;
-    bp.mask = lo >= 0x0100 && hi <= 0x01EF ? 0x00FF : 0xFFFF;
+    g_strlcpy(bp.condition, "value != old", sizeof bp.condition);
     if (intvdebug_bp_add(w->dbg, &bp) >= 0)
-        gtk_label_set_text(w->status, "Breaking when it changes");
+        toast(w, "Breaking when it changes");
     invalidate(w);
 }
 
@@ -1067,7 +1115,7 @@ static void on_wt_add(GtkButton *button, gpointer user_data)
     DbgWin *w = user_data;
     (void)button;
     if (intvwatch_add(gtk_editable_get_text(GTK_EDITABLE(w->wt_entry))) < 0) {
-        gtk_label_set_text(w->status, "Type an address, symbol or BASIC variable (x, #score, a(3))");
+        toast(w, "Type an address, symbol or BASIC variable (x, #score, a(3))");
         return;
     }
     gtk_editable_set_text(GTK_EDITABLE(w->wt_entry), "");
@@ -1119,6 +1167,75 @@ static void on_search_entry_activate(GtkEntry *entry, gpointer user_data)
 
 /* ---- Cart, Trace and History tabs ------------------------------------------- */
 
+/* The cartridge and the memory map on the left; the controllers, PSG ports,
+ * ECS keyboard, Intellivoice and JLP on the right. */
+static void pad_text(GString *t, const intvdebug_pad *pad, const char *title)
+{
+    int side, line;
+
+    if (!pad->present)
+        return;
+    g_string_append_printf(t, "  %s  ports $%02X $%02X%s\n", title, pad->side[0], pad->side[1],
+                           pad->output[0] || pad->output[1] ? "  (set for output)" : "");
+    for (side = 0; side < 2; side++) {
+        gboolean held = FALSE;
+        g_string_append_printf(t, "    %-5s controller:", side ? "right" : "left");
+        for (line = 0; line < 18; line++)
+            if ((side ? pad->right : pad->left)[line]) {
+                g_string_append_printf(t, " %d", line);
+                held = TRUE;
+            }
+        g_string_append(t, held ? "\n" : " (idle)\n");
+    }
+}
+
+static void io_refresh(DbgWin *w)
+{
+    intvdebug_io ports;
+    GString *t = g_string_new(NULL);
+    int row;
+
+    if (!intvdebug_io_get(w->dbg, &ports)) {
+        g_string_append(t, "The Intellivision is off.\n");
+    } else {
+        g_string_append(t, "Controllers (event inputs held: keypad, disc, action buttons)\n");
+        pad_text(t, &ports.pad[0], "Base ");
+        pad_text(t, &ports.pad[1], "ECS  ");
+        if (ports.ecs) {
+            gboolean any = FALSE;
+            g_string_append(t, "\nECS keyboard rows");
+            for (row = 0; row < 8; row++) {
+                g_string_append_printf(t, " %02X", ports.pad[1].keys[row] & 0xFF);
+                any = any || ports.pad[1].keys[row] != 0;
+            }
+            g_string_append_printf(t, "%s\nECS ROM pages  $2xxx %d   $7xxx %d   $Exxx %d\n",
+                                   any ? "" : "  (no key)", ports.ecs_page[0], ports.ecs_page[1], ports.ecs_page[2]);
+        }
+        if (ports.ivoice)
+            g_string_append_printf(t,
+                "\nIntellivoice\n  LRQ %d   ALD %d   PC %03X   mode %X   page %X\n  FIFO %u..%u   %s%s\n",
+                ports.ivoice_lrq, ports.ivoice_ald, ports.ivoice_pc & 0xFFF, ports.ivoice_mode, ports.ivoice_page,
+                ports.ivoice_fifo_tail, ports.ivoice_fifo_head, ports.ivoice_halted ? "halted" : "running",
+                ports.ivoice_fifo_sel ? ", reading the FIFO" : "");
+        if (ports.jlp)
+            g_string_append_printf(t, "\nJLP\n  accelerators %s   flash %s",
+                                   ports.jlp_accel ? "on" : "off",
+                                   ports.jlp_flash ? "open" : "none");
+        if (ports.jlp && ports.jlp_flash)
+            g_string_append_printf(t, " (%u bytes)", ports.jlp_flash_bytes);
+        if (ports.jlp)
+            g_string_append_printf(t, "%s\n", ports.jlp_mb_hole ? "   FujiNet mailbox hole at $9C00-$9F3F" : "");
+        if (ports.locutus)
+            g_string_append(t, "\nLocutus mapper owns the cartridge space\n");
+        if (ports.fujinet_mailbox)
+            g_string_append(t, "\nFujiNet mailbox mapped at $9C00\n");
+        if (!ports.ecs && !ports.ivoice && !ports.jlp && !ports.locutus && !ports.fujinet_mailbox)
+            g_string_append(t, "\nNo ECS, Intellivoice, JLP or mailbox on this machine.\n");
+    }
+    set_text_at(w->io_text, t->str, FALSE);
+    g_string_free(t, TRUE);
+}
+
 static void cart_refresh(DbgWin *w)
 {
     intvdebug_cart cart;
@@ -1129,12 +1246,17 @@ static void cart_refresh(DbgWin *w)
     intvdebug_cart_info(w->dbg, &cart);
     g_string_append(t, "Cartridge\n");
     g_string_append_printf(t, "  File     %s\n", cart.path[0] ? cart.path : "(none)");
-    if (cart.name[0])
-        g_string_append_printf(t, "  Title    %s%s%s\n", cart.name, cart.year ? ", " : "",
-                               cart.year ? g_strdup_printf("%d", cart.year) : "");
+    if (cart.name[0]) {
+        g_string_append_printf(t, "  Title    %s", cart.name);
+        if (cart.year)
+            g_string_append_printf(t, ", %d", cart.year);
+        g_string_append_c(t, '\n');
+    }
     g_string_append_printf(t, "  FujiNet  %s\n", cart.fujinet_mailbox ? "mailbox mapped at $9C00" : "no mailbox");
     g_string_append_printf(t, "  ECS      %s\n", cart.ecs ? "present" : "no");
     g_string_append_printf(t, "  JLP      %s\n", cart.jlp ? "present" : "no");
+    g_string_append_printf(t, "  Voice    %s\n", cart.ivoice ? "Intellivoice" : "no");
+    g_string_append_printf(t, "  Video    %s\n", cart.pal ? "PAL" : "NTSC");
     g_string_append(t, "\nMemory map\n");
     n = intvdebug_memory_map(w->dbg, reg, 64);
     if (!n)
@@ -1143,6 +1265,46 @@ static void cart_refresh(DbgWin *w)
         g_string_append_printf(t, "  %04X-%04X  %c%c  %s\n", reg[i].lo, reg[i].hi,
                                reg[i].readable ? 'r' : '-', reg[i].writable ? 'w' : '-', reg[i].name);
     set_text_at(w->cart_text, t->str, FALSE);
+    g_string_free(t, TRUE);
+    io_refresh(w);
+}
+
+/* Sound: the AY-3-8914s, read straight out of the chips (stopped only). */
+static void sound_refresh(DbgWin *w)
+{
+    static const char voices[] = "ABC";
+    GString *t = g_string_new(NULL);
+    int unit, voice, any = 0;
+
+    for (unit = 0; unit < 2; unit++) {
+        intvdebug_psg psg;
+        int reg;
+        if (!intvdebug_sound_get(w->dbg, unit, &psg) || !psg.present)
+            continue;
+        any = 1;
+        g_string_append_printf(t, "%s PSG (AY-3-8914 at $%04X)\n", unit ? "ECS" : "Base",
+                               unit ? 0x00F0 : 0x01F0);
+        for (voice = 0; voice < 3; voice++) {
+            char bar[17];
+            int lit;
+            for (lit = 0; lit < 16; lit++)
+                bar[lit] = lit < psg.level[voice] ? '#' : '.';
+            bar[16] = '\0';
+            g_string_append_printf(t, "  %c  period %03X  %8.1f Hz  %-4s%-6s  level %X [%s]%s\n", voices[voice],
+                                   psg.period[voice], psg.hz[voice], psg.tone_on[voice] ? "tone" : "----",
+                                   psg.noise_on[voice] ? "+noise" : "", psg.level[voice], bar,
+                                   psg.envelope[voice] ? "  (envelope)" : "");
+        }
+        g_string_append_printf(t, "  noise period %02X   envelope period %04X   shape %X   level %X\n  registers:",
+                               psg.noise_period, psg.env_period, psg.env_shape, psg.env_level);
+        for (reg = 0; reg < 14; reg++)
+            g_string_append_printf(t, " %02X", psg.reg[reg] & 0xFF);
+        g_string_append(t, "\n\n");
+    }
+    if (!any)
+        g_string_append(t, intvdebug_is_paused(w->dbg) ? "No sound chip is present.\n"
+                                                       : "Pause the machine to read the sound chips.\n");
+    set_text_at(w->sound_text, t->str, FALSE);
     g_string_free(t, TRUE);
 }
 
@@ -1318,34 +1480,27 @@ static void on_pop_out(GtkButton *b, gpointer u)
 
 static void refresh_all(DbgWin *w)
 {
-    int paused = intvdebug_is_paused(w->dbg);
+    intvdebug_snapshot snap;
+    int paused;
+    char status[200];
+
+    intvdebug_stop_snapshot(w->dbg, &snap);
+    w->seen_gen = intvdebug_generation(w->dbg);
+    paused = snap.paused;
     gtk_button_set_label(w->run_pause, paused ? "_Run" : "_Pause");
     /* the action on offer wears the accent: Run while stopped */
     if (paused)
         gtk_widget_add_css_class(GTK_WIDGET(w->run_pause), "intv-accent");
     else
         gtk_widget_remove_css_class(GTK_WIDGET(w->run_pause), "intv-accent");
-    {
-        intvdebug_stop_info st;
-        char why[160], status[200];
-        why[0] = '\0';
-        if (paused && intvdebug_last_stop(w->dbg, &st))
-            stop_text(&st, why, sizeof(why));
-        if (why[0] && st.reason != INTVDEBUG_STOP_BREAKPOINT) {
-            snprintf(status, sizeof(status), "Paused: %s", why);
-            gtk_label_set_text(w->status, status);
-        } else {
-            gtk_label_set_text(w->status, paused ? "Paused" : "Running");
-        }
-    }
+    stop_line(&snap, status, sizeof status);
+    gtk_label_set_text(w->status, status);
 
+    refresh_regs(w);
     if (paused) {
-        refresh_regs(w);
         refresh_disasm(w);
         refresh_mem(w);
-        refresh_stic(w);
     } else {
-        gtk_label_set_text(w->regs, "");
         gtk_list_box_remove_all(w->disasm);
         gtk_label_set_text(w->mem, "");
     }
@@ -1357,8 +1512,11 @@ static void refresh_all(DbgWin *w)
     bp_refresh(w);
     wt_rebuild(w);
     cart_refresh(w);
+    sound_refresh(w);
     hist_refresh(w, 0, FALSE);
     hist_refresh(w, 1, FALSE);
+    if (tab_visible(w, TAB_VIDEO))
+        dbg_video_refresh(w->pages[TAB_VIDEO], FALSE);
     if (fuji_showing(w))
         refresh_fujinet(w, FALSE);
     w->was_paused = paused;
@@ -1368,7 +1526,7 @@ static gboolean tick_cb(GtkWidget *widget, GdkFrameClock *clock,
                         gpointer user_data)
 {
     DbgWin *w = user_data;
-    uint64_t serial;
+    intvdebug_snapshot snap;
     (void)widget;
     (void)clock;
 
@@ -1377,10 +1535,10 @@ static gboolean tick_cb(GtkWidget *widget, GdkFrameClock *clock,
     if (w->kick > 0)
         w->kick--;
 
-    serial = intvdebug_stop_serial(w->dbg);
-    if (serial != w->seen_serial ||
-        intvdebug_is_paused(w->dbg) != w->was_paused) {
-        w->seen_serial = serial;
+    intvdebug_stop_snapshot(w->dbg, &snap);
+    if (snap.serial != w->seen_serial || snap.paused != w->was_paused ||
+        intvdebug_generation(w->dbg) != w->seen_gen) {
+        w->seen_serial = snap.serial;
         refresh_all(w);
     } else if (fuji_showing(w) &&
                g_get_monotonic_time() - w->fuji_at >= FUJI_REFRESH_US) {
@@ -1389,12 +1547,14 @@ static gboolean tick_cb(GtkWidget *widget, GdkFrameClock *clock,
     }
     if (w->bas_scroll_line)
         basic_try_scroll(w);
+    if (tab_visible(w, TAB_VIDEO))   /* a running machine publishes a frame every 1/60 s */
+        dbg_video_refresh(w->pages[TAB_VIDEO], FALSE);
     if (tab_visible(w, TAB_TRACE) && g_get_monotonic_time() - w->h_at >= 400000) {
         w->h_at = g_get_monotonic_time();   /* the live view moves while the machine runs */
         hist_refresh(w, 0, FALSE);
     }
     /* Paused with nothing pending: stop (this removes the callback). */
-    if (intvdebug_is_paused(w->dbg) && w->kick <= 0) {
+    if (snap.paused && w->kick <= 0) {
         w->tick_id = 0;
         return G_SOURCE_REMOVE;
     }
@@ -1455,10 +1615,8 @@ static void on_clear_bp(GtkButton *b, gpointer u)
     invalidate(w);
 }
 
-/* Errors here go straight to the status label, same as on_load_symbols'
- * "Could not open symbol file" -- and, like that one, must NOT touch
- * seen_serial: doing so would force the very next tick_cb to overwrite the
- * message with the plain Paused/Running text before the user reads it. */
+/* Messages go to a toast, not the status label: touching seen_serial would
+ * make the next tick overwrite them with the plain Paused/Running text. */
 /* Shows a range in the Memory tab, highlighted, on a row boundary. */
 static void show_in_memory(DbgWin *w, uint16_t lo, uint16_t hi)
 {
@@ -1480,12 +1638,56 @@ static void go_to_mem_addr(DbgWin *w)
     } else {
         char msg[96];
         snprintf(msg, sizeof(msg), "No such symbol, variable or address: %s", text);
-        gtk_label_set_text(w->status, msg);
+        toast(w, msg);
     }
 }
 
 static void on_mem_addr_activate(GtkEntry *entry, gpointer user_data)
 { (void)entry; go_to_mem_addr(user_data); }
+
+/* "address value...": words written from the address on, through the bus. A
+ * value wider than the word at its address (8 bits in the scratchpad, GROM/GRAM
+ * and ECS RAM) is refused rather than cut. */
+static void on_poke(GtkEntry *entry, gpointer user_data)
+{
+    DbgWin *w = user_data;
+    char **parts = g_strsplit_set(gtk_editable_get_text(GTK_EDITABLE(w->poke_entry)), " \t:=,", -1);
+    uint16_t words[POKE_MAX], addr = 0;
+    gboolean have_addr = FALSE, valid = TRUE;
+    int n = 0, i;
+    (void)entry;
+
+    for (i = 0; parts[i] && valid; i++) {
+        long val;
+        if (!*parts[i])
+            continue;
+        if (!have_addr) {
+            valid = intvsym_parse_addr(w->symtab, parts[i], &addr);
+            have_addr = TRUE;
+        } else if (n < POKE_MAX && parse_num(parts[i], &val) && val >= 0 && val <= 0xFFFF) {
+            if (val > (intvdebug_word_width(w->dbg, (uint16_t)(addr + n)) == 8 ? 0xFF : 0xFFFF)) {
+                toast(w, "That value is wider than the word at that address (8 bits there)");
+                g_strfreev(parts);
+                return;
+            }
+            words[n++] = (uint16_t)val;
+        } else {
+            valid = FALSE;
+        }
+    }
+    g_strfreev(parts);
+    if (!valid || !have_addr || n == 0) {
+        toast(w, "Poke takes an address and hex words, e.g. 0200 1234 5678");
+        return;
+    }
+    if (!intvdebug_is_paused(w->dbg)) {
+        toast(w, "Stop the machine to poke its memory");
+        return;
+    }
+    intvdebug_write(w->dbg, addr, words, n);
+    gtk_editable_set_text(GTK_EDITABLE(w->poke_entry), "");
+    show_in_memory(w, addr, (uint16_t)(addr + n - 1));
+}
 
 static void on_break_addr_activate(GtkEntry *entry, gpointer user_data)
 {
@@ -1498,28 +1700,107 @@ static void on_break_addr_activate(GtkEntry *entry, gpointer user_data)
     } else {
         char msg[96];
         snprintf(msg, sizeof(msg), "No such symbol or address: %s", text);
-        gtk_label_set_text(w->status, msg);
+        toast(w, msg);
     }
 }
 
-static void on_cards_page(GtkButton *btn, gpointer user_data)
+/* ---- the Console tab ---------------------------------------------------------- */
+
+static void on_console(GtkEntry *entry, gpointer user_data)
 {
     DbgWin *w = user_data;
-    int delta =
-        GPOINTER_TO_INT(g_object_get_data(G_OBJECT(btn), "delta"));
-    int page = INTVSTIC_CARDS_PER_ROW * CARD_ROWS_PER_PAGE;
-    int last_page = w->card_total > 0
-                       ? ((w->card_total - 1) / page) * page
-                       : 0;
-    int next = w->card_first + delta * page;
-    if (next < 0)
-        next = 0;
-    if (next > last_page)
-        next = last_page;
-    w->card_first = next;
+    static char out[65536];
+    const char *cmd = gtk_editable_get_text(GTK_EDITABLE(entry));
+    char line[512];
+
+    if (!cmd || !*cmd)
+        return;
+    /* the history keeps each command once in a row */
+    if (w->history->len == 0 || strcmp(g_ptr_array_index(w->history, w->history->len - 1), cmd) != 0)
+        g_ptr_array_add(w->history, g_strdup(cmd));
+    w->history_pos = w->history->len;
+    g_snprintf(line, sizeof line, "> %s\n", cmd);
+    append_text(w->console_out, line, TRUE);
+    out[0] = '\0';
+    intvdebug_command(w->dbg, cmd, out, sizeof out);
+    append_text(w->console_out, out, TRUE);
+    if (out[0] && out[strlen(out) - 1] != '\n')
+        append_text(w->console_out, "\n", TRUE);
+    gtk_editable_set_text(GTK_EDITABLE(entry), "");
     invalidate(w);
-    if (intvdebug_is_paused(w->dbg))
-        refresh_stic(w);
+}
+
+static void history_show(DbgWin *w)
+{
+    const char *text = w->history_pos < w->history->len
+                           ? g_ptr_array_index(w->history, w->history_pos) : "";
+    gtk_editable_set_text(GTK_EDITABLE(w->console_in), text);
+    gtk_editable_set_position(GTK_EDITABLE(w->console_in), -1);
+}
+
+/* Tab completes the current word against the commands, the registers and the
+ * labels; several matches are listed instead. Up and Down walk the history. */
+static gboolean on_console_key(GtkEventControllerKey *c, guint keyval, guint code,
+                               GdkModifierType st, gpointer user_data)
+{
+    DbgWin *w = user_data;
+    char comps[4096];
+    const char *text, *word;
+    int n;
+    (void)c; (void)code; (void)st;
+
+    if (keyval == GDK_KEY_Up || keyval == GDK_KEY_KP_Up) {
+        if (w->history_pos > 0) {
+            w->history_pos--;
+            history_show(w);
+        }
+        return TRUE;
+    }
+    if (keyval == GDK_KEY_Down || keyval == GDK_KEY_KP_Down) {
+        if (w->history_pos < w->history->len) {
+            w->history_pos++;
+            history_show(w);
+        }
+        return TRUE;
+    }
+    if (keyval != GDK_KEY_Tab)
+        return FALSE;
+    text = gtk_editable_get_text(GTK_EDITABLE(w->console_in));
+    comps[0] = '\0';
+    /* the engine completes the end of the whole line (a command, then its
+     * arguments), so the whole line goes and the last word is replaced */
+    n = intvdebug_completions(w->dbg, text, comps, sizeof comps);
+    word = strrchr(text, ' ');
+    word = word ? word + 1 : text;
+    if (n == 1) {
+        char merged[600];
+        char *eol = strchr(comps, '\n');
+        if (eol) *eol = '\0';
+        g_snprintf(merged, sizeof merged, "%.*s%s ", (int)(word - text), text, comps);
+        gtk_editable_set_text(GTK_EDITABLE(w->console_in), merged);
+        gtk_editable_set_position(GTK_EDITABLE(w->console_in), -1);
+    } else if (n > 1) {
+        /* the common start is filled in; the candidates are listed */
+        char **cand = g_strsplit(comps, "\n", -1);
+        size_t common = strlen(cand[0]), len = strlen(word);
+        int i;
+        for (i = 1; cand[i] && *cand[i]; i++) {
+            size_t k = 0;
+            while (k < common && cand[i][k] == cand[0][k]) k++;
+            common = k;
+        }
+        if (common > len) {
+            char merged[600];
+            g_snprintf(merged, sizeof merged, "%.*s%.*s", (int)(word - text), text, (int)common, cand[0]);
+            gtk_editable_set_text(GTK_EDITABLE(w->console_in), merged);
+            gtk_editable_set_position(GTK_EDITABLE(w->console_in), -1);
+        }
+        g_strfreev(cand);
+        append_text(w->console_out, comps, FALSE);
+        if (comps[0] && comps[strlen(comps) - 1] != '\n')
+            append_text(w->console_out, "\n", FALSE);
+    }
+    return TRUE;
 }
 
 static void weak_free(gpointer p)
@@ -1548,7 +1829,7 @@ static void load_symbols_done(GObject *source, GAsyncResult *result,
         return;
     n = intvsymtab_load(w->symtab, path);
     if (n < 0) {
-        gtk_label_set_text(w->status, "Could not open symbol file");
+        toast(w, "Could not open symbol file");
         return;
     }
     /* Remember the directory (settings key "sym_dir") so re-opening the
@@ -1740,9 +2021,10 @@ static void on_fuji_clear(GtkButton *b, gpointer u)
 
 /* Help's contexts (intvhelp.h), one per tab */
 static const char *const k_tab_contexts[] = {
-    "debugger/cpu", "debugger/basic", "debugger/memory", "debugger/breakpoints",
-    "debugger/watches", "debugger/cart", "debugger/trace", "debugger/history", "debugger/stic",
-    "debugger/symbols", "debugger/fujinet",
+    "debugger/console", "debugger/disassembly", "debugger/basic", "debugger/memory",
+    "debugger/breakpoints", "debugger/watches", "debugger/cart", "debugger/trace",
+    "debugger/history", "debugger/video", "debugger/sound", "debugger/symbols",
+    "debugger/fujinet",
 };
 
 static gboolean on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num,
@@ -1756,8 +2038,11 @@ static gboolean on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num,
         intv_help_set_context(w->win, k_tab_contexts[tab]);
     if (page == w->fuji_page)
         refresh_fujinet(w, FALSE);
-    if (tab == TAB_BASIC)
-        kick(w);   /* the list has no height until it shows: scroll then */
+    kick(w);   /* a page may have changed under another one (a Video break, the console): catch up */
+    if (tab == TAB_VIDEO)
+        dbg_video_refresh(w->pages[TAB_VIDEO], TRUE);
+    if (tab == TAB_CONSOLE && w->console_in)
+        gtk_widget_grab_focus(GTK_WIDGET(w->console_in));
     return FALSE;
 }
 
@@ -1799,6 +2084,8 @@ static void dbgwin_free(gpointer data, GObject *where)
         g_ptr_array_free(w->bas_labels, TRUE);
     if (w->bas_marks)
         g_array_free(w->bas_marks, TRUE);
+    if (w->history)
+        g_ptr_array_free(w->history, TRUE);
     g_free(data);
 }
 
@@ -1865,6 +2152,7 @@ static GtkWidget *mono_view(GtkTextView **out)
     GtkWidget *view = gtk_text_view_new();
     GtkWidget *scroll = gtk_scrolled_window_new();
     gtk_text_view_set_editable(GTK_TEXT_VIEW(view), FALSE);
+    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(view), FALSE);
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(view), TRUE);
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(view), GTK_WRAP_WORD_CHAR);
     gtk_text_view_set_left_margin(GTK_TEXT_VIEW(view), 6);
@@ -2008,7 +2296,6 @@ static GtkWidget *build_breaks(DbgWin *w)
     GtkWidget *scroll = gtk_scrolled_window_new();
     GtkWidget *foot = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     static const char *const types[] = { "Execute", "Read", "Write", "Access", NULL };
-    static const char *const conds[] = { "any value", "changed", "equals", "not equal", NULL };
 
     w->bp_type = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(types));
     gtk_widget_set_tooltip_text(GTK_WIDGET(w->bp_type),
@@ -2018,15 +2305,16 @@ static GtkWidget *build_breaks(DbgWin *w)
     gtk_entry_set_placeholder_text(w->bp_addr, "address, lo-hi, symbol, x, #score, a(3)");
     gtk_widget_set_hexpand(GTK_WIDGET(w->bp_addr), TRUE);
     g_signal_connect(w->bp_addr, "activate", G_CALLBACK(on_bp_entry_activate), w);
-    w->bp_cond = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(conds));
-    gtk_widget_set_tooltip_text(GTK_WIDGET(w->bp_cond), "A condition on the value written (Write and Access)");
-    w->bp_value = GTK_ENTRY(gtk_entry_new());
-    gtk_entry_set_placeholder_text(w->bp_value, "value (hex)");
-    gtk_editable_set_width_chars(GTK_EDITABLE(w->bp_value), 10);
+    w->bp_cond = GTK_ENTRY(gtk_entry_new());
+    gtk_entry_set_placeholder_text(w->bp_cond, "condition (optional): value != old, r0 == $12, [$0200] > 5");
+    gtk_widget_set_tooltip_text(GTK_WIDGET(w->bp_cond),
+        "An expression: r0-r7 pc sp, flags s z o c i d, [addr], labels, frame, cycles; "
+        "in an access `value`, `addr` and `old` (the word before a write)");
+    gtk_widget_set_hexpand(GTK_WIDGET(w->bp_cond), TRUE);
+    g_signal_connect(w->bp_cond, "activate", G_CALLBACK(on_bp_entry_activate), w);
     gtk_box_append(GTK_BOX(form), GTK_WIDGET(w->bp_type));
     gtk_box_append(GTK_BOX(form), GTK_WIDGET(w->bp_addr));
     gtk_box_append(GTK_BOX(form), GTK_WIDGET(w->bp_cond));
-    gtk_box_append(GTK_BOX(form), GTK_WIDGET(w->bp_value));
     gtk_box_append(GTK_BOX(form), tool_button("_Add", "Add the breakpoint", G_CALLBACK(on_bp_add), w));
 
     w->bp_list = GTK_LIST_BOX(gtk_list_box_new());
@@ -2080,14 +2368,116 @@ static GtkWidget *build_watches(DbgWin *w)
     return box;
 }
 
+static GtkWidget *padded(GtkWidget *w)
+{
+    gtk_widget_set_margin_top(w, 6);
+    gtk_widget_set_margin_bottom(w, 6);
+    gtk_widget_set_margin_start(w, 6);
+    gtk_widget_set_margin_end(w, 6);
+    return w;
+}
+
+/* The cartridge and its memory map, beside the controllers and the other I/O. */
 static GtkWidget *build_cart(DbgWin *w)
 {
-    GtkWidget *scroll = mono_view(&w->cart_text);
-    gtk_widget_set_margin_top(scroll, 6);
-    gtk_widget_set_margin_bottom(scroll, 6);
-    gtk_widget_set_margin_start(scroll, 6);
-    gtk_widget_set_margin_end(scroll, 6);
-    return scroll;
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    GtkWidget *left = mono_view(&w->cart_text);
+    GtkWidget *right = mono_view(&w->io_text);
+
+    gtk_text_view_set_wrap_mode(w->cart_text, GTK_WRAP_NONE);
+    gtk_text_view_set_wrap_mode(w->io_text, GTK_WRAP_NONE);
+    gtk_box_append(GTK_BOX(box), labeled("Cartridge and memory map", left));
+    gtk_box_append(GTK_BOX(box), labeled("Controllers and I/O", right));
+    return padded(box);
+}
+
+static GtkWidget *build_sound(DbgWin *w)
+{
+    return padded(mono_view(&w->sound_text));
+}
+
+static GtkWidget *build_console(DbgWin *w)
+{
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *scroll = mono_view(&w->console_out);
+    GtkEventController *keys;
+
+    make_log(w->console_out);
+    w->console_in = GTK_ENTRY(gtk_entry_new());
+    gtk_entry_set_placeholder_text(w->console_in,
+        "Command (help, step, break, bpw, bpa, print, mem, poke, watch, find, video, disasm, cart, ...) "
+        "\xe2\x80\x94 Tab completes, Up/Down recall");
+    gtk_widget_set_hexpand(GTK_WIDGET(w->console_in), TRUE);
+    g_signal_connect(w->console_in, "activate", G_CALLBACK(on_console), w);
+    /* ahead of the entry's own text handling, so Tab and Up/Down are ours */
+    keys = gtk_event_controller_key_new();
+    gtk_event_controller_set_propagation_phase(keys, GTK_PHASE_CAPTURE);
+    g_signal_connect(keys, "key-pressed", G_CALLBACK(on_console_key), w);
+    gtk_widget_add_controller(GTK_WIDGET(w->console_in), keys);
+    w->history = g_ptr_array_new_with_free_func(g_free);
+
+    gtk_box_append(GTK_BOX(box), scroll);
+    gtk_box_append(GTK_BOX(box), GTK_WIDGET(w->console_in));
+    set_text_at(w->console_out,
+                "Intellivision debugger console (CP-1610 and STIC). Type 'help' for every command.\n"
+                "Numbers: $5000, 0x5000, 5000h, 20480. Registers r0-r7 pc sp s z o c i d; [addr] is the word there.\n",
+                TRUE);
+    return padded(box);
+}
+
+/* The register strip under every tab: R0-R7 (R6 is the stack, growing up;
+ * R7 the PC) and the flags S Z O C I are entries (Enter sets one while the
+ * machine is stopped); D (SDBD pending) and the interrupt state are shown. */
+static GtkWidget *build_regs(DbgWin *w)
+{
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *row2 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    int i;
+
+    for (i = 0; i < REG_COUNT; i++) {
+        char name[16];
+        g_snprintf(name, sizeof name, "R%d%s", i, i == 6 ? " (SP)" : i == 7 ? " (PC)" : "");
+        w->reg[i] = GTK_ENTRY(gtk_entry_new());
+        gtk_entry_set_max_length(w->reg[i], 8);
+        gtk_editable_set_width_chars(GTK_EDITABLE(w->reg[i]), 5);
+        gtk_editable_set_max_width_chars(GTK_EDITABLE(w->reg[i]), 5);
+        gtk_widget_add_css_class(GTK_WIDGET(w->reg[i]), "monospace");
+        g_object_set_data(G_OBJECT(w->reg[i]), "reg", GINT_TO_POINTER(INTVDEBUG_REG_R0 + i));
+        g_signal_connect(w->reg[i], "activate", G_CALLBACK(on_reg_activate), w);
+        gtk_box_append(GTK_BOX(row), labeled(name, GTK_WIDGET(w->reg[i])));
+    }
+    for (i = 0; i < FLAG_COUNT; i++) {
+        w->flag[i] = GTK_ENTRY(gtk_entry_new());
+        gtk_entry_set_max_length(w->flag[i], 4);
+        gtk_editable_set_width_chars(GTK_EDITABLE(w->flag[i]), 2);
+        gtk_editable_set_max_width_chars(GTK_EDITABLE(w->flag[i]), 2);
+        gtk_widget_add_css_class(GTK_WIDGET(w->flag[i]), "monospace");
+        g_object_set_data(G_OBJECT(w->flag[i]), "reg", GINT_TO_POINTER(k_flags[i].reg));
+        g_signal_connect(w->flag[i], "activate", G_CALLBACK(on_reg_activate), w);
+        gtk_box_append(GTK_BOX(row2), labeled(k_flags[i].name, GTK_WIDGET(w->flag[i])));
+    }
+    w->dflag = GTK_LABEL(gtk_label_new("D -"));
+    gtk_widget_add_css_class(GTK_WIDGET(w->dflag), "monospace");
+    gtk_widget_set_valign(GTK_WIDGET(w->dflag), GTK_ALIGN_END);
+    gtk_widget_set_tooltip_text(GTK_WIDGET(w->dflag),
+        "Double-byte data: SDBD is pending for the next instruction (read only)");
+    gtk_box_append(GTK_BOX(row2), GTK_WIDGET(w->dflag));
+    w->intr = GTK_LABEL(gtk_label_new(""));
+    gtk_widget_add_css_class(GTK_WIDGET(w->intr), "dim-label");
+    gtk_widget_add_css_class(GTK_WIDGET(w->intr), "monospace");
+    gtk_label_set_xalign(w->intr, 0);
+    gtk_label_set_ellipsize(w->intr, PANGO_ELLIPSIZE_END);
+    gtk_widget_set_hexpand(GTK_WIDGET(w->intr), TRUE);
+    gtk_widget_set_valign(GTK_WIDGET(w->intr), GTK_ALIGN_END);
+    gtk_box_append(GTK_BOX(row2), GTK_WIDGET(w->intr));
+    gtk_box_append(GTK_BOX(box), row);
+    gtk_box_append(GTK_BOX(box), row2);
+    gtk_widget_set_margin_start(box, 12);
+    gtk_widget_set_margin_end(box, 12);
+    gtk_widget_set_margin_top(box, 6);
+    gtk_widget_set_margin_bottom(box, 6);
+    return box;
 }
 
 static GtkWidget *build_hist(DbgWin *w, int idx)
@@ -2130,12 +2520,12 @@ static GtkWidget *build_hist(DbgWin *w, int idx)
     return box;
 }
 
-/* The notebook's pages, in order; INTV_DEBUGGER_TAB picks one by number or
- * by the start of its name (any case), for tests and captures. */
-
-static int tab_from_env(void)
+/* A tab from an environment variable (INTV_DEBUGGER_TAB, INTV_POPOUT): a
+ * number, or a tab's name or the start of one (any case), or an older name
+ * (cpu, stic, cart, io). For tests and captures. */
+static int tab_from_env(const char *var)
 {
-    const char *tab = g_getenv("INTV_DEBUGGER_TAB");
+    const char *tab = g_getenv(var);
     char *end;
     long n;
     size_t i;
@@ -2148,6 +2538,9 @@ static int tab_from_env(void)
     for (i = 0; i < G_N_ELEMENTS(k_tab_names); i++)
         if (g_ascii_strncasecmp(tab, k_tab_names[i], strlen(tab)) == 0)
             return (int)i;
+    for (i = 0; i < G_N_ELEMENTS(k_tab_aliases); i++)
+        if (g_ascii_strcasecmp(tab, k_tab_aliases[i].name) == 0)
+            return k_tab_aliases[i].tab;
     return -1;
 }
 
@@ -2155,11 +2548,10 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
 {
     static GtkWindow *singleton;
     DbgWin *w;
-    GtkWidget *box, *panes, *scroller, *regbox, *header, *bar, *mem_bar,
-              *mem_scroller, *notebook, *stic_grid, *stic_scroll, *mob_grid,
-              *mob_box, *cards_bar;
+    GtkWidget *box, *scroller, *header, *bar, *mem_bar, *mem_scroller, *notebook,
+              *overlay;
     GtkEventController *keys;
-    int i;
+    int tab;
 
     if (singleton) {
         gtk_window_present(singleton);
@@ -2172,6 +2564,7 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     w->symtab = intvsymtab_shared();
     w->srcmap = intvsrcmap_shared();
     w->mem_view_addr = 0x0000;
+    w->sym_seen_gen = (unsigned)-1;   /* the first refresh always fills the list */
 
     w->win = GTK_WINDOW(adw_window_new());
     g_object_set_data(G_OBJECT(w->win), "dbgwin", w);
@@ -2241,18 +2634,12 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     gtk_widget_set_hexpand(scroller, TRUE);
     gtk_widget_set_vexpand(scroller, TRUE);
 
-    w->regs = GTK_LABEL(gtk_label_new(""));
-    gtk_label_set_xalign(w->regs, 0.0f);
-    gtk_label_set_yalign(w->regs, 0.0f);
-    gtk_widget_add_css_class(GTK_WIDGET(w->regs), "monospace");
-    regbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_widget_set_margin_start(regbox, 12);
-    gtk_widget_set_margin_end(regbox, 12);
-    gtk_widget_set_margin_top(regbox, 6);
-    gtk_box_append(GTK_BOX(regbox), labeled("Registers", GTK_WIDGET(w->regs)));
-
-    gtk_widget_set_margin_bottom(regbox, 6);
-    panes = scroller;   /* the CPU tab is the disassembly; registers sit below every tab */
+    gtk_widget_set_margin_start(scroller, 6);
+    gtk_widget_set_margin_end(scroller, 6);
+    gtk_widget_set_margin_top(scroller, 6);
+    gtk_widget_set_margin_bottom(scroller, 6);
+    /* the wheel and the window size the list, not its 32 rows */
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller), GTK_POLICY_AUTOMATIC, GTK_POLICY_EXTERNAL);
 
     mem_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_widget_set_margin_top(mem_bar, 6);
@@ -2266,6 +2653,16 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     g_signal_connect(w->mem_addr, "activate",
                      G_CALLBACK(on_mem_addr_activate), w);
     gtk_box_append(GTK_BOX(mem_bar), GTK_WIDGET(w->mem_addr));
+    gtk_box_append(GTK_BOX(mem_bar), gtk_label_new("Poke:"));
+    w->poke_entry = GTK_ENTRY(gtk_entry_new());
+    gtk_entry_set_placeholder_text(w->poke_entry, "address word...  e.g. 0200 1234 5678");
+    gtk_widget_set_tooltip_text(GTK_WIDGET(w->poke_entry),
+        "Writes the words from the address on, through the bus (stopped). "
+        "The scratchpad, GROM, GRAM and ECS RAM hold 8 bits.");
+    gtk_widget_set_hexpand(GTK_WIDGET(w->poke_entry), TRUE);
+    g_signal_connect(w->poke_entry, "activate", G_CALLBACK(on_poke), w);
+    gtk_box_append(GTK_BOX(mem_bar), GTK_WIDGET(w->poke_entry));
+    gtk_box_append(GTK_BOX(mem_bar), tool_button("Po_ke", "Write the words", G_CALLBACK(on_poke), w));
 
     w->mem = GTK_LABEL(gtk_label_new(""));
     gtk_label_set_xalign(w->mem, 0.0f);
@@ -2282,105 +2679,25 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     gtk_widget_set_hexpand(mem_scroller, TRUE);
     gtk_widget_set_vexpand(mem_scroller, TRUE);
 
-    /* ---- STIC page ---- */
-    stic_grid = gtk_grid_new();
-    gtk_grid_set_column_spacing(GTK_GRID(stic_grid), 12);
-    gtk_grid_set_row_spacing(GTK_GRID(stic_grid), 8);
-    gtk_widget_set_margin_start(stic_grid, 8);
-    gtk_widget_set_margin_top(stic_grid, 8);
-
-    w->pic_backtab = GTK_PICTURE(gtk_picture_new());
-    gtk_widget_set_size_request(GTK_WIDGET(w->pic_backtab),
-                                INTVSTIC_BACKTAB_W * 2, INTVSTIC_BACKTAB_H * 2);
-    gtk_grid_attach(GTK_GRID(stic_grid),
-                    labeled("BACKTAB", GTK_WIDGET(w->pic_backtab)), 0, 0, 1,
-                    1);
-
-    mob_grid = gtk_grid_new();
-    gtk_grid_set_column_spacing(GTK_GRID(mob_grid), 4);
-    gtk_grid_set_row_spacing(GTK_GRID(mob_grid), 4);
-    for (i = 0; i < INTVSTIC_MOB_COUNT; i++) {
-        w->pic_mob[i] = GTK_PICTURE(gtk_picture_new());
-        gtk_widget_set_size_request(GTK_WIDGET(w->pic_mob[i]), 32, 32);
-        gtk_grid_attach(GTK_GRID(mob_grid), GTK_WIDGET(w->pic_mob[i]),
-                        i % 4, i / 4, 1, 1);
-    }
-    w->mob_info = GTK_LABEL(gtk_label_new(""));
-    gtk_label_set_xalign(w->mob_info, 0.0f);
-    gtk_widget_add_css_class(GTK_WIDGET(w->mob_info), "monospace");
-    mob_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_box_append(GTK_BOX(mob_box), mob_grid);
-    gtk_box_append(GTK_BOX(mob_box), GTK_WIDGET(w->mob_info));
-    gtk_grid_attach(GTK_GRID(stic_grid), labeled("MOBs", mob_box), 1, 0, 1,
-                    1);
-
-    w->pic_cards = GTK_PICTURE(gtk_picture_new());
-    gtk_widget_set_size_request(
-        GTK_WIDGET(w->pic_cards), INTVSTIC_CARDS_PER_ROW * 8 * 2,
-        CARD_ROWS_PER_PAGE * 8 * 2);
-    cards_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    {
-        GtkWidget *prev = gtk_button_new_with_label("\xe2\x97\x80");
-        GtkWidget *next = gtk_button_new_with_label("\xe2\x96\xb6");
-        g_object_set_data(G_OBJECT(prev), "delta", GINT_TO_POINTER(-1));
-        g_object_set_data(G_OBJECT(next), "delta", GINT_TO_POINTER(1));
-        g_signal_connect(prev, "clicked", G_CALLBACK(on_cards_page), w);
-        g_signal_connect(next, "clicked", G_CALLBACK(on_cards_page), w);
-        gtk_box_append(GTK_BOX(cards_bar), prev);
-        gtk_box_append(GTK_BOX(cards_bar), next);
-        w->cards_range = GTK_LABEL(gtk_label_new(""));
-        gtk_box_append(GTK_BOX(cards_bar), GTK_WIDGET(w->cards_range));
-    }
-    {
-        GtkWidget *cbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-        gtk_box_append(GTK_BOX(cbox), GTK_WIDGET(w->pic_cards));
-        gtk_box_append(GTK_BOX(cbox), cards_bar);
-        gtk_grid_attach(GTK_GRID(stic_grid),
-                        labeled("GRAM/GROM cards", cbox), 0, 1, 1, 1);
-    }
-
-    w->pic_pal = GTK_PICTURE(gtk_picture_new());
-    gtk_widget_set_size_request(GTK_WIDGET(w->pic_pal),
-                                INTVSTIC_PAL_CELL * 16, INTVSTIC_PAL_CELL);
-    gtk_grid_attach(GTK_GRID(stic_grid),
-                    labeled("Palette", GTK_WIDGET(w->pic_pal)), 1, 1, 1, 1);
-
-    stic_scroll = mono_view(&w->stic_state);
-    gtk_widget_set_size_request(stic_scroll, 480, 220);
-    gtk_grid_attach(GTK_GRID(stic_grid),
-                    labeled("Registers & mode", stic_scroll), 0, 2, 2, 1);
-
     notebook = gtk_notebook_new();
     w->notebook = GTK_NOTEBOOK(notebook);
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), panes,
-                             gtk_label_new(k_tab_names[TAB_CPU]));
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_basic(w),
-                             gtk_label_new(k_tab_names[TAB_BASIC]));
+    w->pages[TAB_CONSOLE] = build_console(w);
+    w->pages[TAB_DISASM] = scroller;
+    w->pages[TAB_BASIC] = build_basic(w);
     {
         GtkWidget *mem_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
         gtk_box_append(GTK_BOX(mem_page), mem_bar);
         gtk_box_append(GTK_BOX(mem_page), build_search_bar(w));
         gtk_box_append(GTK_BOX(mem_page), mem_scroller);
-        gtk_notebook_append_page(GTK_NOTEBOOK(notebook), mem_page,
-                                 gtk_label_new(k_tab_names[TAB_MEMORY]));
+        w->pages[TAB_MEMORY] = mem_page;
     }
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_breaks(w),
-                             gtk_label_new(k_tab_names[TAB_BREAKS]));
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_watches(w),
-                             gtk_label_new(k_tab_names[TAB_WATCHES]));
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_cart(w),
-                             gtk_label_new(k_tab_names[TAB_CART]));
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_hist(w, 0),
-                             gtk_label_new(k_tab_names[TAB_TRACE]));
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_hist(w, 1),
-                             gtk_label_new(k_tab_names[TAB_HISTORY]));
-    {
-        GtkWidget *outer_scroll = gtk_scrolled_window_new();
-        gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(outer_scroll),
-                                      stic_grid);
-        gtk_notebook_append_page(GTK_NOTEBOOK(notebook), outer_scroll,
-                                 gtk_label_new(k_tab_names[TAB_STIC]));
-    }
+    w->pages[TAB_BREAKS] = build_breaks(w);
+    w->pages[TAB_WATCHES] = build_watches(w);
+    w->pages[TAB_CART] = build_cart(w);
+    w->pages[TAB_TRACE] = build_hist(w, 0);
+    w->pages[TAB_HISTORY] = build_hist(w, 1);
+    w->pages[TAB_VIDEO] = dbg_video_new(w->dbg);
+    w->pages[TAB_SOUND] = build_sound(w);
     {
         GtkWidget *sym_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
         GtkWidget *sym_filter_bar =
@@ -2410,28 +2727,26 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
 
         gtk_box_append(GTK_BOX(sym_box), sym_filter_bar);
         gtk_box_append(GTK_BOX(sym_box), sym_scroll);
-        gtk_notebook_append_page(GTK_NOTEBOOK(notebook), sym_box,
-                                 gtk_label_new(k_tab_names[TAB_SYMBOLS]));
+        w->pages[TAB_SYMBOLS] = sym_box;
     }
     w->fuji_page = build_fujinet(w);
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), w->fuji_page,
-                             gtk_label_new(k_tab_names[TAB_FUJINET]));
+    w->pages[TAB_FUJINET] = w->fuji_page;
     w->tabs = GTK_NOTEBOOK(notebook);
-    {
-        int i;   /* each page keeps its identity when it is moved around */
-        for (i = 0; i < TAB_COUNT; i++) {
-            GtkWidget *pg = gtk_notebook_get_nth_page(GTK_NOTEBOOK(notebook), i);
-            g_object_set_data(G_OBJECT(pg), "tab-index", GINT_TO_POINTER(i + 1));
-            w->pages[i] = pg;
-        }
+    for (tab = 0; tab < TAB_COUNT; tab++) {
+        /* each page keeps its identity when it is moved around */
+        g_object_set_data(G_OBJECT(w->pages[tab]), "tab-index", GINT_TO_POINTER(tab + 1));
+        gtk_notebook_append_page(GTK_NOTEBOOK(notebook), w->pages[tab], gtk_label_new(k_tab_names[tab]));
     }
     g_signal_connect(notebook, "switch-page", G_CALLBACK(on_switch_page), w);
     {
         int cur = gtk_notebook_get_current_page(GTK_NOTEBOOK(notebook));
         intv_help_set_context(w->win, k_tab_contexts[cur > 0 && cur < (int)G_N_ELEMENTS(k_tab_contexts) ? cur : 0]);
     }
-    if (tab_from_env() >= 0)
-        gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), tab_from_env());
+    tab = tab_from_env("INTV_DEBUGGER_TAB");
+    if (tab >= 0) {
+        gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), tab);
+        intv_help_set_context(w->win, k_tab_contexts[tab]);
+    }
 
     box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_box_append(GTK_BOX(box), header);
@@ -2440,8 +2755,11 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     gtk_widget_set_vexpand(notebook, TRUE);
     gtk_box_append(GTK_BOX(box),
                    gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
-    gtk_box_append(GTK_BOX(box), regbox);
-    adw_window_set_content(ADW_WINDOW(w->win), box);
+    gtk_box_append(GTK_BOX(box), build_regs(w));
+    overlay = adw_toast_overlay_new();
+    w->toasts = ADW_TOAST_OVERLAY(overlay);
+    adw_toast_overlay_set_child(w->toasts, box);
+    adw_window_set_content(ADW_WINDOW(w->win), overlay);
 
     keys = gtk_event_controller_key_new();
     g_signal_connect(keys, "key-pressed", G_CALLBACK(on_key), w);
@@ -2482,8 +2800,7 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
             bp.type = INTVDEBUG_BP_WRITE;
             bp.lo = lo;
             bp.hi = hi;
-            bp.cond = INTVDEBUG_COND_CHANGED;
-            bp.mask = 0xFF;
+            g_strlcpy(bp.condition, "value != old", sizeof bp.condition);
             intvdebug_bp_add(w->dbg, &bp);
         }
         if (mg && *mg && intvsym_parse_range(w->symtab, mg, &lo, &hi, NULL))
@@ -2504,4 +2821,9 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
     w->susp_id = g_signal_connect(w->win, "notify::suspended",
                                   G_CALLBACK(on_window_state), w);
     gtk_window_present(w->win);
+    if (current_tab(w) == TAB_CONSOLE)
+        gtk_widget_grab_focus(GTK_WIDGET(w->console_in));
+    tab = tab_from_env("INTV_POPOUT");   /* a tab in a window of its own, for captures */
+    if (tab >= 0)
+        pop_out_tab(w, tab);
 }

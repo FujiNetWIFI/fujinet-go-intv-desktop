@@ -60,6 +60,8 @@
 #include "roms_embedded.h"
 
 extern int jzintv_entry_point(int argc, char *argv[]);
+/* Defined by the post-cfg_init hunk of tools/jzintv/jzintv-fujinet.patch. */
+extern void (*fujinet_post_cfg_init)(void);
 
 static pthread_t s_thread;
 static int       s_running = 0;
@@ -145,6 +147,11 @@ static void (*s_thread_hook)(void) = NULL;
 void intv_host_set_thread_hook(void (*hook)(void))
 {
     s_thread_hook = hook;
+}
+
+void intv_host_set_post_init_hook(void (*hook)(void))
+{
+    fujinet_post_cfg_init = hook;
 }
 
 #ifdef _WIN32

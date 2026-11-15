@@ -120,6 +120,15 @@ int intv_host_fujinet_link(void);
  * to include the emulator thread. Pass NULL to clear. */
 void intv_host_set_thread_hook(void (*hook)(void));
 
+/* Registers a callback the emulator thread runs right after every jzIntv
+ * cfg_init() -- the first boot and each session restart (jzintv.c's
+ * `reload:`). cfg_init rebuilds the CPU and bus, which drops anything a host
+ * hung on them (instruction tick, breakpoints, bus devices); this is where a
+ * host puts it back. Needs the post-cfg_init hunk of
+ * tools/jzintv/jzintv-fujinet.patch. A host that never calls this (Android)
+ * gets no callback. Pass NULL to clear. */
+void intv_host_set_post_init_hook(void (*hook)(void));
+
 /* ---- direct pad injection -------------------------------------------------
  * jzIntv's keyboard/joystick bindings (src/cfg/mapping.c) work by writing a
  * fixed scan-code-like value into pad_t.l[]/r[] (pad0.l[] = left/PD0L,

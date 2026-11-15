@@ -5876,7 +5876,7 @@
  /* Approximate numbers for a 256K board and ~20Kw game. */
  #define JLP_SG_OFS   (224)
 --- a/src/jzintv.c	2026-08-20 07:54:53.103475263 -0500
-+++ b/src/jzintv.c	2026-08-20 07:54:53.114945563 -0500
++++ b/src/jzintv.c	2026-11-15 12:30:00.000000000 -0600
 @@ -38,6 +38,7 @@
  #include "event/event.h"
  #include "ivoice/ivoice.h"
@@ -5885,6 +5885,28 @@
  #include "locutus/locutus_adapt.h"
  #include "cheat/cheat.h"
  #include "cfg/mapping.h"
+@@ -45,6 +46,12 @@
+ 
+ cfg_t intv;
+ 
++/* Called on the emulator thread right after every cfg_init() (first boot and
++ * each reload).  cfg_init() rebuilds the machine, which wipes the CPU's
++ * instruction tick and breakpoints; a host that owns a debugger sets this to
++ * re-arm it.  NULL does nothing. */
++void (*fujinet_post_cfg_init)(void) = NULL;
++
+ double elapsed(const bool);
+ void save_state(int);
+ void load_dump(void);
+@@ -340,6 +347,8 @@
+ #endif
+ reload:
+     cfg_init(&intv, argc, argv);
++    if (fujinet_post_cfg_init)
++        fujinet_post_cfg_init();
+     init_disp_width(0);
+     jzp_flush();
+ 
 --- a/src/jzintv_em.c	2026-08-20 07:54:53.103372115 -0500
 +++ b/src/jzintv_em.c	2026-08-20 07:54:53.114832551 -0500
 @@ -35,6 +35,7 @@

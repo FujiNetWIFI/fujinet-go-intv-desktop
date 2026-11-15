@@ -9,6 +9,40 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "config.h"
+#include "lzoe/lzoe.h"
+#include "file/file.h"
+#include "periph/periph.h"
+#include "cp1600/cp1600.h"
+#include "mem/mem.h"
+#include "ecs/ecs.h"
+#include "icart/icart.h"
+#include "bincfg/bincfg.h"
+#include "bincfg/legacy.h"
+#include "pads/pads.h"
+#include "pads/pads_cgc.h"
+#include "pads/pads_intv2pc.h"
+#include "avi/avi.h"
+#include "gfx/gfx.h"
+#include "gfx/palette.h"
+#include "snd/snd.h"
+#include "ay8910/ay8910.h"
+#include "demo/demo.h"
+#include "stic/stic.h"
+#include "speed/speed.h"
+#include "debug/debug_.h"
+#include "debug/debug_if.h"
+#include "debug/debug_dasm1600.h"
+#include "event/event.h"
+#include "ivoice/ivoice.h"
+#include "jlp/jlp.h"
+#include "fujinet/fujibus.h"
+#include "fujinet/fujinet.h"
+#include "locutus/locutus_adapt.h"
+#include "cheat/cheat.h"
+#include "cfg/mapping.h"
+#include "cfg/cfg.h"
+
 #include "intv_host.h"
 #include "intvdebug.h"
 #include "roms_embedded.h"
@@ -35,6 +69,8 @@ static int wait_paused(intvdebug *d, int timeout_ms)
     }
     return intvdebug_is_paused(d);
 }
+
+extern cfg_t intv;
 
 int main(void)
 {
@@ -138,6 +174,38 @@ int main(void)
     intvdebug_resume(d);
     usleep(20000);
     check("resumed (no longer paused)", !intvdebug_is_paused(d));
+
+    /* ---- a session restart (jzintv.c `reload:` re-runs cfg_init, which
+     * rebuilds the CPU and wipes the instruction tick and every breakpoint)
+     * must not lose the debugger: an EXEC breakpoint in the EXEC
+     * reset code still fires when the machine boots again. 0x1000 is `J
+     * $1026`; the breakpoint goes on the target, which only a reset runs
+     * (not 0x1000 itself: jzIntv arms a breakpoint on the current PC as
+     * "step off me", and a rebooted CPU starts there; not 0x1004, the
+     * interrupt vector, which runs 60 times a second anyway). ---- */
+    intvdebug_bp boot_bp;
+    memset(&boot_bp, 0, sizeof(boot_bp));
+    boot_bp.type = INTVDEBUG_BP_EXEC;
+    boot_bp.lo = boot_bp.hi = 0x1026;
+    boot_bp.enabled = 1;
+    int boot_bp_id = intvdebug_bp_add(d, &boot_bp);
+    check("boot breakpoint added", boot_bp_id > 0);
+    check("still engaged before the restart", intvdebug_is_engaged(d));
+    check("not paused before the restart", !intvdebug_is_paused(d));
+    __atomic_store_n(&intv.do_reload, 1u, __ATOMIC_RELAXED);
+    check("breakpoint fires after a session restart", wait_paused(d, 5000));
+    check("still engaged after the restart", intvdebug_is_engaged(d));
+    intvdebug_regs restarted;
+    check("regs_get after restart", intvdebug_regs_get(d, &restarted) == 1);
+    check("stopped at the boot breakpoint", restarted.pc == 0x1026);
+    intvdebug_stop_info stop;
+    check("last_stop after restart", intvdebug_last_stop(d, &stop) == 1);
+    check("stop reason is the breakpoint",
+          stop.reason == INTVDEBUG_STOP_BREAKPOINT && stop.bp_id == boot_bp_id);
+    intvdebug_bp_remove(d, boot_bp_id);
+    intvdebug_resume(d);
+    usleep(20000);
+    check("runs on after the restart", !intvdebug_is_paused(d));
 
     /* ---- disengage must leave the emulator thread free-running, not
      * parked -- confirmed by the session stopping cleanly below. ---- */

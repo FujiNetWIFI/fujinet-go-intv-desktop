@@ -286,10 +286,16 @@ static uint32_t debug_tick(periph_t *req, uint32_t cycles)
     return 0; /* NEVER CYC_MAX -- that aborts cp1600_run's whole timeslice. */
 }
 
+static void rearm_hook(void);
+
 void intvdebug_set_engaged(intvdebug *d, int engaged)
 {
     if (engaged == d->engaged)
         return;
+    /* The first time anything engages, ask the host to call us back after
+     * every cfg_init (a session restart). Not installed unless a debugger is
+     * ever used, and Android never builds this file. */
+    intv_host_set_post_init_hook(rearm_hook);
 
     if (engaged) {
         d->engaged = 1;
@@ -679,6 +685,40 @@ static void watch_apply(intvdebug *d)
         periph_register(bus, &g_watch, (uint32_t)b << 4, ((uint32_t)e << 4) | 15, "watch");
         b = e;
     }
+}
+
+/* jzIntv's reload path (jzintv.c `reload:`) tears the machine down and runs
+ * cfg_init() again, which rebuilds the CPU and the bus: our instruction tick,
+ * every EXEC breakpoint and the watch device registration are gone, while
+ * `engaged` still says 1 (so set_engaged(1) would be a no-op). Put them back
+ * from the tables. Runs on the emulator thread, right after cfg_init, via the
+ * hook the jzIntv patch adds; also callable by a host that rebuilt the machine
+ * some other way. */
+void intvdebug_rearm(intvdebug *d)
+{
+    int idx;
+
+    if (d->engaged) {
+        cp1600_instr_tick(&intv.cp1600, debug_tick, NULL);
+        intv.cp1600.step_count = (d->hist_on || d->step_mode) ? 1 : ~0U;
+        intv.cp1600.steps_remaining = (d->hist_on || d->step_mode) ? 1 : 0;
+    }
+    d->line_mode = LINE_NONE;      /* a by-line step cannot survive a reboot */
+    d->hist_count = 0;             /* the old instructions belong to a dead machine */
+
+    pthread_mutex_lock(&d->bp_lock);
+    for (idx = 0; idx < d->nbp; idx++)
+        if (d->bps[idx].type & INTVDEBUG_BP_EXEC)
+            bp_arm_exec(&d->bps[idx]);
+    pthread_mutex_unlock(&d->bp_lock);
+
+    g_watch_bus = NULL;            /* the old bus is freed; forget the registration */
+    watch_apply(d);
+}
+
+static void rearm_hook(void)
+{
+    intvdebug_rearm(&g_debug);
 }
 
 /* Called on the emulator thread for each CPU data access on a watched bin. */

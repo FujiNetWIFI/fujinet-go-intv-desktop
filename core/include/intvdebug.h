@@ -65,6 +65,12 @@ typedef struct {
 void intvdebug_set_engaged(intvdebug *d, int engaged);
 int  intvdebug_is_engaged(const intvdebug *d);
 
+/* Re-registers the instruction tick, the EXEC breakpoints and the watch
+ * device on the current machine, and clears the history. The engine calls it
+ * itself after a jzIntv session restart (cfg_init rebuilds the CPU and bus);
+ * emulator thread only. */
+void intvdebug_rearm(intvdebug *d);
+
 /* Pause at the next instruction boundary, or resume. intvdebug_pause
  * returns immediately -- the machine stops shortly after (at most one
  * instruction later), and the stop serial below is how a UI notices. */

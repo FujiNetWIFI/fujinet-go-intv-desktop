@@ -425,6 +425,10 @@ a search hit.
 the highlight onward; **Find Next** and **Find Previous** step through the
 matches.
 
+**Poke** writes a value at an address while the machine is stopped: four hex
+digits, or two in the 8-bit areas (scratch RAM, GRAM, GROM, ECS RAM). Values
+are words, so a 16-bit poke to system RAM keeps all sixteen bits.
+
 <!-- context: debugger/basic -->
 ## BASIC
 

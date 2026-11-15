@@ -598,6 +598,12 @@ void intvdebug_set_engaged(intvdebug *dbg, int engaged)
         cp1600_instr_tick(&intv.cp1600, debug_tick, NULL);
         if (dbg->hist_on)
             intv.cp1600.step_count = 1;
+        /* A release left steps_remaining counting down from ~0U, so without
+         * this a re-engaged tick would not fire for billions of instructions
+         * and Pause/Step would lag after the window was closed and reopened.
+         * A racy write, like intvdebug_pause's: at worst the tick lands one
+         * instruction later. */
+        intv.cp1600.steps_remaining = 1;
     } else {
         intvdebug_resume(dbg); /* never leave the emulator thread parked */
         dbg->engaged = 0;

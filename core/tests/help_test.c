@@ -26,7 +26,7 @@ static const char *const platform_names[] = { "GNOME", "KDE", "Windows", "macOS"
 /* What the frontends' Help buttons and menus open. */
 static const char *const contexts[] = {
     "main", "nobios", "keypad", "ecskbd", "fujilog", "prefs/Machine", "prefs/ROMs",
-    "debugger/cpu", "debugger/basic", "debugger/memory", "debugger/breakpoints", "debugger/watches", "debugger/cart", "debugger/trace", "debugger/history", "debugger/stic", "debugger/symbols", "debugger/fujinet",
+    "debugger/console", "debugger/disassembly", "debugger/basic", "debugger/memory", "debugger/breakpoints", "debugger/watches", "debugger/cart", "debugger/trace", "debugger/history", "debugger/video", "debugger/sound", "debugger/symbols", "debugger/fujinet",
 };
 
 /* The Preferences pages: what each one has, as the frontends label it. */
@@ -184,9 +184,13 @@ static void
 check_debugger(int p)
 {
     static const char *const words[] = { "Pause", "Step Over", "Step Out", "Clear Breakpoints", "Break at",
-                                         "Load Symbols", "Clear Symbols", "eleven tabs", "Pop Out", "Record", "red dot", "Break on Change", "Find Next", "Import File", "Import Folder", "Load Map", ".smap", "INCLUDE", "GRAM", "BACKTAB", "Filter" };
+                                         "Load Symbols", "Clear Symbols", "thirteen tabs", "Pop Out", "Record", "red dot", "Break on Change", "Find Next", "Import File", "Import Folder", "Load Map", ".smap", "INCLUDE", "GRAM", "BACKTAB", "Filter",
+                                         "Display", "Decoded", "Beam", "Values", "Zoom", "Fit", "Overlays", "Pixel", "Registers", "Colours", "Lines", "Timing", "Break on writes" };
+    static const char *const debug_commands[] = { "step", "over", "out", "line", "run", "stop", "runto", "break", "bpr", "bpw", "bpa", "delete", "print", "regs", "set", "mem", "poke", "disasm", "trace", "watch", "unwatch", "find", "symbols", "label", "source", "locals", "map", "io", "cart", "sound", "video", "save" };
     for (size_t k = 0; k < sizeof words / sizeof *words; k++)
         require(p, "debugger", "button", words[k]);
+    for (size_t k = 0; k < sizeof debug_commands / sizeof *debug_commands; k++)
+        require(p, "debugger/console", "command", debug_commands[k]);
 }
 
 int
@@ -215,7 +219,7 @@ main(void)
     CHECK(intvhelp_search(INTVHELP_GNOME, "cartridge", hits, 16) > 0, "search cartridge");
     CHECK(intvhelp_search(INTVHELP_GNOME, "zzqxj", hits, 16) == 0, "search nonsense");
     int n = intvhelp_search(INTVHELP_KDE, "BACKTAB", hits, 16);
-    CHECK(n > 0 && intvhelp_find("debugger/stic", &t, &b) == 0
+    CHECK(n > 0 && intvhelp_find("debugger/video", &t, &b) == 0
           && hits[0].topic == t && hits[0].block == b, "BACKTAB is the first hit");
     for (int i = 1; i < n; i++)
         CHECK(hits[i - 1].score >= hits[i].score, "hits best first");

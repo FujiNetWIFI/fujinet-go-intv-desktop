@@ -360,7 +360,7 @@ controls that differ from the defaults).
 # Debugger
 
 The Debugger (<kbd>F12</kbd>) stops the console and shows what it is doing.
-It has eleven tabs; closing it lets the console go on as it was.
+It has thirteen tabs; closing it lets the console go on as it was.
 
 | Button | Does |
 |---|---|
@@ -375,12 +375,43 @@ It has eleven tabs; closing it lets the console go on as it was.
 | Pop Out | Moves the tab that shows into a window of its own; **Dock** in that window puts it back |
 | Help | Opens the topic of the tab that shows |
 
-<!-- context: debugger/cpu -->
-## CPU
+<!-- context: debugger/console -->
+## Console
+
+A prompt for everything the buttons do, and more. Type a command and press
+Enter; <kbd>Tab</kbd> completes and the arrows recall earlier lines. `help`
+lists them all.
+
+| Command | Does |
+|---|---|
+| `step` `over` `out` `run` `stop` | Run control |
+| `line` `overline` `lineout` | The same by BASIC line |
+| `runto` | Runs to an address |
+| `break` `bpr` `bpw` `bpa` | Execute, Read, Write and Access breakpoints, with an optional `if` condition |
+| `delete` `enable` `clear` | Manage them |
+| `disable` `breaks` `hits` | Likewise |
+| `print` `regs` `set` | Evaluate an expression, show or set the registers |
+| `mem` `poke` `disasm` | Look at memory, change it |
+| `find` `trace` | Search; show the trace |
+| `watch` `unwatch` | Variables to keep an eye on |
+| `symbols` `label` `labels` | Symbols |
+| `source` `locals` | IntyBASIC line and variables |
+| `map` `io` `cart` | Memory map, controllers and ports, cartridge |
+| `sound` `video` | The PSGs; the STIC |
+| `save` | Writes `ram`, `gram`, `regs` or `trace` to a file |
+
+Expressions take numbers (`$5000`, `0x5000`, `20480`), registers (`r0` to `r7`,
+`pc`, `sp`), flags (`s z o c i d`), symbols, `[addr]` for the word at an
+address, `frame` and `cycles`. A condition on an access can also use `value`,
+`addr` and `old`, for instance `bpw $0310 if value > old`.
+
+<!-- context: debugger/disassembly -->
+## Disassembly
 
 The CP1610 disassembled with symbols. The instruction the machine is on is a
 green bar, and a breakpoint is a red dot in the margin; click a line to toggle
-its breakpoint. The registers are in the strip under every tab.
+its breakpoint. The registers are in the strip under every tab: click one
+and type a new value, then Enter, while the machine is stopped.
 
 <!-- context: debugger/memory -->
 ## Memory
@@ -420,13 +451,13 @@ the ROM that is running.
 <!-- context: debugger/breakpoints -->
 ## Breakpoints
 
-Every breakpoint and watchpoint. **Add** one with a type, an address, and for
-Write and Access a condition on the value written:
+Every breakpoint and watchpoint. **Add** one with a type, an address, and a
+condition, an expression such as `value > old` or `r1 == 5`:
 
 - **Execute** stops before an instruction runs.
 - **Read**, **Write** and **Access** (both) stop *after* the instruction that
   touched the words, and the status line says what it did, for instance
-  `wrote $010C = $1D (was $1C)`. They see the CPU's data accesses only: an
+  `wrote $010C = $1D (was $1C)`; the values are words, two hex digits only in the 8-bit areas. They see the CPU's data accesses only: an
   instruction fetch is not one, so use Execute to catch code.
 
 The address can be a number (`$010C`), a range (`$0100-$010F`), a symbol, or an
@@ -444,13 +475,15 @@ it in the Memory tab, and **Break on Change** adds a Write breakpoint that
 fires when its value changes.
 
 <!-- context: debugger/cart -->
-## Cart
+## Cart & I/O
 
 The cartridge that is running (its file, its title if it carries one, and
 whether the FujiNet mailbox, the ECS and the JLP are in play) and the memory
 map: every range the machine answers in, whether it is readable and writable,
 and what answers there (STIC, PSG, the EXEC ROM, your cartridge, the FujiNet
-mailbox). Stop the machine to read the map.
+mailbox). Stop the machine to read the map. Below it are the two hand
+controllers (disc, keypad and side buttons), the PSG I/O ports, the ECS
+keyboard rows, the Intellivoice and the JLP.
 
 <!-- context: debugger/trace -->
 ## Trace
@@ -468,12 +501,39 @@ The same record as the Trace tab, shown when the machine stops: what it did
 just before it hit a breakpoint or a watch. It is the instructions leading up
 to the stop, newest at the bottom.
 
-<!-- context: debugger/stic -->
-## STIC
+<!-- context: debugger/video -->
+## Video
 
-The STIC video chip, decoded from its live state: the BACKTAB, the MOBs
-(sprites), the GRAM and GROM cards (page through them with ◀ and ▶), the
-palette, and its registers and mode.
+The STIC, with the picture on the left and its sections on the right. The STIC
+draws the whole frame at once, so the console keeps what it was given for every
+frame.
+
+| View | Shows |
+|---|---|
+| Display | The last finished frame, as the screen showed it |
+| Decoded | One source at a time: the BACKTAB cards, the MOBs (sprites), the GRAM and GROM card sheet (page with ◀ and ▶) or the palette |
+| Beam | Stopped only: where the beam was in this frame |
+| Values | The BACKTAB words as hex |
+
+**Zoom** goes from 1 to 16 times, or **Fit**. **Overlays** switch on the card
+grid, MOB boxes, the border and blanking, the beam and a heat tint for the
+words written lately.
+
+Point at a pixel to see it in **Pixel**: the card or MOB, its address and word.
+Click to pin it, click again to let go. **Break on writes** stops the machine
+when anything writes that BACKTAB word, GRAM card byte or MOB register.
+
+**Registers** shows the STIC registers with how long ago each changed,
+**Colours** the sixteen colours and the colour stack, **Lines** the twelve card
+rows, and **Timing** the frame and scanline length for NTSC or PAL.
+
+<!-- context: debugger/sound -->
+## Sound
+
+The AY-3-8914 sound chips, read while the machine is stopped: the base PSG and,
+with the ECS, the second one. Each shows its three tone periods and volumes,
+the noise period, the mixer (which channels have tone and noise on), the
+envelope and the I/O ports.
 
 <!-- context: debugger/symbols -->
 ## Symbols

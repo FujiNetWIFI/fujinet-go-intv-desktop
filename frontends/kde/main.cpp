@@ -30,12 +30,15 @@ int main(int argc, char *argv[])
 
     /* Checked toggles (ECS Ctrl/Shift, the keypad's Map) in the icon's dark
      * green; ":checked" only, so unchecked buttons keep the platform look. */
-    app.setStyleSheet(QStringLiteral(
-        "QPushButton:checked { background-color: #1E4912; color: white; }"
-        "QPushButton:checked:hover { background-color: #2C6B1A; }"
-        /* a button whose action is on offer (the debugger's Run while stopped) */
-        "QPushButton[accent=\"true\"] { background-color: #1E4912; color: white; }"
-        "QPushButton[accent=\"true\"]:hover { background-color: #2C6B1A; }"));
+    const QString accent = QStringLiteral("#%1").arg(INTVSESSION_ACCENT_RGB, 6, 16, QLatin1Char('0'));
+    const QString ink = QStringLiteral("#%1").arg(INTVSESSION_ACCENT_INK_RGB, 6, 16, QLatin1Char('0'));
+    app.setStyleSheet(
+        QStringLiteral("QPushButton:checked { background-color: %1; color: %2; }"
+                       "QPushButton:checked:hover { background-color: #2C6B1A; }"
+                       /* a button whose action is on offer (the debugger's Run while stopped) */
+                       "QPushButton[accent=\"true\"] { background-color: %1; color: %2; }"
+                       "QPushButton[accent=\"true\"]:hover { background-color: #2C6B1A; }")
+            .arg(accent, ink));
 
     intvsession *session = intvsession_new(nullptr);
     if (!session) {

@@ -35,6 +35,7 @@ add_executable(fujinet-go-intv-kde
   SettingsDialog.cpp
   help/HelpWindow.cpp
   debugger/DebuggerWindow.cpp
+  debugger/VideoTab.cpp
   keypad/KeypadWindow.cpp
   ecskbd/EcsKeyboardWindow.cpp
 )
@@ -97,6 +98,23 @@ qt_add_shaders(display_shaders_test "display_shaders_guard"
 add_test(NAME display_shaders_kde COMMAND display_shaders_test)
 set_tests_properties(display_shaders_kde PROPERTIES
                      ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+# The Debugger window on the offscreen platform: the tabs and what needs no
+# machine always, and with the system ROMs (WITH_INTV_ROMS=ON) a NOP-padded
+# program stepped through the window.
+find_package(Qt6 COMPONENTS Test QUIET)
+if(Qt6Test_FOUND)
+  add_executable(debugger_test debugger_test.cpp debugger/DebuggerWindow.cpp
+                 debugger/VideoTab.cpp help/HelpWindow.cpp)
+  set_target_properties(debugger_test PROPERTIES CXX_STANDARD 17)
+  target_link_libraries(debugger_test PRIVATE intv_session Qt6::Widgets Qt6::Test)
+  target_include_directories(debugger_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+                             "${CMAKE_SOURCE_DIR}/core/debugger")
+  target_compile_options(debugger_test PRIVATE -Wall -Wextra)
+  add_test(NAME debugger_kde COMMAND debugger_test)
+  set_tests_properties(debugger_kde PROPERTIES
+                       ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+endif()
 
 install(TARGETS fujinet-go-intv-kde RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES data/${KDE_APP_ID}.desktop

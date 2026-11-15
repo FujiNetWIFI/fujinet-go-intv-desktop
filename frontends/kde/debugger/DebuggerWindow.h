@@ -9,7 +9,7 @@
 
 #include "intvdebug.h"
 #include "intvsession.h"
-#include "intvstic.h"
+#include <QStringList>
 
 struct intvsymtab;
 struct intvsrcmap;
@@ -22,7 +22,10 @@ class QListWidgetItem;
 class QPlainTextEdit;
 class QPushButton;
 class QTabWidget;
+class QEvent;
+class QObject;
 class QTimer;
+class VideoTab;
 
 class DebuggerWindow : public QMainWindow {
     Q_OBJECT
@@ -34,18 +37,36 @@ private:
     explicit DebuggerWindow(QWidget *parent, intvsession *session);
     ~DebuggerWindow() override;
 
+    /* Tab completes and Up/Down recall in the console's entry. */
+    bool eventFilter(QObject *obj, QEvent *e) override;
     /* The 33 ms poll runs only while the window is shown. */
     void showEvent(QShowEvent *e) override;
     void hideEvent(QHideEvent *e) override;
 
     void buildUi();
+    QWidget *buildConsole();
+    QWidget *buildRegs();
+    QWidget *buildMemory();
+    QWidget *buildVideo();
+    QWidget *buildSound();
+    void refreshSound();
+    void refreshIo();
+    void refreshVideo(bool force);
+    void refreshStatus(const intvdebug_snapshot &snap);
+    void showNote(const QString &text);
+    void runConsole();
+    void completeConsole();
+    void consoleAppend(const QString &text);
+    void setReg(int reg);
+    void setFlag(int flag);
+    void pokeMem();
+    void editCondition();
+    bool numberOf(const QString &text, long *out, QString *why = nullptr);
     void refreshAll();
     void refreshDisasm();
     void refreshRegs();
     void refreshMem();
-    void refreshStic();
     void pauseContinue();
-    void cardsPage(int delta);
     void loadSymbols();
     void clearSymbols();
     void goToAddr();
@@ -95,7 +116,8 @@ private:
     int m_disasmBar = -1;     /* the block wearing the current-line bar */
 
     QLineEdit *m_regEdit[8]; /* R0-R7 */
-    QLabel *m_flags;
+    QLineEdit *m_flagEdit[5]; /* S Z O C I */
+    QLabel *m_flags;         /* D (SDBD pending) and whether an interrupt would be taken */
 
     QLineEdit *m_memAddr;
     QPlainTextEdit *m_memView;
@@ -108,12 +130,19 @@ private:
     unsigned m_symSeenGen = 0;
     QString m_symFilterText;
 
-    QLabel *m_backtab, *m_mob[INTVSTIC_MOB_COUNT], *m_cards, *m_palette;
-    QLabel *m_cardsRange;
-    QPlainTextEdit *m_mobInfo;
-    QPlainTextEdit *m_sticState;
-    int m_cardFirst = 0;
-    int m_cardTotal = 0;
+    /* Console tab */
+    QPlainTextEdit *m_conOut = nullptr;
+    QLineEdit *m_conIn = nullptr;
+    QStringList m_history;
+    int m_historyPos = 0;
+
+    /* Memory tab: the Poke bar */
+    QLineEdit *m_pokeAddr = nullptr, *m_pokeVal = nullptr;
+
+    /* Video and Sound tabs */
+    VideoTab *m_video = nullptr;
+    bool m_videoForce = true;
+    QPlainTextEdit *m_soundText = nullptr;
 
     /* BASIC tab: the imported IntyBASIC source (core/debugger/srcmap.h) */
     QLabel *m_basNote;
@@ -134,8 +163,8 @@ private:
     QLabel *m_srchNote;
 
     /* Breakpoints tab */
-    QComboBox *m_bpType, *m_bpCond;
-    QLineEdit *m_bpAddr, *m_bpValue;
+    QComboBox *m_bpType;
+    QLineEdit *m_bpAddr, *m_bpCond;
     QListWidget *m_bpList;
     QLabel *m_bpStop;
     unsigned m_bpGen = 0;
@@ -146,7 +175,7 @@ private:
     QListWidget *m_wtList;
 
     /* Cart tab; Trace (0, live) and History (1, when stopped) share one ring */
-    QPlainTextEdit *m_cartText;
+    QPlainTextEdit *m_cartText, *m_ioText;
     QPushButton *m_hRec[2];
     QComboBox *m_hFilter[2];
     QLineEdit *m_hRange[2];
@@ -171,5 +200,6 @@ private:
 
     QTimer *m_tick;
     uint64_t m_seenSerial = 0;
+    unsigned m_seenGen = 0;
     int m_wasPaused = 0;
 };

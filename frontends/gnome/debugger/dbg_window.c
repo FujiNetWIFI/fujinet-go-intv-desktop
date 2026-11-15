@@ -2801,7 +2801,17 @@ void intv_debugger_show(GtkWindow *parent, intvsession *session)
             bp.lo = lo;
             bp.hi = hi;
             g_strlcpy(bp.condition, "value != old", sizeof bp.condition);
-            intvdebug_bp_add(w->dbg, &bp);
+            {   /* reopening the window must not stack a second copy */
+                intvdebug_bp have[INTVDEBUG_MAX_BREAKPOINTS];
+                const int count = intvdebug_bp_list(w->dbg, have, INTVDEBUG_MAX_BREAKPOINTS);
+                int idx, dup = 0;
+                for (idx = 0; idx < count; idx++)
+                    if (have[idx].type == bp.type && have[idx].lo == bp.lo && have[idx].hi == bp.hi &&
+                        strcmp(have[idx].condition, bp.condition) == 0)
+                        dup = 1;
+                if (!dup)
+                    intvdebug_bp_add(w->dbg, &bp);
+            }
         }
         if (mg && *mg && intvsym_parse_range(w->symtab, mg, &lo, &hi, NULL))
             show_in_memory(w, lo, hi);

@@ -38,6 +38,7 @@
     intvsession *_session;
     NSWindow *_window;
     DisplayView *_display;
+    id<NSObject> _activity;          /* no App Nap, no timer coalescing while we run */
     NSWindow *_configWindow;
     NSWindow *_logWindow;
     NSTextView *_logView;
@@ -937,6 +938,13 @@ static NSArray<NSString *> *restartSettingKeys(void)
 - (void)applicationDidFinishLaunching:(NSNotification *)note
 {
     (void)note;
+
+    /* An emulator is latency-critical work: App Nap must not throttle the
+     * machine thread or coalesce its timers when the window is behind
+     * another, and Game Mode (Info.plist) asks the system to favour it. */
+    _activity = [[NSProcessInfo processInfo]
+        beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical)
+                          reason:@"Emulating an Intellivision"];
     [self buildMenus];
 
     /* 4:3 content area plus room for the title bar -- matches the display's
@@ -953,6 +961,8 @@ static NSArray<NSString *> *restartSettingKeys(void)
                     backing:NSBackingStoreBuffered
                       defer:NO];
     _window.title = @"FujiNet Go Intv";
+    /* Full screen is where Game Mode (Info.plist) engages. */
+    _window.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
 
     _display = [[DisplayView alloc] initWithSession:_session];
     _display.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
@@ -990,6 +1000,10 @@ static NSArray<NSString *> *restartSettingKeys(void)
     [_logTimer invalidate];
     [_sysactTimer invalidate];
     [_display stop];
+    if (_activity) {
+        [[NSProcessInfo processInfo] endActivity:_activity];
+        _activity = nil;
+    }
     intvsession_stop(_session);
 }
 

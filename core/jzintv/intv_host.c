@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "intv_host.h"
+#include "apple_realtime.h"
 
 #include <pthread.h>
 #ifdef _WIN32
@@ -178,6 +179,7 @@ static void *thread_main(void *arg)
 #endif
     if (s_thread_hook)
         s_thread_hook();
+    apple_realtime_begin(1e9 / 60.0);   /* a real-time slot on macOS; a no-op elsewhere */
     jzintv_entry_point(s_argc, s_argv);
 
     pthread_mutex_lock(&s_lock);

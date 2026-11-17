@@ -50,6 +50,16 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.20.0" date="2026-11-16">
+      <description>
+        <p>
+          macOS: the picture is drawn with Metal in step with the display, so it is smoother on 60 and 120 Hz screens; the emulator runs with game-grade scheduling priority; and the app opts into macOS Game Mode when it is full screen.
+        </p>
+        <p>
+          Full screen from the View menu now works on macOS.
+        </p>
+      </description>
+    </release>
     <release version="0.19.0" date="2026-11-15">
       <description>
         <p>The debugger gets the family's newer tools: a Console with a command prompt and expressions, a Video tab (Display, Decoded, Beam and Values views with overlays, an inspector and Break on writes), a Sound tab for both PSGs, and Cart &amp; I/O. Registers and memory can be edited, breakpoints take conditions such as value &gt; old, and a session restart no longer loses the debugger.</p>

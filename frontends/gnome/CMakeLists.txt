@@ -21,7 +21,7 @@ set(GNOME_SOURCES
   help/help_window.c
   debugger/dbg_window.c
   debugger/dbg_video.c
-  keypad/keypad_window.c
+  controllers/controllers_window.c
   ecskbd/ecskbd_window.c
 )
 
@@ -52,7 +52,7 @@ add_executable(fujinet-go-intv-gnome ${GNOME_SOURCES})
 # stdc++ in the explicit list, which is what fixes the order.
 target_link_libraries(fujinet-go-intv-gnome PRIVATE intv_session jzintv_core
                       PkgConfig::ADW stdc++)
-# debugger/dbg_window.c and keypad/keypad_window.c include their own headers
+# debugger/dbg_window.c and controllers/controllers_window.c include their own headers
 # by that path.
 target_include_directories(fujinet-go-intv-gnome PRIVATE
                            "${CMAKE_CURRENT_SOURCE_DIR}"

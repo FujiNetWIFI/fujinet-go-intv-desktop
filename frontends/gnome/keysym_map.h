@@ -7,7 +7,7 @@
  * them through unmodified silently drops every arrow/numpad/modifier key
  * (matched no case, always hit the default: none() branch) while ASCII
  * letters/digits kept working by coincidence, since GDK's values for those
- * ARE their ASCII codes. Shared by window.c, keypad/keypad_window.c and
+ * ARE their ASCII codes. Shared by window.c, controllers/controllers_window.c and
  * ecskbd/ecskbd_window.c so the mapping only lives in one place.
  *
  * Callers handling a GtkEventControllerKey signal should use

@@ -1,6 +1,6 @@
 /*
  * IntvWindow: main window of the GNOME frontend. Header bar + menu over the
- * emulator display; keyboard capture routes everything except F9 (keypad
+ * emulator display; keyboard capture routes everything except F9 (Controllers
  * window), F10 (ECS keyboard window), F11 (fullscreen) and F12 (debugger)
  * to the Intellivision. No on-screen input panels are shown unless the
  * user asks for them.
@@ -19,7 +19,7 @@
 #include "display.h"
 #include "help/help_window.h"
 #include "ecskbd/ecskbd_window.h"
-#include "keypad/keypad_window.h"
+#include "controllers/controllers_window.h"
 #include "keysym_map.h"
 #include "prefs.h"
 
@@ -39,6 +39,7 @@ struct _IntvWindow {
      * when focus moves elsewhere doesn't leave its slot stuck "down". */
     gboolean sysact_down[INTVSESSION_SYSACT_COUNT];
     guint sysact_timer_id;
+    unsigned pad_generation;  /* gamepads seen at the last drain: a change toasts */
 };
 
 G_DEFINE_FINAL_TYPE(IntvWindow, intv_window, ADW_TYPE_APPLICATION_WINDOW)
@@ -49,7 +50,7 @@ void intv_window_toast(IntvWindow *self, const char *message)
 }
 
 /* ---- the display CSS ------------------------------------------------------
- * One display-wide provider, installed at startup so the keypad and ECS
+ * One display-wide provider, installed at startup so the Controllers and ECS
  * windows get it too: checked toggles and highlighted buttons in the icon's
  * dark green (INTVSESSION_ACCENT_RGB) with its ink (INTVSESSION_ACCENT_INK_RGB), in light
  * and dark. */
@@ -357,8 +358,23 @@ static void action_open_sd(GSimpleAction *action, GVariant *param,
     g_object_unref(launcher);
 }
 
+/* A system action from the keyboard, the Controllers window's buttons or a
+ * gamepad: fired here, on the UI thread. Stop in debugger also brings the
+ * debugger window up, which follows the stop. */
+void intv_window_sysaction(IntvWindow *self, intvsession_sysaction action)
+{
+    if (intvsession_sysaction_fire(self->session, action) != 0)
+        intv_window_toast(self, intvsession_last_error(self->session));
+    else if (action == INTVSESSION_SYSACT_DEBUG_STOP)
+        intv_debugger_show(GTK_WINDOW(self), self->session);
+    else if (action == INTVSESSION_SYSACT_RESET_GAME)
+        intv_window_toast(self, "Reset Game");
+    else if (action == INTVSESSION_SYSACT_RESET_CONFIG)
+        intv_window_toast(self, "Reset to CONFIG");
+}
+
 /* ---- keyboard capture ---------------------------------------------------
- * Everything goes to the machine except F9 (keypad window), F11
+ * Everything goes to the machine except F9 (Controllers window), F11
  * (fullscreen) and F12 (debugger). Both press and release are forwarded:
  * jzIntv's pad_t tracks held keys via a direct bit injection (see
  * core/jzintv/intv_host.h), so a missed release leaves that key down in the
@@ -370,7 +386,7 @@ static gboolean forward_key(IntvWindow *self, GtkEventControllerKey *ctrl,
 {
     uint32_t keysym = intv_keysym_from_key_event(ctrl, keyval, keycode, state);
 
-    /* _bound, not the pure table: a keypad window "Map" remap has to take
+    /* _bound, not the pure table: a Controllers window "Map" remap has to take
      * effect here too, since typing while the main window holds focus is
      * the common case, not the exception. Resolved once, up front, so a
      * system-action target can be checked ahead of ECS keyboard mode
@@ -392,7 +408,7 @@ static gboolean forward_key(IntvWindow *self, GtkEventControllerKey *ctrl,
         if (down) {
             if (!self->sysact_down[m.sysact]) {
                 self->sysact_down[m.sysact] = TRUE;
-                intvsession_sysaction_fire(self->session, m.sysact);
+                intv_window_sysaction(self, m.sysact);
             }
         } else {
             self->sysact_down[m.sysact] = FALSE;
@@ -441,7 +457,7 @@ const char *intv_window_help_context(IntvWindow *self)
 }
 
 /* app.help: every window's Ctrl+Shift+H, for what it shows. Not a cast of
- * the active window: it can be the debugger, the keypad or the log. */
+ * the active window: it can be the debugger, the Controllers or the log. */
 static void action_help(GSimpleAction *a, GVariant *p, gpointer user_data)
 {
     (void)a; (void)p;
@@ -467,7 +483,7 @@ static gboolean on_key_pressed(GtkEventControllerKey *controller, guint keyval,
 
     switch (keyval) {
     case GDK_KEY_F9:
-        intv_keypad_window_toggle(GTK_WINDOW(self), self->session);
+        intv_controllers_window_toggle(GTK_WINDOW(self), self->session);
         return TRUE;
     case GDK_KEY_F10:
         intv_ecskbd_window_toggle(GTK_WINDOW(self), self->session);
@@ -520,19 +536,20 @@ static void on_focus_leave(GtkEventControllerFocus *controller,
     int i;
     (void)controller;
     intvsession_ecs_keys_clear(self->session);
+    intvsession_release_keyboard(self->session);
     for (i = 0; i < INTVSESSION_SYSACT_COUNT; i++)
         self->sysact_down[i] = FALSE;
 }
 
 /* ---- actions ------------------------------------------------------------ */
 
-static void action_keypad(GSimpleAction *action, GVariant *param,
+static void action_controllers(GSimpleAction *action, GVariant *param,
                           gpointer user_data)
 {
     IntvWindow *self = INTV_WINDOW(user_data);
     (void)action;
     (void)param;
-    intv_keypad_window_toggle(GTK_WINDOW(self), self->session);
+    intv_controllers_window_toggle(GTK_WINDOW(self), self->session);
 }
 
 static void action_ecs_keyboard(GSimpleAction *action, GVariant *param,
@@ -760,7 +777,7 @@ static gboolean screenshot_tick(gpointer user_data)
 /* ---- construction ------------------------------------------------------- */
 
 static const GActionEntry win_actions[] = {
-    {.name = "keypad", .activate = action_keypad},
+    {.name = "controllers", .activate = action_controllers},
     {.name = "ecs-keyboard", .activate = action_ecs_keyboard},
     {.name = "import-bios", .activate = action_import_bios},
     {.name = "import-bios-folder", .activate = action_import_bios_folder},
@@ -815,7 +832,7 @@ static GMenu *build_menu(void)
     g_menu_append(machine, "Open SD Folder", "win.open-sd");
     g_menu_append_section(menu, "Machine", G_MENU_MODEL(machine));
 
-    g_menu_append(view, "Keypad (F9)", "win.keypad");
+    g_menu_append(view, "Controllers (F9)", "win.controllers");
     g_menu_append(view, "ECS Keyboard (F10)", "win.ecs-keyboard");
     g_menu_append(view, "Debugger (F12)", "win.debugger");
     g_menu_append_section(menu, "View", G_MENU_MODEL(view));
@@ -841,10 +858,10 @@ static GMenu *build_menu(void)
 /* Drains intvsession_sysaction_take -- the only caller that can't fire a
  * sysaction directly (gamepad_sdl.c's SDL thread, queuing RESET_CONFIG so it
  * never joins itself) -- and fires each on this, the UI thread. Lives on the
- * main window rather than the keypad window: the latter hides rather than
- * destroys itself (see keypad_window.c) but is hidden far more often than
+ * main window rather than the Controllers window: the latter hides rather than
+ * destroys itself (see controllers_window.c) but is hidden far more often than
  * shown, and a gamepad-bound sysaction has to keep working regardless of
- * whether that window happens to be open. ~100ms: fast enough that a
+ * whether that window happens to be open. ~40ms: fast enough that a
  * gamepad press feels immediate, cheap enough to run for the app's whole
  * lifetime. */
 static gboolean sysact_drain_tick(gpointer user_data)
@@ -852,9 +869,18 @@ static gboolean sysact_drain_tick(gpointer user_data)
     IntvWindow *self = INTV_WINDOW(user_data);
     intvsession_sysaction a;
 
-    while (intvsession_sysaction_take(self->session, &a)) {
-        if (intvsession_sysaction_fire(self->session, a) != 0)
-            intv_window_toast(self, intvsession_last_error(self->session));
+    unsigned generation;
+    char text[160];
+
+    while (intvsession_sysaction_take(self->session, &a))
+        intv_window_sysaction(self, a);
+
+    /* a gamepad coming or going says so */
+    generation = intvsession_gamepad_generation(self->session);
+    if (generation != self->pad_generation) {
+        self->pad_generation = generation;
+        if (intvsession_gamepad_last_event(self->session, text, sizeof text) > 0)
+            intv_window_toast(self, text);
     }
     return G_SOURCE_CONTINUE;
 }
@@ -925,7 +951,10 @@ GtkWidget *intv_window_new(AdwApplication *app, intvsession *session)
         gtk_widget_add_controller(GTK_WIDGET(self), focus);
     }
 
-    self->sysact_timer_id = g_timeout_add(100, sysact_drain_tick, self);
+    /* The current pad set is the baseline: no toast for pads found before
+     * the window existed. */
+    self->pad_generation = intvsession_gamepad_generation(session);
+    self->sysact_timer_id = g_timeout_add(40, sysact_drain_tick, self);
 
     intv_window_show_page(self);
     gtk_widget_grab_focus(GTK_WIDGET(self->display));
@@ -934,8 +963,8 @@ GtkWidget *intv_window_new(AdwApplication *app, intvsession *session)
      * alongside the main window. */
     if (getenv("INTV_OPEN_DEBUGGER"))
         intv_debugger_show(GTK_WINDOW(self), session);
-    if (getenv("INTV_OPEN_KEYPAD"))
-        intv_keypad_window_toggle(GTK_WINDOW(self), session);
+    if (getenv("INTV_OPEN_CONTROLLERS") || getenv("INTV_OPEN_KEYPAD"))
+        intv_controllers_window_toggle(GTK_WINDOW(self), session);
     if (getenv("INTV_OPEN_ECS"))
         intv_ecskbd_window_toggle(GTK_WINDOW(self), session);
     if (getenv("INTV_OPEN_SETTINGS"))

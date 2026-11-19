@@ -18,6 +18,11 @@ G_DECLARE_FINAL_TYPE(IntvWindow, intv_window, INTV, WINDOW,
 GtkWidget *intv_window_new(AdwApplication *app, intvsession *session);
 void intv_window_toast(IntvWindow *self, const char *message);
 
+/* Fires a system action on the UI thread (the keyboard, the Controllers
+ * window and the gamepad drain all come here): toasts a failure, and brings
+ * the debugger up for Stop in debugger. */
+void intv_window_sysaction(IntvWindow *self, intvsession_sysaction action);
+
 /* The Help context the main window shows now: "nobios", "prefs/<page>"
  * while Preferences is open, else "main". */
 const char *intv_window_help_context(IntvWindow *self);

@@ -12,6 +12,7 @@
  *   "ivoice"         INTVSESSION_HW_* (default AUTO)  -- restart to apply
  *   "video_standard" INTVSESSION_VIDEO_* (default NTSC) -- restart to apply
  *   "keyboard_mode"  0 = hand controllers, 1 = ECS keyboard -- applies live
+ *   "enable_gamepad" 0/1 (default 1) -- restart to apply
  *
  * Every row is one of three apply classes (RowBinding.apply below), the
  * same three-way split CoCo's prefs.c introduced: APPLY_LIVE pushes
@@ -29,9 +30,11 @@
 #include <string.h>
 
 #include "window.h"
+#include "controllers/controllers_window.h"
 #include "help/help_window.h"
 
 #define MAX_ROM_ROWS 8
+#define MAX_PADS 8
 
 typedef struct {
     IntvWindow *window;
@@ -39,6 +42,12 @@ typedef struct {
     gboolean session_dirty;
     GtkWidget *ecs_row;
     GtkWidget *rom_rows[MAX_ROM_ROWS];
+    AdwPreferencesDialog *dialog;
+    GtkWidget *pad_group;
+    GtkWidget *pad_rows[MAX_PADS];
+    int pad_row_count;
+    unsigned pad_generation;
+    guint pad_timer;
 } PrefsState;
 
 typedef struct {
@@ -285,10 +294,122 @@ static AdwPreferencesPage *build_roms_page(PrefsState *st, GObject *dialog)
     return page;
 }
 
+/* ---- gamepads: one row per pad, with the controller it drives ---------------- */
+
+static const char *const k_side_names[4] = { "Left", "Right", "ECS Left", "ECS Right" };
+
+static void pad_assign_changed(GObject *row, GParamSpec *pspec, gpointer user_data)
+{
+    PrefsState *state = user_data;
+    int idx = GPOINTER_TO_INT(g_object_get_data(row, "pad-index"));
+    int sel = (int)adw_combo_row_get_selected(ADW_COMBO_ROW(row));
+    (void)pspec;
+    /* 0 = automatic, then Left, Right and, with the ECS on, its pair */
+    intvsession_gamepad_assign(state->session, idx, sel - 1);
+}
+
+static void rebuild_pad_rows(PrefsState *state)
+{
+    const gboolean ecs = intvsession_ecs_on(state->session) != 0;
+    const char *choices[6] = { "Automatic", "Left", "Right", NULL, NULL, NULL };
+    int idx, count = intvsession_gamepad_count(state->session);
+    char name[128], sub[64];
+
+    if (ecs) {
+        choices[3] = "ECS Left";
+        choices[4] = "ECS Right";
+    }
+    for (idx = 0; idx < state->pad_row_count; idx++)
+        adw_preferences_group_remove(ADW_PREFERENCES_GROUP(state->pad_group), state->pad_rows[idx]);
+    state->pad_row_count = 0;
+
+    if (count == 0) {
+        GtkWidget *row = adw_action_row_new();
+        adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), "No gamepads connected");
+        adw_action_row_set_subtitle(ADW_ACTION_ROW(row), "Plug one in: it is picked up as it appears");
+        adw_preferences_group_add(ADW_PREFERENCES_GROUP(state->pad_group), row);
+        state->pad_rows[state->pad_row_count++] = row;
+        return;
+    }
+    for (idx = 0; idx < count && idx < MAX_PADS; idx++) {
+        GtkWidget *row = adw_combo_row_new();
+        GtkStringList *model = gtk_string_list_new(choices);
+        const int effective = intvsession_gamepad_effective_side(state->session, idx);
+        const int assign = intvsession_gamepad_assignment(state->session, idx);
+        intvsession_gamepad_name(state->session, idx, name, sizeof name);
+        adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), name);
+        if (effective >= 0 && effective < 4)
+            g_snprintf(sub, sizeof sub, "Driving the %s controller", k_side_names[effective]);
+        else
+            g_snprintf(sub, sizeof sub, "Driving nothing");
+        adw_action_row_set_subtitle(ADW_ACTION_ROW(row), sub);
+        adw_combo_row_set_model(ADW_COMBO_ROW(row), G_LIST_MODEL(model));
+        adw_combo_row_set_selected(ADW_COMBO_ROW(row),
+                                   assign < 0 || assign + 1 >= (ecs ? 5 : 3) ? 0 : (guint)assign + 1);
+        g_object_set_data(G_OBJECT(row), "pad-index", GINT_TO_POINTER(idx));
+        g_signal_connect(row, "notify::selected", G_CALLBACK(pad_assign_changed), state);
+        adw_preferences_group_add(ADW_PREFERENCES_GROUP(state->pad_group), row);
+        state->pad_rows[state->pad_row_count++] = row;
+        g_object_unref(model);
+    }
+}
+
+static gboolean pad_tick(gpointer user_data)
+{
+    PrefsState *state = user_data;
+    unsigned generation = intvsession_gamepad_generation(state->session);
+    if (generation != state->pad_generation) {
+        state->pad_generation = generation;
+        rebuild_pad_rows(state);
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static void on_open_controllers(GtkButton *button, gpointer user_data)
+{
+    PrefsState *state = user_data;
+    (void)button;
+    intv_controllers_window_show(GTK_WINDOW(state->window), state->session);
+}
+
+/* Every key and gamepad button back to its default, and every gamepad back to
+ * automatic assignment. */
+static void on_reset_controls(GtkButton *button, gpointer user_data)
+{
+    PrefsState *state = user_data;
+    int idx;
+    (void)button;
+    intvsession_bindings_reset(state->session);
+    for (idx = 0; idx < intvsession_gamepad_count(state->session); idx++)
+        intvsession_gamepad_assign(state->session, idx, -1);
+    rebuild_pad_rows(state);
+    intv_controllers_window_refresh();
+    adw_preferences_dialog_add_toast(
+        state->dialog,
+        adw_toast_new("Controls back to their defaults; gamepads on automatic"));
+}
+
+/* A row with a title, a line under it and a button. */
+static GtkWidget *button_row(const char *title, const char *subtitle, const char *label,
+                             GCallback callback, gpointer data)
+{
+    GtkWidget *row = adw_action_row_new();
+    GtkWidget *button = gtk_button_new_with_label(label);
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), title);
+    adw_action_row_set_subtitle(ADW_ACTION_ROW(row), subtitle);
+    gtk_widget_set_valign(button, GTK_ALIGN_CENTER);
+    g_signal_connect(button, "clicked", callback, data);
+    adw_action_row_add_suffix(ADW_ACTION_ROW(row), button);
+    return row;
+}
+
 static void prefs_closed(GtkWidget *dialog, gpointer user_data)
 {
     PrefsState *state = user_data;
     (void)dialog;
+    if (state->pad_timer)
+        g_source_remove(state->pad_timer);
+    state->pad_timer = 0;
     if (state->session_dirty) {
         intv_window_restart_session(state->window);
         intv_window_toast(state->window,
@@ -304,13 +425,20 @@ void intv_prefs_show(IntvWindow *parent, intvsession *session)
     AdwPreferencesPage *page = ADW_PREFERENCES_PAGE(adw_preferences_page_new());
     AdwPreferencesGroup *machine =
         ADW_PREFERENCES_GROUP(adw_preferences_group_new());
-    AdwPreferencesGroup *input =
+    AdwPreferencesPage *input = ADW_PREFERENCES_PAGE(adw_preferences_page_new());
+    AdwPreferencesGroup *keyboard =
+        ADW_PREFERENCES_GROUP(adw_preferences_group_new());
+    AdwPreferencesGroup *pads =
+        ADW_PREFERENCES_GROUP(adw_preferences_group_new());
+    AdwPreferencesGroup *controls =
         ADW_PREFERENCES_GROUP(adw_preferences_group_new());
     AdwPreferencesGroup *fujinet =
         ADW_PREFERENCES_GROUP(adw_preferences_group_new());
 
     state->window = parent;
     state->session = session;
+    state->dialog = dialog;
+    state->pad_group = GTK_WIDGET(pads);
 
     adw_dialog_set_title(ADW_DIALOG(dialog), "Preferences");
     adw_preferences_page_set_title(page, "Machine");
@@ -345,16 +473,48 @@ void intv_prefs_show(IntvWindow *parent, intvsession *session)
         combo_row(state, "Video Standard", NULL, "video_standard",
                  INTVSESSION_VIDEO_NTSC, video_table(), APPLY_ON_CLOSE));
 
-    adw_preferences_group_set_title(input, "Input");
+    adw_preferences_page_set_title(input, "Input");
+    adw_preferences_page_set_name(input, "Input");
+    adw_preferences_page_set_icon_name(input, "input-gaming-symbolic");
+
+    adw_preferences_group_set_title(keyboard, "Keyboard");
+    adw_preferences_group_set_header_suffix(keyboard, intv_help_button("prefs/Input"));
     adw_preferences_group_add(
-        input,
+        keyboard,
         switch_row(state, "ECS Keyboard",
                   "When on, the keyboard types on the ECS instead of "
                   "driving the hand controllers (toggle any time, applies "
                   "immediately). Warning: the FujiNet CONFIG ROM has no ECS "
                   "keyboard support yet, so while this is on its menus can "
-                  "only be driven by a gamepad or the keypad window (F9)",
+                  "only be driven by a gamepad or the Controllers window (F9)",
                   "keyboard_mode", 0, APPLY_LIVE));
+
+    adw_preferences_group_set_title(pads, "Gamepads");
+    adw_preferences_group_set_description(
+        pads, "Assigned to the controllers in connection order unless chosen "
+              "here, and remembered. Enabling gamepads is read when the session "
+              "starts, so changing it restarts the session when this dialog "
+              "closes.");
+    adw_preferences_group_add(
+        pads,
+        switch_row(state, "Enable gamepads", "Poll USB/Bluetooth gamepads",
+                   "enable_gamepad", 1, APPLY_ON_CLOSE));
+    rebuild_pad_rows(state);
+    state->pad_generation = intvsession_gamepad_generation(session);
+
+    adw_preferences_group_set_title(controls, "Controls");
+    adw_preferences_group_set_description(
+        controls, "Keys and gamepad buttons are re-mapped in the Controllers "
+                  "window (F9): press Map, choose a control, then press the key "
+                  "or gamepad button to give it.");
+    adw_preferences_group_add(
+        controls,
+        button_row("Controllers window", "The handsets, the console's RESET and Map",
+                   "Open Controllers", G_CALLBACK(on_open_controllers), state));
+    adw_preferences_group_add(
+        controls,
+        button_row("Reset Controls", "Put every key and gamepad button back to its default",
+                   "Reset Controls", G_CALLBACK(on_reset_controls), state));
 
     adw_preferences_group_set_title(fujinet, "FujiNet");
     adw_preferences_group_set_description(
@@ -381,15 +541,21 @@ void intv_prefs_show(IntvWindow *parent, intvsession *session)
     }
 
     adw_preferences_page_add(page, machine);
-    adw_preferences_page_add(page, input);
     adw_preferences_page_add(page, fujinet);
+    adw_preferences_page_add(input, keyboard);
+    adw_preferences_page_add(input, pads);
+    adw_preferences_page_add(input, controls);
     adw_preferences_dialog_add(dialog, page);
+    adw_preferences_dialog_add(dialog, input);
+    state->pad_timer = g_timeout_add(1000, pad_tick, state);
     g_object_set_data_full(G_OBJECT(dialog), "intv-prefs", state, g_free);
     adw_preferences_dialog_add(dialog, build_roms_page(state, G_OBJECT(dialog)));
     refresh_rows(state);
     /* Developer affordance for screenshots: INTV_PREFS_PAGE=roms. */
     if (g_strcmp0(g_getenv("INTV_PREFS_PAGE"), "roms") == 0)
         adw_preferences_dialog_set_visible_page_name(dialog, "ROMs");
+    else if (g_strcmp0(g_getenv("INTV_PREFS_PAGE"), "input") == 0)
+        adw_preferences_dialog_set_visible_page_name(dialog, "Input");
 
     g_signal_connect(dialog, "closed", G_CALLBACK(prefs_closed), state);
     adw_dialog_present(ADW_DIALOG(dialog), GTK_WIDGET(parent));

@@ -50,6 +50,16 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.21.0" date="2026-11-19">
+      <description>
+        <p>
+          The Controllers window (F9, was the Keypad window) now draws the real hardware: two Intellivision II hand controllers, with the ECS's two more when the ECS is fitted, and the console's reset button. Press keys and side buttons and drag the 16-position disc with the mouse; Map, Clear and Defaults change the controls. The ECS Keyboard window (F10) is drawn like the real keyboard, and its Shift and Ctrl latch and light.
+        </p>
+        <p>
+          The keyboard, each gamepad and the mouse are now separate, so letting go of a key no longer drops a direction a gamepad is holding. Each gamepad's hand controller is remembered, gamepad plug and unplug are announced, and Preferences has a new Input page. Stop in debugger can be bound to a key or button.
+        </p>
+      </description>
+    </release>
     <release version="0.20.0" date="2026-11-16">
       <description>
         <p>

@@ -28,7 +28,11 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QScreen>
+#include <QScrollArea>
+#include <QScrollBar>
 #include <QShortcut>
+#include <QTimer>
 #include <QVBoxLayout>
 
 namespace {
@@ -47,7 +51,17 @@ SettingsDialog::SettingsDialog(intvsession *session, QWidget *parent)
     : QDialog(parent), m_session(session)
 {
     setWindowTitle(QStringLiteral("Settings"));
-    auto *outer = new QVBoxLayout(this);
+    /* The groups scroll when the screen is too short for all of them. */
+    auto *frame = new QVBoxLayout(this);
+    auto *scroll = new QScrollArea(this);
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    auto *body = new QWidget;
+    auto *outer = new QVBoxLayout(body);
+    outer->setContentsMargins(0, 0, 0, 0);
+    scroll->setWidget(body);
+    frame->addWidget(scroll, 1);
 
     auto *machineBox = new QGroupBox(QStringLiteral("Machine"), this);
     auto *machineForm = new QFormLayout(machineBox);
@@ -97,10 +111,59 @@ SettingsDialog::SettingsDialog(intvsession *session, QWidget *parent)
                        "driving the hand controllers (applies immediately).\n"
                        "Warning: the FujiNet CONFIG ROM has no ECS keyboard "
                        "support yet, so while this is on its menus can only "
-                       "be driven by a gamepad or the keypad window (F9)."),
+                       "be driven by a gamepad or the Controllers window (F9)."),
         inputBox);
     inputNote->setWordWrap(true);
     inputForm->addRow(inputNote);
+
+    /* Gamepads (a change of the polling switch is applied by the restart) */
+    inputBox->setProperty("intvHelpContext", QStringLiteral("prefs/Input"));
+    auto *gamepads = new QCheckBox(inputBox);
+    gamepads->setChecked(intvsession_get_int(m_session, "enable_gamepad", 1) != 0);
+    gamepads->setToolTip(QStringLiteral("Poll USB/Bluetooth gamepads (applied by restarting the session)"));
+    connect(gamepads, &QCheckBox::toggled, this, [this](bool on) {
+        if (intvsession_get_int(m_session, "enable_gamepad", 1) == (on ? 1 : 0))
+            return;
+        intvsession_set_int(m_session, "enable_gamepad", on ? 1 : 0);
+        m_sessionDirty = true;
+    });
+    inputForm->addRow(QStringLiteral("Enable gamepads"), gamepads);
+
+    /* One row per pad, refreshed as they come and go */
+    auto *padBox = new QGroupBox(QStringLiteral("Gamepads (assigned in connection order unless chosen here)"), inputBox);
+    m_padBox = new QVBoxLayout(padBox);
+    m_padBox->setSpacing(2);
+    inputForm->addRow(padBox);
+    auto *padTimer = new QTimer(this);
+    connect(padTimer, &QTimer::timeout, this, [this] {
+        if (intvsession_gamepad_generation(m_session) != m_padGen)
+            rebuildPads();
+        else
+            refreshPadSides();
+    });
+    padTimer->start(1000);
+    rebuildPads();
+
+    auto *controlsRow = new QHBoxLayout;
+    auto *resetControls = new QPushButton(QStringLiteral("Reset Controls"), inputBox);
+    resetControls->setToolTip(QStringLiteral("Put every key and gamepad button back to its default"));
+    auto *openWindow = new QPushButton(QStringLiteral("Open Controllers"), inputBox);
+    openWindow->setToolTip(QStringLiteral("Close Settings and open the Controllers window (F9), where keys and gamepad buttons are re-mapped"));
+    auto *resetState = new QLabel(inputBox);
+    resetState->setStyleSheet(QStringLiteral("color: gray;"));
+    connect(resetControls, &QPushButton::clicked, this, [this, resetState] {
+        intvsession_bindings_reset(m_session);
+        resetState->setText(QStringLiteral("Every key and gamepad button is back to its default."));
+    });
+    connect(openWindow, &QPushButton::clicked, this, [this] {
+        m_openControllers = true;
+        accept();
+    });
+    controlsRow->addWidget(resetControls);
+    controlsRow->addWidget(openWindow);
+    controlsRow->addWidget(resetState, 1);
+    controlsRow->addWidget(intvHelpButton(QStringLiteral("prefs/Input")));
+    inputForm->addRow(controlsRow);
 
     auto *fujinetBox = new QGroupBox(QStringLiteral("FujiNet"), this);
     auto *fujinetForm = new QFormLayout(fujinetBox);
@@ -224,7 +287,13 @@ SettingsDialog::SettingsDialog(intvsession *session, QWidget *parent)
         }
         accept();
     });
-    outer->addWidget(buttons);
+    frame->addWidget(buttons);
+
+    /* Room for every group when the screen has it, else as tall as it allows. */
+    const QSize want = body->sizeHint();
+    const int avail = screen() ? screen()->availableGeometry().height() - 170 : want.height();
+    scroll->setMinimumSize(want.width() + scroll->verticalScrollBar()->sizeHint().width() + 4,
+                           qMin(want.height(), qMax(avail, 300)));
 }
 
 QComboBox *SettingsDialog::addHwModeRow(QFormLayout *form,
@@ -243,6 +312,67 @@ QComboBox *SettingsDialog::addHwModeRow(QFormLayout *form,
     });
     form->addRow(label, box);
     return box;
+}
+
+/* "plays Left" next to each pad. */
+void SettingsDialog::refreshPadSides()
+{
+    for (int idx = 0; idx < (int)m_padEff.size(); ++idx) {
+        const int eff = intvsession_gamepad_effective_side(m_session, idx);
+        const QString text = eff >= 0
+            ? QStringLiteral("plays %1").arg(QString::fromUtf8(intvsession_pad_side_name((intvsession_pad_side)eff)))
+            : QStringLiteral("plays nothing");
+        if (m_padEff[(size_t)idx]->text() != text)
+            m_padEff[(size_t)idx]->setText(text);
+    }
+}
+
+/* One row per pad: its name, the controller it plays and the one it is set to
+ * (Automatic, Left, Right, and the ECS pair when the ECS is on). */
+void SettingsDialog::rebuildPads()
+{
+    for (QWidget *row : m_padRows)
+        delete row;
+    m_padRows.clear();
+    m_padEff.clear();
+    m_padGen = intvsession_gamepad_generation(m_session);
+    const int sides = intvsession_ecs_on(m_session) ? 4 : 2;
+    const int count = intvsession_gamepad_count(m_session);
+    if (count == 0) {
+        auto *none = new QLabel(QStringLiteral("No gamepads connected - plug one in"));
+        none->setStyleSheet(QStringLiteral("color: gray;"));
+        m_padBox->addWidget(none);
+        m_padRows.push_back(none);
+        return;
+    }
+    for (int idx = 0; idx < count; ++idx) {
+        char name[128];
+        intvsession_gamepad_name(m_session, idx, name, sizeof name);
+        auto *row = new QWidget;
+        auto *line = new QHBoxLayout(row);
+        line->setContentsMargins(0, 0, 0, 0);
+        auto *label = new QLabel(QString::fromUtf8(name));
+        auto *eff = new QLabel;
+        eff->setStyleSheet(QStringLiteral("color: gray;"));
+        /* -1 = automatic (connection order), 0.. = that controller */
+        auto *box = new QComboBox;
+        box->addItem(QStringLiteral("Automatic"));
+        for (int side = 0; side < sides; ++side)
+            box->addItem(QString::fromUtf8(intvsession_pad_side_name((intvsession_pad_side)side)));
+        const int assign = intvsession_gamepad_assignment(m_session, idx);
+        box->setCurrentIndex(assign < 0 || assign >= sides ? 0 : assign + 1);
+        connect(box, &QComboBox::currentIndexChanged, this, [this, idx](int sel) {
+            intvsession_gamepad_assign(m_session, idx, sel <= 0 ? -1 : sel - 1);
+            refreshPadSides();
+        });
+        line->addWidget(label, 1);
+        line->addWidget(eff);
+        line->addWidget(box);
+        m_padBox->addWidget(row);
+        m_padRows.push_back(row);
+        m_padEff.push_back(eff);
+    }
+    refreshPadSides();
 }
 
 void SettingsDialog::refreshRoms()

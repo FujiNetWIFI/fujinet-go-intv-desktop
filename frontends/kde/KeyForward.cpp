@@ -267,8 +267,14 @@ void intvForwardKey(intvsession *session, const QKeyEvent *event, int down)
      * repeat guard is needed for the fire-once behaviour a sysaction
      * wants. */
     if (m.kind == INTVSESSION_MAP_SYSACT) {
-        if (down)
-            intvsession_sysaction_fire(session, m.sysact);
+        if (down) {
+            /* Stop in debugger is queued: MainWindow's drain fires it and
+             * shows the debugger window after the stop. */
+            if (m.sysact == INTVSESSION_SYSACT_DEBUG_STOP)
+                intvsession_sysaction_post(session, m.sysact);
+            else
+                intvsession_sysaction_fire(session, m.sysact);
+        }
         return;
     }
 

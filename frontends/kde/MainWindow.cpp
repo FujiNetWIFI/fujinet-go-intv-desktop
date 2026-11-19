@@ -37,8 +37,8 @@
 #include "help/HelpWindow.h"
 #include "SettingsDialog.h"
 #include "debugger/DebuggerWindow.h"
+#include "controllers/ControllersWindow.h"
 #include "ecskbd/EcsKeyboardWindow.h"
-#include "keypad/KeypadWindow.h"
 
 #ifndef INTV_VERSION_STRING
 #define INTV_VERSION_STRING "0.0.0"
@@ -65,12 +65,18 @@ MainWindow::MainWindow(intvsession *session, QWidget *parent)
     buildMenus();
     showPage();
 
-    /* ~100ms: fast enough that a gamepad press feels immediate, cheap
-     * enough to run for the app's whole lifetime. */
+    /* 40ms: a gamepad-bound system action (and the Controllers window's
+     * RESET) lands within a frame or two, cheap enough to run for the app's
+     * whole lifetime. */
     m_sysactTimer = new QTimer(this);
     connect(m_sysactTimer, &QTimer::timeout, this,
            &MainWindow::drainSysactions);
-    m_sysactTimer->start(100);
+    m_sysactTimer->start(40);
+    /* Gamepads come and go on their own thread; say so when they do. */
+    m_padGen = intvsession_gamepad_generation(session);
+    m_padTimer = new QTimer(this);
+    connect(m_padTimer, &QTimer::timeout, this, &MainWindow::pollGamepads);
+    m_padTimer->start(500);
 
     /* For the smoke tests: picture every open window, then quit. */
     const QString shot = qEnvironmentVariable("INTV_SCREENSHOT");
@@ -267,7 +273,34 @@ void MainWindow::drainSysactions()
         if (intvsession_sysaction_fire(m_session, a) != 0)
             statusBar()->showMessage(
                 QString::fromUtf8(intvsession_last_error(m_session)), 5000);
+        else if (a == INTVSESSION_SYSACT_DEBUG_STOP)
+            DebuggerWindow::showFor(this, m_session);   /* the core engaged it and paused */
+        else if (a == INTVSESSION_SYSACT_RESET_GAME)
+            statusBar()->showMessage(QStringLiteral("Reset Game"), 5000);
+        else if (a == INTVSESSION_SYSACT_RESET_CONFIG)
+            statusBar()->showMessage(QStringLiteral("Reset to CONFIG"), 5000);
     }
+}
+
+/* A pad plugged in or out: say so (the Controllers window's rows and the
+ * Settings dialog follow the same generation). */
+void MainWindow::pollGamepads()
+{
+    const unsigned gen = intvsession_gamepad_generation(m_session);
+    if (gen == m_padGen)
+        return;
+    m_padGen = gen;
+    char text[256] = "";
+    if (intvsession_gamepad_last_event(m_session, text, sizeof text) > 0)
+        statusBar()->showMessage(QString::fromUtf8(text), 5000);
+}
+
+/* The keyboard's holds only: the Controllers window's mouse holds are its own. */
+bool MainWindow::event(QEvent *evt)
+{
+    if (evt->type() == QEvent::WindowDeactivate)
+        intvsession_release_keyboard(m_session);
+    return QMainWindow::event(evt);
 }
 
 void MainWindow::showDebugger()
@@ -275,14 +308,37 @@ void MainWindow::showDebugger()
     DebuggerWindow::showFor(this, m_session);
 }
 
-void MainWindow::showKeypad()
+void MainWindow::showControllers()
 {
-    KeypadWindow::showFor(this, m_session);
+    if (!m_controllers) {
+        m_controllers = new ControllersWindow(m_session, this);
+        m_controllers->onToggleEcsKeyboard = [this] { toggleEcsKeyboard(); };
+        m_controllers->onShowDebugger = [this] { showDebugger(); };
+        m_controllers->onResetToConfig = [this] { resetToConfig(); };
+    }
+    m_controllers->present();
 }
 
-void MainWindow::showEcsKeyboard()
+void MainWindow::toggleControllers()
 {
-    EcsKeyboardWindow::showFor(this, m_session);
+    if (m_controllers && m_controllers->isVisible())
+        m_controllers->hide();
+    else
+        showControllers();
+}
+
+void MainWindow::toggleEcsKeyboard()
+{
+    if (!m_ecsKeyboard) {
+        m_ecsKeyboard = new EcsKeyboardWindow(m_session, this);
+        m_ecsKeyboard->onToggleControllers = [this] { toggleControllers(); };
+        m_ecsKeyboard->onShowDebugger = [this] { showDebugger(); };
+        m_ecsKeyboard->onResetToConfig = [this] { resetToConfig(); };
+    }
+    if (m_ecsKeyboard->isVisible())
+        m_ecsKeyboard->hide();
+    else
+        m_ecsKeyboard->present();
 }
 
 void MainWindow::restartSession()
@@ -323,6 +379,7 @@ void MainWindow::showSettings()
     connect(&dlg, &SettingsDialog::romsImported, this,
             &MainWindow::startIfReady);
     dlg.exec();
+    const bool openControllers = dlg.openControllersRequested();
     if (dlg.sessionDirty()) {
         restartSession();
         statusBar()->showMessage(
@@ -330,6 +387,9 @@ void MainWindow::showSettings()
             5000);
     }
     showPage();
+    if (openControllers) {
+        showControllers();
+    }
 }
 
 void MainWindow::buildMenus()
@@ -346,10 +406,10 @@ void MainWindow::buildMenus()
                        &MainWindow::openSdFolder);
 
     QMenu *view = menuBar()->addMenu(QStringLiteral("&View"));
-    view->addAction(QStringLiteral("&Keypad"), QKeySequence(Qt::Key_F9), this,
-                    &MainWindow::showKeypad);
-    view->addAction(QStringLiteral("ECS &Keyboard"), QKeySequence(Qt::Key_F10),
-                    this, &MainWindow::showEcsKeyboard);
+    view->addAction(QStringLiteral("&Controllers (F9)"), QKeySequence(Qt::Key_F9),
+                    this, &MainWindow::toggleControllers);
+    view->addAction(QStringLiteral("ECS &Keyboard (F10)"), QKeySequence(Qt::Key_F10),
+                    this, &MainWindow::toggleEcsKeyboard);
     view->addAction(QStringLiteral("&Debugger"), QKeySequence(Qt::Key_F12),
                     this, &MainWindow::showDebugger);
 
@@ -357,11 +417,11 @@ void MainWindow::buildMenus()
     /* No QKeySequence here, deliberately: Backspace is a *remappable*
      * default (core/src/bindings.c), not a fixed accelerator like Ctrl+R
      * below. Binding one here would fire Reset Game on plain Backspace
-     * forever, even after a keypad window Map-mode remap moved that action
+     * forever, even after a Controllers window Map-mode remap moved that action
      * to a different key -- DisplayWidget claims the ShortcutOverride for
      * everything except F9/F11/F12 specifically so menu accelerators can't
-     * shadow what the machine should receive (see its own header), but a
-     * KeypadWindow with focus doesn't, so this would have raced the
+     * shadow what the machine should receive (see its own header), but the
+     * Controllers window with focus doesn't, so this would have raced the
      * bindings table there. The mouse-clickable menu entry is enough; the
      * real trigger is intvForwardKey's MAP_SYSACT dispatch (KeyForward.cpp),
      * which honours whatever the user has actually bound. */
@@ -395,7 +455,7 @@ void MainWindow::buildMenus()
 
     QMenu *help = menuBar()->addMenu(QStringLiteral("&Help"));
     {
-        /* works from every window of the app (the keypad windows and the
+        /* works from every window of the app (the controller windows and the
          * Debugger have the keyboard too) */
         QAction *helpAct = help->addAction(QStringLiteral("FujiNet Go Intv &Help"));
         helpAct->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_H));

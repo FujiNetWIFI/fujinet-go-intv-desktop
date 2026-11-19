@@ -14,7 +14,6 @@
 #include "MainWindow.h"
 #include "debugger/DebuggerWindow.h"
 #include "intvsession.h"
-#include "keypad/KeypadWindow.h"
 
 int main(int argc, char *argv[])
 {
@@ -60,8 +59,8 @@ int main(int argc, char *argv[])
     /* Developer affordances shared with the GNOME frontend. */
     if (std::getenv("INTV_OPEN_DEBUGGER"))
         DebuggerWindow::showFor(&win, session);
-    if (std::getenv("INTV_OPEN_KEYPAD"))
-        KeypadWindow::showFor(&win, session);
+    if (std::getenv("INTV_OPEN_CONTROLLERS"))
+        win.showControllers();
 
     const int rc = app.exec();
 

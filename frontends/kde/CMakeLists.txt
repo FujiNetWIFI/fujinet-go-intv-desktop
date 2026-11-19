@@ -36,7 +36,7 @@ add_executable(fujinet-go-intv-kde
   help/HelpWindow.cpp
   debugger/DebuggerWindow.cpp
   debugger/VideoTab.cpp
-  keypad/KeypadWindow.cpp
+  controllers/ControllersWindow.cpp
   ecskbd/EcsKeyboardWindow.cpp
 )
 

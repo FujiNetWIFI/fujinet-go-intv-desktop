@@ -11,6 +11,8 @@
 #include "intvsession.h"
 
 class DisplayView;
+class ControllersWindow;
+class EcsKeyboardWindow;
 class QStackedWidget;
 
 class MainWindow : public QMainWindow {
@@ -25,20 +27,28 @@ public:
      * frontend's intv_window_restart_session. */
     void restartSession();
 
+    /* Shows the Controllers window (INTV_OPEN_CONTROLLERS). */
+    void showControllers();
+
+protected:
+    /* Letting go of the keyboard's holds when the window is deactivated. */
+    bool event(QEvent *evt) override;
+
 private:
     void buildMenus();
     void showDebugger();
-    void showKeypad();
-    void showEcsKeyboard();
+    void toggleControllers();
+    void toggleEcsKeyboard();
+    void pollGamepads();
     void showSettings();
     void resetToConfig();
     void resetGame();
     /* Drains intvsession_sysaction_take -- the one caller that can't fire a
      * sysaction directly is gamepad_sdl.c's SDL thread (queuing RESET_CONFIG
      * so it never joins itself); this, the UI thread, fires each on
-     * m_sysactTimer's tick. Lives here rather than on KeypadWindow: that
-     * window hides rather than closes but is hidden far more often than
-     * shown, and a gamepad-bound sysaction has to keep working regardless. */
+     * m_sysactTimer's tick. Lives here rather than on the Controllers window:
+     * that window is hidden far more often than shown, and a gamepad-bound
+     * sysaction has to keep working regardless. */
     void drainSysactions();
     void importBios(bool folder);
     void importCartToSd();
@@ -57,4 +67,8 @@ private:
     QStackedWidget *m_stack;
     QWidget *m_noBios;
     QTimer *m_sysactTimer;
+    QTimer *m_padTimer;
+    unsigned m_padGen = 0;
+    ControllersWindow *m_controllers = nullptr;
+    EcsKeyboardWindow *m_ecsKeyboard = nullptr;
 };

@@ -16,6 +16,9 @@ class QCheckBox;
 class QComboBox;
 class QLabel;
 class QLineEdit;
+class QTimer;
+class QVBoxLayout;
+class QWidget;
 
 class SettingsDialog : public QDialog {
     Q_OBJECT
@@ -27,6 +30,9 @@ public:
      * to take effect. */
     bool sessionDirty() const { return m_sessionDirty; }
 
+    /* True when the dialog was closed with "Open Controllers". */
+    bool openControllersRequested() const { return m_openControllers; }
+
 signals:
     /* A ROM import ran (successful or not): the caller may now be able to
      * start the session. */
@@ -35,6 +41,8 @@ signals:
 private:
     void refreshRoms();
     void importRoms(bool folder);
+    void rebuildPads();
+    void refreshPadSides();
     QComboBox *addHwModeRow(class QFormLayout *form, const QString &label,
                             const char *key);
 
@@ -45,4 +53,9 @@ private:
     QLineEdit *m_externalAddr = nullptr;
     std::vector<QLabel *> m_romRows;
     bool m_sessionDirty = false;
+    bool m_openControllers = false;
+    QVBoxLayout *m_padBox = nullptr;
+    std::vector<QWidget *> m_padRows;
+    std::vector<QLabel *> m_padEff;
+    unsigned m_padGen = ~0u;
 };

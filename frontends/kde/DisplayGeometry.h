@@ -32,15 +32,15 @@ inline QRectF displayRect(QSizeF avail)
     return QRectF((w - dw) / 2.0, (h - dh) / 2.0, dw, dh);
 }
 
-/* Claim every key except the reserved chords (F9 keypad, F11 fullscreen, F12
- * debugger) while focused, so menu accelerators cannot shadow what the
+/* Claim every key except the reserved chords (F9 Controllers, F10 ECS keyboard,
+ * F11 fullscreen, F12 debugger) while focused, so menu accelerators cannot shadow what the
  * machine should receive. */
 inline bool claimShortcut(QEvent *event)
 {
     if (event->type() != QEvent::ShortcutOverride)
         return false;
     const int k = static_cast<QKeyEvent *>(event)->key();
-    if (k == Qt::Key_F9 || k == Qt::Key_F11 || k == Qt::Key_F12)
+    if (k == Qt::Key_F9 || k == Qt::Key_F10 || k == Qt::Key_F11 || k == Qt::Key_F12)
         return false;
     event->accept();
     return true;

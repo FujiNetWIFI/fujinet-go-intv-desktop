@@ -5,7 +5,7 @@
  * Direct3D 11 display (display.c; GDI fallback) letterboxed to 4:3, full
  * keyboard mapping, a menu bar, importing of the BIOS and of cartridges for
  * the SD host, and the FujiNet configuration (default browser) and
- * console-log windows, plus clickable keypad and ECS keyboard windows.
+ * console-log windows, plus the skinned Controllers and ECS keyboard windows.
  *
  * There is no vsync-feeding present thread to drive: intvsession has no
  * notify_vsync (jzIntv's own paced thread already governs itself to
@@ -34,8 +34,8 @@
 #include "import.h"
 #include "help/help_window.h"
 #include "key_forward.h"
+#include "controllers/controller_window.h"
 #include "ecskbd/ecskbd_window.h"
-#include "keypad/keypad_window.h"
 #include "resource.h"
 #include "roms.h"
 #include "win_common.h"
@@ -58,6 +58,9 @@ static int g_fullscreen;
 static WINDOWPLACEMENT g_prev_placement = {sizeof(g_prev_placement)};
 
 #define TIMER_SYSACT  3 /* 2 is LOG_TIMER_ID, on the separate log window */
+#define TIMER_TOAST   4 /* the hot-plug note in the title bar */
+
+static unsigned g_pad_generation;
 
 static void start_machine(void);
 static void refresh_settings_ecs(void);
@@ -216,7 +219,7 @@ static void make_fonts(void)
 
 static void toggle_fullscreen(HWND hwnd);
 static void open_debugger(void);
-static void open_keypad(void);
+static void open_controllers(void);
 static void open_ecskbd(void);
 static void reset_to_config(void);
 
@@ -224,7 +227,7 @@ static void reset_to_config(void);
 static void on_key(HWND hwnd, WPARAM vk, LPARAM lp, int down)
 {
     /* Which keys are hotkeys is intv_key_is_reserved's answer, not a second
-     * list here: a keypad window's Map mode asks the same function so it can
+     * list here: the Controllers window's Map mode asks the same function so it can
      * refuse to bind one (key_translate.c), and two lists that had to agree
      * would eventually stop agreeing -- leaving Map mode either refusing a
      * key nothing claims, or accepting one this function then shadows. The
@@ -242,7 +245,7 @@ static void on_key(HWND hwnd, WPARAM vk, LPARAM lp, int down)
 
     switch (vk) {
     case VK_F9:
-        open_keypad();
+        open_controllers();
         break;
     case VK_F10:
         /* Claimed here like F9/F11/F12 rather than left to Win32's own
@@ -267,9 +270,8 @@ static void on_key(HWND hwnd, WPARAM vk, LPARAM lp, int down)
 
 
 /* The translate-and-dispatch half of on_key, without any of its hotkey
- * handling -- shared with the keypad window, whose child controls take
- * focus on click and so must forward keystrokes here rather than letting
- * them fall on the floor. Declared in key_forward.h. */
+ * handling -- shared with the Controllers window, which forwards the keys it
+ * does not take itself. Declared in key_forward.h. */
 void intv_forward_key(WPARAM vk, LPARAM lp, int down)
 {
     const uint32_t keysym = intv_keysym_from_msg(vk, lp);
@@ -278,7 +280,7 @@ void intv_forward_key(WPARAM vk, LPARAM lp, int down)
     if (!keysym)
         return;
 
-    /* _bound, not the pure table: a keypad window "Map" remap has to reach
+    /* _bound, not the pure table: a Controllers window "Map" remap has to reach
      * every keyboard-driven window, not just the one the remap happened
      * in -- see intvsession.h's own comment on why. Resolved once, up
      * front, so a system-action target can be checked ahead of ECS
@@ -301,8 +303,15 @@ void intv_forward_key(WPARAM vk, LPARAM lp, int down)
          * always 1 on WM_KEYUP/WM_SYSKEYUP (a release is never a repeat),
          * so this only needs checking on the down edge; the release itself
          * is a no-op for a sysaction either way. */
-        if (down && !(lp & (1L << 30)))
-            intvsession_sysaction_fire(g_session, m.sysact);
+        if (down && !(lp & (1L << 30))) {
+            /* Stop in debugger is queued: drain_sysactions fires it and opens
+             * the debugger window after the stop. */
+            if (m.sysact == INTVSESSION_SYSACT_DEBUG_STOP)
+                intvsession_sysaction_post(g_session, m.sysact);
+            else if (intvsession_sysaction_fire(g_session, m.sysact) != 0)
+                MessageBoxA(g_hwnd, intvsession_last_error(g_session),
+                            "FujiNet Go Intv", MB_ICONWARNING);
+        }
         return;
     }
 
@@ -448,9 +457,9 @@ static void open_debugger(void)
     intv_debugger_show(g_hwnd, g_session);
 }
 
-static void open_keypad(void)
+static void open_controllers(void)
 {
-    intv_keypad_window_toggle(g_hwnd, g_session);
+    intv_controller_window_toggle(g_hwnd, g_session);
 }
 
 static void open_ecskbd(void)
@@ -515,9 +524,8 @@ static void reset_game(void)
  * sysaction directly is gamepad_sdl.c's SDL thread (queuing RESET_CONFIG so
  * it never joins itself); this, the UI thread, fires each on TIMER_SYSACT's
  * tick (see WinMain's own SetTimer). Lives on the main window rather than
- * the keypad window: that window hides rather than destroys itself (see
- * intv_keypad_pretranslate's own header) but is hidden far more often than
- * shown, and a gamepad-bound sysaction has to keep working regardless. */
+ * the Controllers window: that window hides rather than destroys itself
+ * but is hidden far more often than shown, and a gamepad-bound sysaction has to keep working regardless. */
 static void drain_sysactions(void)
 {
     intvsession_sysaction a;
@@ -525,6 +533,26 @@ static void drain_sysactions(void)
         if (intvsession_sysaction_fire(g_session, a) != 0)
             MessageBoxA(g_hwnd, intvsession_last_error(g_session),
                         "FujiNet Go Intv", MB_ICONWARNING);
+        else if (a == INTVSESSION_SYSACT_DEBUG_STOP)
+            open_debugger();
+    }
+}
+
+/* A pad plugged in or out: the title bar says so for a few seconds, and the
+ * Controllers window refreshes its pad rows. Compared by generation on the
+ * sysaction tick. */
+static void check_gamepads(void)
+{
+    const unsigned generation = intvsession_gamepad_generation(g_session);
+    char event[200], title[260];
+    if (generation == g_pad_generation)
+        return;
+    g_pad_generation = generation;
+    intv_controller_window_gamepads_changed();
+    if (intvsession_gamepad_last_event(g_session, event, sizeof(event)) > 0) {
+        snprintf(title, sizeof(title), "FujiNet Go Intv - %s", event);
+        SetWindowTextA(g_hwnd, title);
+        SetTimer(g_hwnd, TIMER_TOAST, 4000, NULL);
     }
 }
 
@@ -533,7 +561,7 @@ static void drain_sysactions(void)
  * boxes for the tri-state ECS/Intellivoice options and the video standard,
  * a checkbox for the ECS keyboard input mode) -- not a DIALOGEX resource
  * template, matching every other secondary window in this frontend (the
- * keypad and debugger windows). Key/default list matches the GNOME/KDE
+ * Controllers and debugger windows). Key/default list matches the GNOME/KDE
  * frontends' own settings dialogs (frontends/gnome/prefs.c's header is the
  * canonical reference):
  *   "ecs"/"ivoice"    INTVSESSION_HW_* (default AUTO)     -- restart to apply
@@ -610,7 +638,7 @@ static int pad_list_signature(void)
     /* Cheap "has anything changed" stamp: count, plus each pad's effective
      * side. Enough to catch connect/disconnect and reassignment, which is
      * everything the list shows. */
-    int sig = intvsession_gamepad_count(g_session) * 31;
+    int sig = (int)intvsession_gamepad_generation(g_session) * 977 + intvsession_gamepad_count(g_session) * 31;
     for (int i = 0; i < intvsession_gamepad_count(g_session); i++)
         sig = sig * 7 + intvsession_gamepad_effective_side(g_session, i) + 2;
     return sig;
@@ -706,6 +734,7 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp,
                     /* Entry 0 is "Automatic" (-1); the rest are the four
                      * sides in intvsession_pad_side order. */
                     intvsession_gamepad_assign(g_session, sel, choice - 1);
+                    intv_controller_window_gamepads_changed();
                     /* A reassignment can move some OTHER pad too -- the
                      * automatic slots renumber around an explicit one (see
                      * intv_pad_for_port) -- so redraw the whole list, not
@@ -716,6 +745,28 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp,
             return 0;
         case IDC_SET_ROMS:
             show_roms();
+            return 0;
+        case IDC_SET_GAMEPAD: {
+            const int on = SendMessageA(GetDlgItem(hwnd, IDC_SET_GAMEPAD), BM_GETCHECK, 0, 0) == BST_CHECKED;
+            if (intvsession_get_int(g_session, "enable_gamepad", 1) != (on ? 1 : 0)) {
+                intvsession_set_int(g_session, "enable_gamepad", on ? 1 : 0);
+                g_settings_dirty = 1;
+            }
+            return 0;
+        }
+        case IDC_SET_RESET_CTRL: {
+            /* every key and gamepad button back to its default, every gamepad back to Automatic */
+            const int count = intvsession_gamepad_count(g_session);
+            int pad;
+            intvsession_bindings_reset(g_session);
+            for (pad = 0; pad < count; pad++)
+                intvsession_gamepad_assign(g_session, pad, -1);
+            fill_pad_list(hwnd, (int)SendMessageA(GetDlgItem(hwnd, IDC_SET_PAD_LIST), LB_GETCURSEL, 0, 0));
+            intv_controller_window_gamepads_changed();
+            return 0;
+        }
+        case IDC_SET_OPEN_CTRL:
+            intv_controller_window_show(g_hwnd, g_session);
             return 0;
         case IDC_SET_EXTERNAL: {
             int wanted = SendDlgItemMessageA(hwnd, IDC_SET_EXTERNAL,
@@ -828,7 +879,7 @@ static void show_settings(HINSTANCE inst)
     g_settings_window = CreateWindowA(
         "IntvSettingsWindow", "Settings",
         WS_OVERLAPPEDWINDOW & ~(WS_MAXIMIZEBOX | WS_THICKFRAME),
-        CW_USEDEFAULT, CW_USEDEFAULT, 460, 670, NULL, NULL, inst, NULL);
+        CW_USEDEFAULT, CW_USEDEFAULT, 460, 770, NULL, NULL, inst, NULL);
 
     have_ecs_rom = intvsession_has_ecs_rom(g_session);
     CreateWindowExA(0, "STATIC", "ECS:", WS_CHILD | WS_VISIBLE, 16, y, 120,
@@ -918,7 +969,7 @@ static void show_settings(HINSTANCE inst)
         "closed (the session restarts). ECS Keyboard applies immediately. "
         "Warning: the FujiNet CONFIG ROM has no ECS keyboard support yet, "
         "so while ECS Keyboard is on its menus can only be driven by a "
-        "gamepad or the keypad window (F9).",
+        "gamepad or the Controllers window (F9).",
         WS_CHILD | WS_VISIBLE, 16, y, 420, 130, g_settings_window, NULL, inst,
         NULL);
     SendMessageA(note, WM_SETFONT, (WPARAM)font, TRUE);
@@ -927,8 +978,8 @@ static void show_settings(HINSTANCE inst)
      * little whitespace. */
     y += 138;
 
-    CreateWindowExA(0, "STATIC", "Controllers:", WS_CHILD | WS_VISIBLE, 16, y,
-                    120, 20, g_settings_window, NULL, inst, NULL);
+    CreateWindowExA(0, "STATIC", "Gamepads (applied at once):", WS_CHILD | WS_VISIBLE, 16, y,
+                    240, 20, g_settings_window, NULL, inst, NULL);
     y += 20;
     list = CreateWindowExA(
         WS_EX_CLIENTEDGE, "LISTBOX", "",
@@ -945,13 +996,31 @@ static void show_settings(HINSTANCE inst)
         296, 200, g_settings_window, (HMENU)(INT_PTR)IDC_SET_PAD_SIDE, inst,
         NULL);
     SendMessageA(combo, CB_ADDSTRING, 0, (LPARAM)"Automatic");
-    for (int side = 0; side < 4; side++)
+    /* the ECS pair is a choice only while the ECS is on */
+    for (int side = 0; side < (intvsession_ecs_on(g_session) ? 4 : 2); side++)
         SendMessageA(combo, CB_ADDSTRING, 0,
                     (LPARAM)intvsession_pad_side_name(
                         (intvsession_pad_side)side));
     SendMessageA(combo, WM_SETFONT, (WPARAM)font, TRUE);
 
     y += 36;
+    check = CreateWindowExA(0, "BUTTON",
+                            "Enable gamepads (applied by restarting the session)",
+                            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 16, y, 420, 22,
+                            g_settings_window, (HMENU)(INT_PTR)IDC_SET_GAMEPAD, inst, NULL);
+    SendMessageA(check, BM_SETCHECK,
+                intvsession_get_int(g_session, "enable_gamepad", 1) ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageA(check, WM_SETFONT, (WPARAM)font, TRUE);
+    y += 32;
+    check = CreateWindowExA(0, "BUTTON", "Reset Controls",
+                            WS_CHILD | WS_VISIBLE | WS_TABSTOP, 16, y, 130, 28,
+                            g_settings_window, (HMENU)(INT_PTR)IDC_SET_RESET_CTRL, inst, NULL);
+    SendMessageA(check, WM_SETFONT, (WPARAM)font, TRUE);
+    check = CreateWindowExA(0, "BUTTON", "Open Controllers",
+                            WS_CHILD | WS_VISIBLE | WS_TABSTOP, 154, y, 140, 28,
+                            g_settings_window, (HMENU)(INT_PTR)IDC_SET_OPEN_CTRL, inst, NULL);
+    SendMessageA(check, WM_SETFONT, (WPARAM)font, TRUE);
+    y += 40;
     check = CreateWindowExA(0, "BUTTON", "System ROMs...",
                             WS_CHILD | WS_VISIBLE | WS_TABSTOP, 16, y, 160, 28,
                             g_settings_window, (HMENU)(INT_PTR)IDC_SET_ROMS,
@@ -962,7 +1031,7 @@ static void show_settings(HINSTANCE inst)
                             g_settings_window, (HMENU)(INT_PTR)IDC_SET_HELP,
                             inst, NULL);
     SendMessageA(check, WM_SETFONT, (WPARAM)font, TRUE);
-    intv_help_set_context(g_settings_window, "prefs/Machine", 1);
+    intv_help_set_context(g_settings_window, "prefs/Input", 1);
 
     fill_pad_list(g_settings_window, -1);
     SetTimer(g_settings_window, IDT_SETTINGS_PADS, 1000, NULL);
@@ -1040,7 +1109,7 @@ static HMENU build_menu(void)
     AppendMenuA(fujinet, MF_STRING, IDM_FUJINET_LOG, "Console Log...");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)fujinet, "&FujiNet");
 
-    AppendMenuA(view, MF_STRING, IDM_KEYPAD, "Keypad\tF9");
+    AppendMenuA(view, MF_STRING, IDM_CONTROLLERS, "Controllers\tF9");
     AppendMenuA(view, MF_STRING, IDM_ECS_KEYBOARD, "ECS Keyboard\tF10");
     AppendMenuA(view, MF_STRING, IDM_FULLSCREEN, "Fullscreen\tF11");
     AppendMenuA(view, MF_STRING, IDM_DEBUGGER, "Debugger\tF12");
@@ -1100,6 +1169,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         if (wp == TIMER_SYSACT) {
             drain_sysactions();
+            check_gamepads();
+            return 0;
+        }
+        if (wp == TIMER_TOAST) {
+            KillTimer(hwnd, TIMER_TOAST);
+            SetWindowTextA(hwnd, "FujiNet Go Intv");
             return 0;
         }
         break;
@@ -1116,13 +1191,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
          * whichever matrix was active -- see intvsession_ecs_keys_clear's
          * own comment. Both matrices: the hand controllers were missing
          * here, so alt-tabbing mid-press left that key held for good, and
-         * widening the bindable key range only makes that easier to hit. */
+         * widening the bindable key range only makes that easier to hit.
+         * The keyboard's holds only: the Controllers window's pointer and
+         * the gamepads let go of their own. */
         intvsession_ecs_keys_clear(g_session);
-        intvsession_pads_clear(g_session);
+        intvsession_release_keyboard(g_session);
+        break;
+    case WM_ENTERMENULOOP:
+        /* a menu swallows the key-ups */
+        intvsession_release_all(g_session);
         break;
     case WM_COMMAND:
         switch (LOWORD(wp)) {
-        case IDM_KEYPAD:         open_keypad(); break;
+        case IDM_CONTROLLERS:    open_controllers(); break;
         case IDM_ECS_KEYBOARD:   open_ecskbd(); break;
         case IDM_RESET_GAME:     reset_game(); break;
         case IDM_RESET_CONFIG:   reset_to_config(); break;
@@ -1266,14 +1347,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
      * steps and declared dropped frames. One call fixes it, and since
      * Windows 10 2004 it affects only this process. */
     timeBeginPeriod(1);
-    SetTimer(g_hwnd, TIMER_SYSACT, 100, NULL);
+    SetTimer(g_hwnd, TIMER_SYSACT, 50, NULL);
+    g_pad_generation = intvsession_gamepad_generation(g_session);
 
     /* Developer affordances, matching the GNOME frontend's own
      * INTV_OPEN_DEBUGGER/INTV_OPEN_KEYPAD env vars. */
     if (getenv("INTV_OPEN_DEBUGGER"))
         open_debugger();
-    if (getenv("INTV_OPEN_KEYPAD"))
-        open_keypad();
+    if (getenv("INTV_OPEN_KEYPAD") || getenv("INTV_OPEN_CONTROLLERS"))
+        open_controllers();
+    if (getenv("INTV_OPEN_ECSKBD"))
+        open_ecskbd();
     /* Same affordance for Settings. It earns its place here more than the
      * other two: the maintainer has no Windows machine, so this window is
      * only ever seen by cross-building and running under Wine, where there
@@ -1287,10 +1371,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
         if (intv_debugger_pretranslate(&msg))
             continue;
         if (intv_help_pretranslate(&msg))
-            continue;
-        if (intv_keypad_pretranslate(&msg))
-            continue;
-        if (intv_ecskbd_pretranslate(&msg))
             continue;
         TranslateMessage(&msg);
         DispatchMessageA(&msg);

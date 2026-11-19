@@ -1,28 +1,21 @@
 /*
- * EcsKeyboardWindow (Win32) -- an on-screen ECS keyboard: 48 buttons
- * covering every key of the ECS's own 7x8 scan-matrix keyboard (see
- * core/jzintv/intv_host.h's intv_ecs_key), each driving
- * intvsession_ecs_key_set directly. Independent of the "keyboard_mode"
- * setting (main.c's on_key) -- these on-screen buttons work whether or not
- * the physical keyboard is currently routed to the ECS, so opening this
- * window never silently changes that setting.
+ * The Win32 ECS Keyboard window (F10): the Intellivision Computer Keyboard as
+ * the real one looks -- beige case, the INTELLIVISION label plate, ventilation
+ * ridges, the red pinstripe, black keys with their shifted legends above them,
+ * the white RTN and two SHIFT caps -- drawn from the session's layout
+ * (intvsession_ecs_layout) in a fixed-size tool window.
  *
- * Ordinary keys are plain BUTTON controls subclassed to catch
- * WM_LBUTTONDOWN/WM_LBUTTONUP directly, exactly like keypad_window.c's own
- * key buttons: a real ECS key is held for as long as it's down.
- * Shift/Ctrl are BS_AUTOCHECKBOX|BS_PUSHLIKE buttons instead -- a mouse
- * can't hold two buttons down to chord a Shifted letter the way a hand
- * can, so they latch (toggled via BN_CLICKED, routed through this
- * window's own WM_COMMAND), and intv_host_ecs_key's OR-in-a-bit chording
- * (core/jzintv/intv_host.c) does the rest.
+ * Clicking a key holds it for as long as the mouse button is down
+ * (intvsession_ecs_key_set); SHIFT and CTL latch: a click flips them, and a
+ * latched one stays lit until it is clicked again or the window is left for
+ * another program. A cap is lit while the machine sees its key held
+ * (intvsession_ecs_key_held), so typing on the physical keyboard lights it too.
+ * The window is the ECS keyboard whether or not the "keyboard_mode" setting
+ * routes the physical keyboard there, so typing in it always reaches the ECS
+ * matrix (intv_forward_ecs_key); the hotkeys go to the main window.
  *
- * FOCUS: like keypad_window.c, this window forwards keyboard input to the
- * session -- see that file's own FOCUS note (intv_ecskbd_pretranslate below
- * is called from the frontend's message pump the same way
- * intv_keypad_pretranslate is, rather than from each child's own proc).
- * Here it goes through intv_forward_ecs_key, which routes to the ECS matrix
- * regardless of the "keyboard_mode" setting, matching this window's
- * on-screen buttons above and the GNOME and KDE ports' equivalents.
+ * The art is drawn at twice the size into a memory bitmap and shrunk with
+ * HALFTONE; the legends go on after at the window's own size.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -30,277 +23,538 @@
 
 #include "ecskbd_window.h"
 
-#include "../accent_button.h"
-#include "../help/help_window.h"
-#include "key_forward.h"
+/* GET_X_LPARAM / GET_Y_LPARAM live here, not in windows.h. */
+#include <windowsx.h>
 
-#include <stdlib.h>
+#include <math.h>
+#include <stdio.h>
 #include <string.h>
 
-#define WIN_W 660
-#define WIN_H 300
+#include "../accent_button.h"
+#include "../controllers/gdi_art.h"
+#include "../help/help_window.h"
+#include "../key_forward.h"
+#include "../win_common.h"
 
-static HWND g_win;
-static HWND g_notice;
+#define PANEL_CLASS   "FujiNetGoIntvEcsKeyboard"
+#define PANEL_STYLE   (WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN)
+#define PANEL_EXSTYLE WS_EX_TOOLWINDOW
+
+#define UNIT96   22         /* pixels per layout unit at 96 dpi */
+#define MARGIN   12
+#define BAR_H    28
+#define MAX_CAPS 64
+
+#define IDT_HELD 1
+
+static HWND g_panel, g_parent;
 static intvsession *g_session;
+static int g_dpi = 96;
 
-/* ---- ordinary keys (subclassed BUTTON, press/release) -------------------- */
+static const intvsession_ecs_cap *g_caps;
+static int g_numcaps;
+static float g_layw, g_layh;
+static double g_unit, g_orgx, g_orgy;
+static int g_total_w, g_total_h;
+static RECT g_art_rc, g_notice_rc, g_help_rc;
 
-typedef struct {
-    intvsession *session;
-    intvsession_ecs_key key;
-} key_binding;
+static int g_mouse_cap = -1;                /* the cap the mouse holds down (not a latch) */
+static unsigned char g_lit[MAX_CAPS];       /* what was last painted */
+static int g_notice_shown, g_mode_shown = -1;
+static HFONT g_font, g_key, g_small, g_label, g_script;
 
-static WNDPROC g_btn_proc;
+static int scaled(int val) { return intv_scale(val, g_dpi); }
 
-static LRESULT CALLBACK key_btn_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+#define HX(val) gdi_rgb(val)
+
+#define COL_HELD HX(INTVSESSION_HELD_RGB)
+
+static void free_fonts(void)
 {
-    key_binding *kb = (key_binding *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+    HFONT *const slots[] = { &g_font, &g_key, &g_small, &g_label, &g_script };
+    size_t idx;
+    for (idx = 0; idx < sizeof slots / sizeof slots[0]; idx++)
+        if (*slots[idx]) { DeleteObject(*slots[idx]); *slots[idx] = NULL; }
+}
 
-    if (kb) {
-        if (msg == WM_LBUTTONDOWN) {
-            SetCapture(hwnd);
-            intvsession_ecs_key_set(kb->session, kb->key, 1);
-        } else if (msg == WM_LBUTTONUP) {
-            ReleaseCapture();
-            intvsession_ecs_key_set(kb->session, kb->key, 0);
-        } else if (msg == WM_DESTROY) {
-            free(kb);
+static void make_fonts(void)
+{
+    free_fonts();
+    g_font = intv_make_font(g_dpi, 0, FW_NORMAL, NULL);
+    g_key = gdi_face_font(g_dpi, 12, FW_BOLD, 0);       /* a key's main legend */
+    g_small = gdi_face_font(g_dpi, 9, FW_BOLD, 0);      /* the shifted legend, SPACE */
+    g_label = gdi_face_font(g_dpi, 12, FW_BOLD, 0);     /* INTELLIVISION on the plate */
+    g_script = gdi_face_font(g_dpi, 10, FW_BOLD, 1);    /* the red MATTEL ELECTRONICS script */
+}
+
+/* ---- the art ------------------------------------------------------------------- */
+
+static int cap_lit(const intvsession_ecs_cap *cap)
+{
+    return cap->kind == INTVSESSION_ECS_KEYCAP && intvsession_ecs_key_held(g_session, (intvsession_ecs_key)cap->key);
+}
+
+static void cap_box(const intvsession_ecs_cap *cap, double *xpos, double *ypos, double *width, double *height)
+{
+    *xpos = g_orgx + (double)cap->x * g_unit;
+    *ypos = g_orgy + (double)cap->y * g_unit;
+    *width = (double)cap->w * g_unit;
+    *height = (double)cap->h * g_unit;
+}
+
+static void cap_rect(const intvsession_ecs_cap *cap, RECT *rect)
+{
+    double xpos, ypos, width, height;
+    cap_box(cap, &xpos, &ypos, &width, &height);
+    SetRect(rect, (int)floor(xpos), (int)floor(ypos), (int)ceil(xpos + width), (int)ceil(ypos + height));
+}
+
+static void art_body(HDC hdc, const intvsession_ecs_cap *cap)
+{
+    double boxx, boxy, boxw, boxh;
+    const double unit = g_unit;
+    int ridge;
+    cap_box(cap, &boxx, &boxy, &boxw, &boxh);
+    if (!strcmp(cap->label, "Case")) {
+        gdi_rrect(hdc, boxx + unit * 0.12, boxy + unit * 0.18, boxw, boxh, unit * 1.0, HX(0x59564B), HX(0x59564B), 0);
+        gdi_grad_rrect(hdc, boxx, boxy, boxw, boxh, unit * 1.0, gdi_mix(HX(INTVSESSION_ECS_CASE_RGB), HX(0xFFFFFF), 0.25),
+                       HX(INTVSESSION_ECS_CASE_RGB), HX(INTVSESSION_SHADE_RGB), unit * 0.08);
+    } else if (!strcmp(cap->label, "Plate")) {
+        gdi_rrect(hdc, boxx, boxy, boxw, boxh, unit * 0.6, HX(INTVSESSION_ECS_PLATE_RGB), HX(INTVSESSION_SHADE_RGB),
+                  unit * 0.06);
+    } else if (!strcmp(cap->label, "Label")) {
+        gdi_rrect(hdc, boxx, boxy, boxw, boxh, unit * 0.3, HX(INTVSESSION_ECS_LABEL_RGB), HX(0x1F181D), unit * 0.05);
+    } else if (!strcmp(cap->label, "Vents")) {
+        for (ridge = 0; ridge < 6; ridge++) {
+            const double row = boxy + (ridge + 0.5) * boxh / 6.0;
+            gdi_line(hdc, boxx, row, boxx + boxw, row, HX(INTVSESSION_ECS_RIDGE_RGB), unit * 0.16);
+            gdi_line(hdc, boxx, row + unit * 0.14, boxx + boxw, row + unit * 0.14,
+                     gdi_mix(HX(INTVSESSION_ECS_CASE_RGB), HX(0xFFFFFF), 0.5), unit * 0.05);
+        }
+    } else if (!strcmp(cap->label, "Pinstripe")) {
+        gdi_rrect(hdc, boxx, boxy, boxw, boxh, unit * 0.1, HX(INTVSESSION_ECS_PINSTRIPE_RGB), HX(INTVSESSION_ECS_PINSTRIPE_RGB),
+                  0);
+    } else if (!strcmp(cap->label, "Cable")) {
+        gdi_rrect(hdc, boxx, boxy, boxw, boxh, unit * 0.2, HX(INTVSESSION_CABLE_RGB), HX(0x2B2B2B), unit * 0.05);
+    }
+}
+
+static void art_cap(HDC hdc, const intvsession_ecs_cap *cap)
+{
+    double boxx, boxy, boxw, boxh;
+    const double unit = g_unit;
+    const int lit = cap_lit(cap), white = (cap->flags & INTVSESSION_ECSCAP_WHITE) != 0;
+    const COLORREF face = white ? HX(INTVSESSION_ECS_RTN_RGB) : HX(INTVSESSION_ECS_KEY_RGB);
+    cap_box(cap, &boxx, &boxy, &boxw, &boxh);
+    gdi_rrect(hdc, boxx + unit * 0.06, boxy + unit * 0.12, boxw, boxh, unit * 0.3, HX(0x59564B), HX(0x59564B), 0);
+    gdi_rrect(hdc, boxx, boxy, boxw, boxh, unit * 0.3, lit ? COL_HELD : face, lit ? COL_HELD : gdi_mix(face, HX(0), 0.4),
+              unit * 0.07);
+    if (!lit)
+        gdi_line(hdc, boxx + unit * 0.3, boxy + unit * 0.14, boxx + boxw - unit * 0.3, boxy + unit * 0.14,
+                 gdi_mix(face, HX(0xFFFFFF), white ? 0.0 : 0.22), unit * 0.06);
+}
+
+static void art_all(HDC hdc)
+{
+    int idx;
+    for (idx = 0; idx < g_numcaps; idx++) {
+        if (g_caps[idx].kind == INTVSESSION_ECS_BODY) art_body(hdc, &g_caps[idx]);
+        else art_cap(hdc, &g_caps[idx]);
+    }
+}
+
+static void text_all(HDC hdc)
+{
+    int idx;
+    SetBkMode(hdc, TRANSPARENT);
+    for (idx = 0; idx < g_numcaps; idx++) {
+        const intvsession_ecs_cap *cap = &g_caps[idx];
+        RECT rect;
+        cap_rect(cap, &rect);
+        if (cap->kind == INTVSESSION_ECS_BODY) {
+            if (!strcmp(cap->label, "Label") && cap->shifted) {
+                /* the two white lines on the plate */
+                char first[48];
+                const char *bar = strchr(cap->shifted, '|');
+                RECT top = rect, bottom = rect;
+                size_t len = bar ? (size_t)(bar - cap->shifted) : strlen(cap->shifted);
+                if (len >= sizeof first) len = sizeof first - 1;
+                memcpy(first, cap->shifted, len);
+                first[len] = '\0';
+                top.left += scaled(8);
+                top.bottom = rect.top + (rect.bottom - rect.top) * 11 / 20;
+                bottom.left += scaled(8);
+                bottom.top = top.bottom;
+                SelectObject(hdc, g_label);
+                SetTextColor(hdc, HX(INTVSESSION_LEGEND_RGB));
+                gdi_text_line(hdc, first, &top, DT_LEFT);
+                if (bar) {
+                    SelectObject(hdc, g_small);
+                    gdi_text_line(hdc, bar + 1, &bottom, DT_LEFT);
+                }
+            } else if (!strcmp(cap->label, "Mattel") && cap->shifted) {
+                /* on the plate's first line, to the right of INTELLIVISION */
+                OffsetRect(&rect, scaled(4), -(rect.bottom - rect.top));
+                SelectObject(hdc, g_script);
+                SetTextColor(hdc, HX(INTVSESSION_MATTEL_RED_RGB));
+                gdi_text_line(hdc, cap->shifted, &rect, DT_RIGHT);
+            }
+            continue;
+        }
+        {
+            const int lit = cap_lit(cap), white = (cap->flags & INTVSESSION_ECSCAP_WHITE) != 0;
+            const COLORREF ink = lit ? RGB(0, 0, 0)
+                                     : (white ? HX(INTVSESSION_ECS_RTN_INK_RGB) : HX(INTVSESSION_LEGEND_RGB));
+            RECT main = rect, upper = rect;
+            if (cap->shifted) {
+                const int mid = rect.top + (rect.bottom - rect.top) * 9 / 20;
+                upper.bottom = mid;
+                main.top = mid;
+                SelectObject(hdc, g_small);
+                SetTextColor(hdc, ink);
+                gdi_text_line(hdc, cap->shifted, &upper, DT_CENTER);
+            }
+            SelectObject(hdc, cap->label[1] != '\0' && (unsigned char)cap->label[0] < 0x80 ? g_small : g_key);
+            SetTextColor(hdc, ink);
+            gdi_text_line(hdc, cap->label, &main, DT_CENTER);
         }
     }
-    return CallWindowProcA(g_btn_proc, hwnd, msg, wp, lp);
 }
 
-static HWND make_key(HWND parent, HINSTANCE inst, const char *text,
-                     intvsession *session, intvsession_ecs_key key,
-                     int x, int y, int w)
+/* ---- layout -------------------------------------------------------------------- */
+
+static void layout_static(void)
 {
-    HWND btn = CreateWindowExA(0, "BUTTON", text,
-                               WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x, y, w,
-                               32, parent, NULL, inst, NULL);
-    key_binding *kb = (key_binding *)calloc(1, sizeof(*kb));
-    kb->session = session;
-    kb->key = key;
-    SetWindowLongPtrA(btn, GWLP_USERDATA, (LONG_PTR)kb);
-    g_btn_proc = (WNDPROC)SetWindowLongPtrA(btn, GWLP_WNDPROC,
-                                            (LONG_PTR)key_btn_proc);
-    return btn;
+    const int left = scaled(MARGIN);
+    int ypos = scaled(MARGIN), art_w;
+
+    g_caps = intvsession_ecs_layout(&g_numcaps, &g_layw, &g_layh);
+    if (g_numcaps > MAX_CAPS) g_numcaps = MAX_CAPS;
+    g_unit = (double)UNIT96 * g_dpi / 96.0;
+    art_w = (int)ceil((double)g_layw * g_unit);
+    g_orgx = left;
+    g_orgy = ypos;
+    SetRect(&g_art_rc, left, ypos, left + art_w, ypos + (int)ceil((double)g_layh * g_unit) + scaled(3));
+    g_total_w = 2 * left + art_w;
+    ypos = g_art_rc.bottom + scaled(8);
+    SetRect(&g_help_rc, left + art_w - scaled(56), ypos, left + art_w, ypos + scaled(BAR_H));
+    SetRect(&g_notice_rc, left, ypos, g_help_rc.left - scaled(8), ypos + scaled(BAR_H));
+    g_total_h = ypos + scaled(BAR_H) + scaled(MARGIN);
 }
 
-/* ---- Shift/Ctrl (latching -- see file header) ---------------------------- */
-
-#define IDC_ECSKBD_CTRL  1001
-#define IDC_ECSKBD_SHIFT 1002
-#define IDC_ECSKBD_HELP  1003
-
-static HWND make_mod_key(HWND parent, HINSTANCE inst, const char *text,
-                         int ctrl_id, int x, int y, int w)
+static void fit_client(void)
 {
-    return CreateWindowExA(0, "BUTTON", text,
-                           WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX |
-                               BS_PUSHLIKE,
-                           x, y, w, 32, parent, (HMENU)(INT_PTR)ctrl_id, inst,
-                           NULL);
+    RECT wnd, client;
+    GetWindowRect(g_panel, &wnd);
+    GetClientRect(g_panel, &client);
+    if (client.right == g_total_w && client.bottom == g_total_h) return;
+    SetWindowPos(g_panel, NULL, 0, 0, (wnd.right - wnd.left) - client.right + g_total_w,
+                 (wnd.bottom - wnd.top) - client.bottom + g_total_h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
-/* ---- layout ---------------------------------------------------------------
- * Four QWERTY-ish rows plus a function row, covering all 48 PHYSICAL keys of
- * intv_ecs_key exactly once -- the physical caps, i.e. everything below
- * INTV_ECS_KEY_PHYSICAL_COUNT. The shifted band past it is not drawn: those
- * are not extra buttons, they are these same keys with SHIFT, and the
- * latching SHIFT button below already chords them exactly as a hand would.
- * See core/jzintv/intv_host.h for the row/mask this ultimately maps to. */
-
-typedef struct { const char *label; intvsession_ecs_key key; } ecs_key_label;
-
-static const ecs_key_label kRowDigits[10] = {
-    {"1", INTVSESSION_ECS_KEY_1}, {"2", INTVSESSION_ECS_KEY_2},
-    {"3", INTVSESSION_ECS_KEY_3}, {"4", INTVSESSION_ECS_KEY_4},
-    {"5", INTVSESSION_ECS_KEY_5}, {"6", INTVSESSION_ECS_KEY_6},
-    {"7", INTVSESSION_ECS_KEY_7}, {"8", INTVSESSION_ECS_KEY_8},
-    {"9", INTVSESSION_ECS_KEY_9}, {"0", INTVSESSION_ECS_KEY_0},
-};
-static const ecs_key_label kRowQwerty[10] = {
-    {"Q", INTVSESSION_ECS_KEY_Q}, {"W", INTVSESSION_ECS_KEY_W},
-    {"E", INTVSESSION_ECS_KEY_E}, {"R", INTVSESSION_ECS_KEY_R},
-    {"T", INTVSESSION_ECS_KEY_T}, {"Y", INTVSESSION_ECS_KEY_Y},
-    {"U", INTVSESSION_ECS_KEY_U}, {"I", INTVSESSION_ECS_KEY_I},
-    {"O", INTVSESSION_ECS_KEY_O}, {"P", INTVSESSION_ECS_KEY_P},
-};
-static const ecs_key_label kRowAsdf[10] = {
-    {"A", INTVSESSION_ECS_KEY_A}, {"S", INTVSESSION_ECS_KEY_S},
-    {"D", INTVSESSION_ECS_KEY_D}, {"F", INTVSESSION_ECS_KEY_F},
-    {"G", INTVSESSION_ECS_KEY_G}, {"H", INTVSESSION_ECS_KEY_H},
-    {"J", INTVSESSION_ECS_KEY_J}, {"K", INTVSESSION_ECS_KEY_K},
-    {"L", INTVSESSION_ECS_KEY_L}, {";", INTVSESSION_ECS_KEY_SEMI},
-};
-static const ecs_key_label kRowZxcv[10] = {
-    {"Z", INTVSESSION_ECS_KEY_Z}, {"X", INTVSESSION_ECS_KEY_X},
-    {"C", INTVSESSION_ECS_KEY_C}, {"V", INTVSESSION_ECS_KEY_V},
-    {"B", INTVSESSION_ECS_KEY_B}, {"N", INTVSESSION_ECS_KEY_N},
-    {"M", INTVSESSION_ECS_KEY_M}, {",", INTVSESSION_ECS_KEY_COMMA},
-    {".", INTVSESSION_ECS_KEY_PERIOD}, {"<-", INTVSESSION_ECS_KEY_LEFT},
-};
-
-static void add_row(HWND parent, HINSTANCE inst, intvsession *session,
-                    const ecs_key_label *row, int count, int y)
+static void window_size(HWND hwnd, SIZE *dims)
 {
-    const int key_w = 40, gap = 4;
-    const int total = count * key_w + (count - 1) * gap;
-    int x = (WIN_W - total) / 2;
-    int i;
-    for (i = 0; i < count; i++) {
-        make_key(parent, inst, row[i].label, session, row[i].key, x, y,
-                key_w);
-        x += key_w + gap;
+    RECT wnd, client;
+    if (hwnd && GetWindowRect(hwnd, &wnd) && GetClientRect(hwnd, &client) && client.right > 0) {
+        dims->cx = (wnd.right - wnd.left) - client.right + g_total_w;
+        dims->cy = (wnd.bottom - wnd.top) - client.bottom + g_total_h;
+    } else {
+        SetRect(&wnd, 0, 0, g_total_w, g_total_h);
+        AdjustWindowRectEx(&wnd, PANEL_STYLE, FALSE, PANEL_EXSTYLE);
+        dims->cx = wnd.right - wnd.left;
+        dims->cy = wnd.bottom - wnd.top;
     }
 }
 
-static void build_keyboard(HWND parent, HINSTANCE inst, intvsession *session)
+/* ---- state ---------------------------------------------------------------------- */
+
+/* The ECS is off (or has no ecs.bin): the keyboard does nothing until Settings turns it on. */
+static int ecs_missing(void)
 {
-    add_row(parent, inst, session, kRowDigits, 10, 30);
-    add_row(parent, inst, session, kRowQwerty, 10, 66);
-    add_row(parent, inst, session, kRowAsdf, 10, 102);
-    add_row(parent, inst, session, kRowZxcv, 10, 138);
+    return !intvsession_ecs_on(g_session);
+}
 
-    {
-        /* Esc(56) Ctrl(64) Shift(64) Space(160) Up(40) Down(40) Right(40)
-         * Enter(56), 4px gaps between the 8 -- see file header. */
-        int x = (WIN_W - (56 + 64 + 64 + 160 + 40 + 40 + 40 + 56 + 7 * 4)) / 2;
-        const int y = 182;
+static void update_title(void)
+{
+    const int mode = intvsession_get_int(g_session, "keyboard_mode", 0) != 0;
+    if (!g_panel || mode == g_mode_shown) return;
+    g_mode_shown = mode;
+    SetWindowTextA(g_panel, mode ? "ECS Keyboard (F10) - the keyboard types here" : "ECS Keyboard (F10)");
+}
 
-        make_key(parent, inst, "Esc", session, INTVSESSION_ECS_KEY_ESC, x, y,
-                56);
-        x += 56 + 4;
-        make_mod_key(parent, inst, "Ctrl", IDC_ECSKBD_CTRL, x, y, 64);
-        x += 64 + 4;
-        make_mod_key(parent, inst, "Shift", IDC_ECSKBD_SHIFT, x, y, 64);
-        x += 64 + 4;
-        make_key(parent, inst, "Space", session, INTVSESSION_ECS_KEY_SPACE, x,
-                y, 160);
-        x += 160 + 4;
-        make_key(parent, inst, "Up", session, INTVSESSION_ECS_KEY_UP, x, y,
-                40);
-        x += 40 + 4;
-        make_key(parent, inst, "Down", session, INTVSESSION_ECS_KEY_DOWN, x,
-                y, 40);
-        x += 40 + 4;
-        make_key(parent, inst, "Right", session, INTVSESSION_ECS_KEY_RIGHT, x,
-                y, 40);
-        x += 40 + 4;
-        make_key(parent, inst, "Enter", session, INTVSESSION_ECS_KEY_ENTER, x,
-                y, 56);
-        x += 56 + 4;
-        CreateWindowExA(0, "BUTTON", "Help", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x, y, 48, 32, parent,
-                        (HMENU)(INT_PTR)IDC_ECSKBD_HELP, inst, NULL);
+/* Lights follow what the machine sees held; redrawn when any changed. */
+static void refresh_held(void)
+{
+    unsigned char now[MAX_CAPS];
+    int idx;
+    if (!g_panel || !g_session) return;
+    memset(now, 0, sizeof now);
+    for (idx = 0; idx < g_numcaps; idx++) now[idx] = (unsigned char)cap_lit(&g_caps[idx]);
+    if (memcmp(now, g_lit, sizeof now) != 0) {
+        memcpy(g_lit, now, sizeof now);
+        InvalidateRect(g_panel, &g_art_rc, FALSE);
     }
+    if (ecs_missing() != g_notice_shown) {
+        g_notice_shown = ecs_missing();
+        InvalidateRect(g_panel, &g_notice_rc, FALSE);
+    }
+    update_title();
 }
 
-/* ---- top-level window ------------------------------------------------------ */
-
-static void release_all(void)
+static void release_mouse(void)
 {
-    if (g_session)
-        intvsession_ecs_keys_clear(g_session);
+    if (g_mouse_cap >= 0 && g_session) {
+        const intvsession_ecs_cap *cap = &g_caps[g_mouse_cap];
+        intvsession_ecs_key_set(g_session, (intvsession_ecs_key)cap->key, 0);
+    }
+    g_mouse_cap = -1;
+    if (GetCapture() == g_panel) ReleaseCapture();
 }
 
-static void update_notice(intvsession *session)
+static void hide_panel(void)
 {
-    int show = !intvsession_has_ecs_rom(session) ||
-              intvsession_get_int(session, "ecs", INTVSESSION_HW_AUTO) ==
-                  INTVSESSION_HW_OFF;
-    ShowWindow(g_notice, show ? SW_SHOW : SW_HIDE);
+    release_mouse();
+    ShowWindow(g_panel, SW_HIDE);
 }
 
-static LRESULT CALLBACK ecskbd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp,
-                                        LPARAM lp)
+/* ---- window ---------------------------------------------------------------------- */
+
+static void paint_rect(HDC hdc, const RECT *inval)
+{
+    RECT art;
+    FillRect(hdc, inval, GetSysColorBrush(COLOR_BTNFACE));
+    SetBkMode(hdc, TRANSPARENT);
+    IntersectRect(&art, inval, &g_art_rc);
+    if (!IsRectEmpty(&art)) {
+        gdi_paint_art(hdc, &art, GetSysColor(COLOR_BTNFACE), art_all);
+        SelectObject(hdc, g_font);
+        text_all(hdc);
+    }
+    SelectObject(hdc, g_font);
+    if (ecs_missing()) {
+        SetTextColor(hdc, GetSysColor(COLOR_GRAYTEXT));
+        gdi_text_line(hdc, "The ECS is not enabled: turn it on in Settings (it applies on restart).", &g_notice_rc,
+                      DT_LEFT | DT_END_ELLIPSIS);
+    } else {
+        SetTextColor(hdc, GetSysColor(COLOR_GRAYTEXT));
+        gdi_text_line(hdc, "SHIFT and CTL latch: click again to let go.", &g_notice_rc, DT_LEFT | DT_END_ELLIPSIS);
+    }
+    gdi_button_face(hdc, &g_help_rc, 0, 0, INTV_ACCENT_COLORREF, INTV_ACCENT_INK_COLORREF);
+    gdi_text_line(hdc, "Help", &g_help_rc, DT_CENTER);
+}
+
+static void mouse_down(HWND hwnd, POINT pnt)
+{
+    int cap;
+    SetFocus(hwnd);
+    if (PtInRect(&g_help_rc, pnt)) {
+        intv_help_show(hwnd, "ecskbd");
+        return;
+    }
+    cap = intvsession_ecs_hit((float)((pnt.x - g_orgx) / g_unit), (float)((pnt.y - g_orgy) / g_unit));
+    if (cap < 0 || cap >= g_numcaps) return;
+    if (g_caps[cap].flags & INTVSESSION_ECSCAP_LATCH) {
+        /* a click flips a latch; both SHIFT caps are the same key */
+        const intvsession_ecs_key key = (intvsession_ecs_key)g_caps[cap].key;
+        intvsession_ecs_key_set(g_session, key, !intvsession_ecs_key_held(g_session, key));
+    } else {
+        release_mouse();
+        g_mouse_cap = cap;
+        intvsession_ecs_key_set(g_session, (intvsession_ecs_key)g_caps[cap].key, 1);
+        SetCapture(hwnd);
+    }
+    refresh_held();
+}
+
+/* A key with the window focused: the hotkeys belong to the main window, the
+ * rest types on the ECS matrix. */
+static int panel_key(UINT msg, WPARAM vk, LPARAM lparam)
+{
+    const int down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+    if (vk == VK_F10) {
+        if (down && !(lparam & (1 << 30))) hide_panel();
+        return 1;
+    }
+    if (msg == WM_SYSKEYDOWN && vk == VK_F4) return 0;
+    if (intv_key_is_reserved(vk, NULL)) {
+        if (g_parent) SendMessageA(g_parent, msg, vk, lparam);
+        return 1;
+    }
+    intv_forward_ecs_key(vk, lparam, down);
+    return 1;
+}
+
+static LRESULT CALLBACK panel_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     switch (msg) {
-    case WM_COMMAND:
-        if (HIWORD(wp) == BN_CLICKED) {
-            int id = LOWORD(wp);
-            if (id == IDC_ECSKBD_HELP) {
-                intv_help_show(hwnd, "ecskbd");
-            } else if (id == IDC_ECSKBD_CTRL || id == IDC_ECSKBD_SHIFT) {
-                HWND ctl = (HWND)lp;
-                int checked =
-                    SendMessageA(ctl, BM_GETCHECK, 0, 0) == BST_CHECKED;
-                intvsession_ecs_key_set(
-                    g_session,
-                    id == IDC_ECSKBD_CTRL ? INTVSESSION_ECS_KEY_CTRL
-                                          : INTVSESSION_ECS_KEY_SHIFT,
-                    checked);
-            }
+    case WM_PAINT: {
+        PAINTSTRUCT paint;
+        HDC hdc = BeginPaint(hwnd, &paint);
+        RECT inval = paint.rcPaint;
+        const int width = inval.right - inval.left, height = inval.bottom - inval.top;
+        if (width > 0 && height > 0) {
+            HDC mem = CreateCompatibleDC(hdc);
+            HBITMAP bmp = CreateCompatibleBitmap(hdc, width, height);
+            HGDIOBJ oldbmp = SelectObject(mem, bmp);
+            HGDIOBJ oldfont = SelectObject(mem, g_font);
+            SetViewportOrgEx(mem, -inval.left, -inval.top, NULL);
+            paint_rect(mem, &inval);
+            SetViewportOrgEx(mem, 0, 0, NULL);
+            BitBlt(hdc, inval.left, inval.top, width, height, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, oldfont);
+            SelectObject(mem, oldbmp);
+            DeleteObject(bmp);
+            DeleteDC(mem);
+        }
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_LBUTTONDOWN: {
+        POINT pnt;
+        pnt.x = GET_X_LPARAM(lparam);
+        pnt.y = GET_Y_LPARAM(lparam);
+        mouse_down(hwnd, pnt);
+        return 0;
+    }
+    case WM_LBUTTONUP:
+        release_mouse();
+        refresh_held();
+        return 0;
+    case WM_CAPTURECHANGED:
+        if ((HWND)lparam != hwnd && g_mouse_cap >= 0) {
+            release_mouse();
+            refresh_held();
         }
         return 0;
-    case WM_NOTIFY: {
-        /* Ctrl/Shift wear the accent colour while latched. */
-        const NMHDR *nh = (const NMHDR *)lp;
-        if (nh->code == NM_CUSTOMDRAW &&
-            (nh->idFrom == IDC_ECSKBD_CTRL || nh->idFrom == IDC_ECSKBD_SHIFT))
-            return intv_accent_customdraw(
-                (const NMCUSTOMDRAW *)lp,
-                SendMessageA(nh->hwndFrom, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    case WM_TIMER:
+        if (wparam == IDT_HELD) refresh_held();
+        return 0;
+
+    /* WM_SYSKEY* too: Alt is a key here as in the main window */
+    case WM_KEYDOWN: case WM_SYSKEYDOWN: case WM_KEYUP: case WM_SYSKEYUP:
+        if (panel_key(msg, wparam, lparam)) return 0;
         break;
+    case WM_SYSCHAR:
+        if (wparam != ' ' && g_parent) { SendMessageA(g_parent, msg, wparam, lparam); return 0; }
+        break;
+    case WM_ENTERMENULOOP:
+        intvsession_ecs_keys_clear(g_session);
+        break;
+    case WM_ACTIVATE:
+        if (LOWORD(wparam) == WA_INACTIVE) {
+            const HWND other = (HWND)lparam;
+            release_mouse();
+            /* Leaving the app: nothing typed here, a latch included, stays
+             * held (within it, the click that latches goes on working). */
+            if (!other || GetWindowThreadProcessId(other, NULL) != GetCurrentThreadId())
+                intvsession_ecs_keys_clear(g_session);
+            refresh_held();
+        }
+        break;
+    case WM_SHOWWINDOW:
+        if (wparam) {
+            refresh_held();
+            SetTimer(hwnd, IDT_HELD, 40, NULL);
+        } else {
+            KillTimer(hwnd, IDT_HELD);
+            release_mouse();
+        }
+        break;
+    case WM_GETMINMAXINFO:
+        if (g_total_w) {
+            MINMAXINFO *limits = (MINMAXINFO *)lparam;
+            SIZE dims;
+            window_size(hwnd, &dims);
+            limits->ptMinTrackSize.x = limits->ptMaxTrackSize.x = limits->ptMaxSize.x = dims.cx;
+            limits->ptMinTrackSize.y = limits->ptMaxTrackSize.y = limits->ptMaxSize.y = dims.cy;
+            return 0;
+        }
+        break;
+    case WM_DPICHANGED: {
+        const RECT *suggested = (const RECT *)lparam;
+        g_dpi = HIWORD(wparam);
+        make_fonts();
+        layout_static();
+        SetWindowPos(hwnd, NULL, suggested->left, suggested->top, suggested->right - suggested->left,
+                     suggested->bottom - suggested->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        fit_client();
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
     }
     case WM_CLOSE:
-        release_all();
-        ShowWindow(hwnd, SW_HIDE);
-        return 0; /* singleton: hide and reuse, matching the GNOME port */
+        /* Hide, do not destroy; the keys let go with it. */
+        hide_panel();
+        return 0;
+    case WM_DESTROY:
+        release_mouse();
+        g_panel = NULL;
+        g_numcaps = 0;
+        free_fonts();
+        break;
+    default:
+        break;
     }
-    return DefWindowProcA(hwnd, msg, wp, lp);
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
 }
 
-int intv_ecskbd_pretranslate(MSG *msg)
+static int create_panel(void)
 {
-    if (!g_win || GetAncestor(msg->hwnd, GA_ROOT) != g_win)
-        return 0;
-    return intv_forward_ecs_key_msg(msg->message, msg->wParam, msg->lParam);
+    static int registered;
+    HINSTANCE inst = GetModuleHandleA(NULL);
+    RECT want;
+
+    if (!registered) {
+        WNDCLASSEXA wcls;
+        memset(&wcls, 0, sizeof wcls);
+        wcls.cbSize = sizeof wcls;
+        wcls.lpfnWndProc = panel_proc;
+        wcls.hInstance = inst;
+        wcls.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wcls.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wcls.lpszClassName = PANEL_CLASS;
+        registered = RegisterClassExA(&wcls) != 0;
+    }
+    g_dpi = intv_window_dpi(g_parent);
+    make_fonts();
+    layout_static();
+    SetRect(&want, 0, 0, g_total_w, g_total_h);
+    AdjustWindowRectEx(&want, PANEL_STYLE, FALSE, PANEL_EXSTYLE);
+    g_panel = CreateWindowExA(PANEL_EXSTYLE, PANEL_CLASS, "ECS Keyboard (F10)", PANEL_STYLE, CW_USEDEFAULT,
+                              CW_USEDEFAULT, want.right - want.left, want.bottom - want.top, g_parent, NULL, inst,
+                              NULL);
+    if (!g_panel) return 0;
+    intv_help_set_context(g_panel, "ecskbd", 0);
+    g_mode_shown = -1;
+    g_notice_shown = -1;
+    memset(g_lit, 0xFF, sizeof g_lit);
+    {
+        const int dpi = intv_window_dpi(g_panel);   /* placed on another monitor than the main window */
+        if (dpi != g_dpi) {
+            g_dpi = dpi;
+            make_fonts();
+            layout_static();
+        }
+    }
+    fit_client();
+    return 1;
 }
 
 void intv_ecskbd_window_toggle(HWND parent, intvsession *session)
 {
-    static int registered;
-    HINSTANCE inst = (HINSTANCE)GetWindowLongPtrA(parent, GWLP_HINSTANCE);
-
     g_session = session;
-
-    if (g_win) {
-        if (IsWindowVisible(g_win)) {
-            ShowWindow(g_win, SW_HIDE);
-            release_all();
-        } else {
-            update_notice(session);
-            ShowWindow(g_win, SW_SHOW);
-            SetForegroundWindow(g_win);
-        }
+    if (parent) g_parent = parent;
+    if (!g_panel && !create_panel()) return;
+    if (IsWindowVisible(g_panel)) {
+        hide_panel();
         return;
     }
+    ShowWindow(g_panel, SW_SHOW);
+    SetForegroundWindow(g_panel);
+}
 
-    if (!registered) {
-        WNDCLASSA wc;
-        memset(&wc, 0, sizeof(wc));
-        wc.lpfnWndProc = ecskbd_wnd_proc;
-        wc.hInstance = inst;
-        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-        wc.lpszClassName = "IntvEcsKeyboardWindow";
-        RegisterClassA(&wc);
-        registered = 1;
-    }
-
-    g_win = CreateWindowExA(0, "IntvEcsKeyboardWindow", "ECS Keyboard",
-                            WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                            WIN_W, WIN_H, parent, NULL, inst, NULL);
-
-    g_notice = CreateWindowExA(
-        0, "STATIC", "ECS is not enabled -- see Settings to turn it on.",
-        WS_CHILD | WS_VISIBLE | SS_CENTER, 8, 4, WIN_W - 16, 20, g_win, NULL,
-        inst, NULL);
-
-    build_keyboard(g_win, inst, session);
-    intv_help_set_context(g_win, "ecskbd", 0);
-    update_notice(session);
-
-    ShowWindow(g_win, SW_SHOW);
+int intv_ecskbd_window_visible(void)
+{
+    return g_panel && IsWindowVisible(g_panel);
 }

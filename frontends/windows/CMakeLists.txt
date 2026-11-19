@@ -23,7 +23,7 @@ add_executable(fujinet-go-intv-windows WIN32
   key_translate.c
   debugger/dbg_window.c
   debugger/dbg_video.c
-  keypad/keypad_window.c
+  controllers/controller_window.c
   ecskbd/ecskbd_window.c
   resource.rc
 )

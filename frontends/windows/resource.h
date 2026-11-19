@@ -4,7 +4,7 @@
 
 #define IDI_APPICON        101
 
-#define IDM_KEYPAD         201
+#define IDM_CONTROLLERS    201
 #define IDM_FUJINET_CONFIG 202
 #define IDM_FUJINET_LOG    203
 #define IDM_FULLSCREEN     204
@@ -33,6 +33,9 @@
 #define IDC_SET_EXTERNAL     308
 #define IDC_SET_EXT_ADDR     309
 #define IDC_SET_HELP         310
+#define IDC_SET_GAMEPAD      311
+#define IDC_SET_RESET_CTRL   312
+#define IDC_SET_OPEN_CTRL    313
 
 /* The No-BIOS page's buttons. */
 #define IDC_BIOS_FILES       401

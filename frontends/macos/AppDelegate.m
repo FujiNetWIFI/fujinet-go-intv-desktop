@@ -3,12 +3,13 @@
  * lifecycle, and hosts the FujiNet configuration (WKWebView) and console
  * log windows. Mirrors the GNOME/KDE/Windows frontends over the same
  * intvsession API, with the native debugger window in
- * debugger/DebuggerWindow.m and the keypad window in
- * keypad/KeypadWindow.m.
+ * debugger/DebuggerWindow.m, the Controllers panel in
+ * controllers/ControllersWindow.m and the ECS keyboard panel in
+ * ecskbd/EcsKeyboardWindow.m.
  *
  * No Machine/Display/CPU radio menus, unlike the CoCo/ADAM/MSX macOS
  * ports: the Intellivision has one fixed configuration, matching the
- * GNOME/KDE/Windows frontends' own menu scope (View: Keypad/ECS Keyboard/
+ * GNOME/KDE/Windows frontends' own menu scope (View: Controllers/ECS Keyboard/
  * Fullscreen/Debugger; FujiNet: Configuration/Console Log).
  *
  * NOT BUILT OR RUN-VERIFIED -- see main.m's file header.
@@ -25,13 +26,26 @@
 #import "DisplayView.h"
 #import "help/HelpWindow.h"
 #import "debugger/DebuggerWindow.h"
+#import "controllers/ControllersWindow.h"
 #import "ecskbd/EcsKeyboardWindow.h"
-#import "keypad/KeypadWindow.h"
 
 #include <stdlib.h>
 #include <string.h>
 
+/* How long a message (a gamepad coming or going) stays over the picture. */
+#define INTV_TOAST_SECONDS 3.0
+
+/* Gamepad rows in Settings' Input group (the Controllers panel has the same). */
+#define INTV_SETTINGS_PADS 4
+
 @interface AppDelegate () <NSWindowDelegate, WKUIDelegate>
+- (void)showToast:(NSString *)text;
+- (void)refreshPadList;
+- (void)fitSettings;
+- (void)startSettingsTimer;
+- (void)resetControls:(id)sender;
+- (void)openControllers:(id)sender;
+- (void)padAssignChanged:(NSPopUpButton *)sender;
 @end
 
 @implementation AppDelegate {
@@ -50,6 +64,16 @@
     NSView *_noRoms;
     NSMutableArray<NSTextField *> *_romStatus;
     NSPopUpButton *_ecsPop;
+    NSTextField *_toast;             /* the hot-plug message over the picture */
+    unsigned _toastGeneration;       /* the pads' generation the toast has seen */
+    NSUInteger _toastSerial;
+    NSGridView *_settingsGrid;
+    NSInteger _padRowBase;           /* the grid row of the first gamepad row */
+    NSTextField *_padName[INTV_SETTINGS_PADS];
+    NSPopUpButton *_padAssign[INTV_SETTINGS_PADS];
+    unsigned _padGeneration;         /* the pads' generation the Input rows show */
+    int _padAssignEcs;               /* the assign popups were filled for this ecs_on */
+    NSTimer *_settingsTimer;
 }
 
 /* Settings keys shared with the GNOME/KDE/Windows frontends (all four read/
@@ -58,6 +82,7 @@
  *   "ecs"/"ivoice"    INTVSESSION_HW_* (default AUTO)     -- restart to apply
  *   "video_standard"  INTVSESSION_VIDEO_* (default NTSC)  -- restart to apply
  *   "keyboard_mode"   0 = hand controllers, 1 = ECS keyboard -- applies live
+ *   "enable_gamepad"  1 = run the SDL gamepad thread (default) -- restart
  *   "fujinet_external"/"fujinet_external_addr"  dial another FujiNet -- restart
  * The restart-class key set, mirroring the CoCo/ADAM macOS ports' own
  * sessionSettingKeys()/machineSettingKeys() helpers. */
@@ -66,8 +91,8 @@ static NSArray<NSString *> *restartSettingKeys(void)
     static NSArray<NSString *> *keys;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-      keys = @[ @"ecs", @"ivoice", @"video_standard", @"fujinet_external",
-                @"fujinet_external_addr" ];
+      keys = @[ @"ecs", @"ivoice", @"video_standard", @"enable_gamepad",
+                @"fujinet_external", @"fujinet_external_addr" ];
     });
     return keys;
 }
@@ -317,10 +342,10 @@ static NSArray<NSString *> *restartSettingKeys(void)
 
 /* ---- actions ------------------------------------------------------------ */
 
-- (void)showKeypad:(id)sender
+- (void)showControllers:(id)sender
 {
     (void)sender;
-    [KeypadWindow toggleForSession:_session];
+    [IntvControllersWindow toggleWithSession:_session];
 }
 
 - (void)showEcsKeyboard:(id)sender
@@ -356,9 +381,11 @@ static NSArray<NSString *> *restartSettingKeys(void)
 /* Drains intvsession_sysaction_take -- the one caller that can't fire a
  * sysaction directly is gamepad_sdl.c's SDL thread (queuing RESET_CONFIG so
  * it never joins itself); this, the UI thread, fires each on the tick
- * below. Lives on the app delegate rather than the keypad window: that
- * window hides rather than closes but is hidden far more often than shown,
- * and a gamepad-bound sysaction has to keep working regardless. */
+ * below. The Controllers panel's RESET and system buttons are queued here too,
+ * so a failure is reported in one place. Lives on the app delegate rather than
+ * the panel: the panel hides rather than closes but is hidden far more often
+ * than shown, and a gamepad-bound sysaction has to keep working regardless.
+ * Handles all three actions (Reset Game, Reset to CONFIG, Stop in debugger). */
 - (void)drainSysactions
 {
     intvsession_sysaction a;
@@ -369,8 +396,56 @@ static NSArray<NSString *> *restartSettingKeys(void)
             alert.informativeText = [NSString
                 stringWithUTF8String:intvsession_last_error(_session)];
             [alert runModal];
+            continue;
+        }
+        switch (a) {
+        case INTVSESSION_SYSACT_DEBUG_STOP:
+            /* the machine is stopping; the debugger window follows the stop */
+            [DebuggerWindow showForSession:_session];
+            break;
+        case INTVSESSION_SYSACT_RESET_GAME:
+        case INTVSESSION_SYSACT_RESET_CONFIG:
+        default:
+            break;
         }
     }
+}
+
+/* A message over the top of the picture that fades (a gamepad coming or
+ * going). A newer message restarts the clock; hidden when faded, so it never
+ * takes a click. */
+- (void)showToast:(NSString *)text
+{
+    if (!text || !_toast) return;
+    _toast.stringValue = text;
+    _toast.hidden = NO;
+    _toast.alphaValue = 1.0;
+    const NSUInteger serial = ++_toastSerial;
+    __weak AppDelegate *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(INTV_TOAST_SECONDS * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        AppDelegate *strongSelf = weakSelf;
+        if (!strongSelf || serial != strongSelf->_toastSerial) return;
+        [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
+            ctx.duration = 0.5;
+            strongSelf->_toast.animator.alphaValue = 0.0;
+        } completionHandler:^{
+            if (serial == strongSelf->_toastSerial) strongSelf->_toast.hidden = YES;
+        }];
+    });
+}
+
+/* Pads coming and going: the panels read them again, the picture says so. */
+- (void)checkGamepadEvents
+{
+    const unsigned gen = intvsession_gamepad_generation(_session);
+    if (gen == _toastGeneration) return;
+    _toastGeneration = gen;
+    char msg[160];
+    msg[0] = '\0';
+    if (intvsession_gamepad_last_event(_session, msg, (int)sizeof msg) > 0)
+        [self showToast:[NSString stringWithUTF8String:msg]];
+    [IntvControllersWindow refresh];
 }
 
 - (void)showFujiNetConfig:(id)sender
@@ -542,10 +617,13 @@ static NSArray<NSString *> *restartSettingKeys(void)
         _externalField.enabled = value != 0;
     if ([restartSettingKeys() containsObject:key]) {
         _sessionDirty = YES;
-    } else if ([key isEqualToString:@"keyboard_mode"] && value == 0) {
-        /* Leaving ECS keyboard mode -- release anything still held; see
-         * intvsession_ecs_keys_clear's own comment. */
-        intvsession_ecs_keys_clear(_session);
+    } else if ([key isEqualToString:@"keyboard_mode"]) {
+        if (value == 0) {
+            /* Leaving ECS keyboard mode -- release anything still held; see
+             * intvsession_ecs_keys_clear's own comment. */
+            intvsession_ecs_keys_clear(_session);
+        }
+        [EcsKeyboardWindow refresh];
     }
 }
 
@@ -573,6 +651,8 @@ static NSArray<NSString *> *restartSettingKeys(void)
 {
     (void)sender;
     if (_settingsWindow) {
+        [self refreshPadList];
+        [self startSettingsTimer];
         [_settingsWindow makeKeyAndOrderFront:nil];
         return;
     }
@@ -600,7 +680,7 @@ static NSArray<NSString *> *restartSettingKeys(void)
                                                      INTVSESSION_VIDEO_NTSC)];
 
     NSButton *ecsKeyboard =
-        [NSButton checkboxWithTitle:@""
+        [NSButton checkboxWithTitle:@"The keyboard types on the ECS keyboard"
                              target:self
                              action:@selector(settingChanged:)];
     ecsKeyboard.state = intvsession_get_int(_session, "keyboard_mode", 0)
@@ -626,17 +706,64 @@ static NSArray<NSString *> *restartSettingKeys(void)
     _externalField.action = @selector(externalAddrChanged:);
     [_externalField.cell setSendsActionOnEndEditing:YES];
 
-    NSArray<NSArray<NSView *> *> *rows = @[
+    NSButton *gamepadsBox =
+        [NSButton checkboxWithTitle:@"Gamepads (applied when this window closes)"
+                             target:self
+                             action:@selector(settingChanged:)];
+    gamepadsBox.state = intvsession_get_int(_session, "enable_gamepad", 1)
+                            ? NSControlStateValueOn
+                            : NSControlStateValueOff;
+    gamepadsBox.identifier = @"enable_gamepad";
+
+    NSMutableArray<NSArray<NSView *> *> *all = [NSMutableArray arrayWithArray:@[
         @[ [NSTextField labelWithString:@"ECS"], ecsPop ],
         @[ [NSTextField labelWithString:@"Intellivoice"],
            [self hwModePopUpForKey:"ivoice"] ],
         @[ [NSTextField labelWithString:@"Video Standard"], videoPop ],
-        @[ [NSTextField labelWithString:@"ECS Keyboard"], ecsKeyboard ],
         @[ [NSTextField labelWithString:@"Use external FujiNet"], externalBox ],
         @[ [NSTextField labelWithString:@"Address:port"], _externalField ],
-    ];
+    ]];
+    /* Input: the keyboard's route, the gamepads with the side each drives. */
+    {
+        NSTextField *inputHead = [NSTextField labelWithString:@"Input"];
+        inputHead.font = [NSFont boldSystemFontOfSize:NSFont.systemFontSize];
+        NSTextField *inputNote = [NSTextField labelWithString:@"applied immediately, except Gamepads"];
+        inputNote.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+        inputNote.textColor = NSColor.secondaryLabelColor;
+        [all addObject:@[ inputHead, inputNote ]];
+        [all addObject:@[ [NSTextField labelWithString:@"ECS Keyboard"], ecsKeyboard ]];
+        [all addObject:@[ [NSTextField labelWithString:@""], gamepadsBox ]];
+        _padRowBase = (NSInteger)all.count;
+        _padAssignEcs = -1;
+        for (int row = 0; row < INTV_SETTINGS_PADS; row++) {
+            _padName[row] = [NSTextField labelWithString:@""];
+            _padName[row].font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+            _padName[row].lineBreakMode = NSLineBreakByTruncatingTail;
+            [_padName[row].widthAnchor constraintEqualToConstant:230].active = YES;
+            _padAssign[row] = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+            _padAssign[row].tag = row;
+            _padAssign[row].target = self;
+            _padAssign[row].action = @selector(padAssignChanged:);
+            NSStackView *padRow = [NSStackView stackViewWithViews:@[ _padName[row], _padAssign[row] ]];
+            padRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+            [all addObject:@[ [NSTextField labelWithString:(row == 0 ? @"Gamepads" : @"")], padRow ]];
+        }
+        NSButton *reset = [NSButton buttonWithTitle:@"Reset Controls"
+                                             target:self
+                                             action:@selector(resetControls:)];
+        NSButton *open = [NSButton buttonWithTitle:@"Open Controllers"
+                                            target:self
+                                            action:@selector(openControllers:)];
+        NSButton *inputHelp = IntvHelpButton(@"prefs/Input");
+        NSStackView *buttons = [NSStackView stackViewWithViews:@[ reset, open, inputHelp ]];
+        buttons.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+        [all addObject:@[ [NSTextField labelWithString:@""], buttons ]];
+        NSTextField *mapNote = [NSTextField labelWithString:@"Keys and gamepad buttons are mapped in the Controllers window (F9)."];
+        mapNote.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+        mapNote.textColor = NSColor.secondaryLabelColor;
+        [all addObject:@[ [NSTextField labelWithString:@""], mapNote ]];
+    }
     /* ROMs: one row per item under its group, refreshed after an import. */
-    NSMutableArray<NSArray<NSView *> *> *all = [rows mutableCopy];
     NSTextField *romsHead = [NSTextField labelWithString:@"ROMs"];
     romsHead.font = [NSFont boldSystemFontOfSize:NSFont.systemFontSize];
     [all addObject:@[ romsHead, [NSTextField labelWithString:@""] ]];
@@ -673,19 +800,20 @@ static NSArray<NSString *> *restartSettingKeys(void)
     [self refreshRomRows];
 
     NSGridView *grid = [NSGridView gridViewWithViews:all];
+    _settingsGrid = grid;
     grid.rowSpacing = 8;
     grid.columnSpacing = 12;
     [grid columnAtIndex:0].xPlacement = NSGridCellPlacementTrailing;
 
     NSTextField *note = [NSTextField
-        labelWithString:@"ECS/Intellivoice/Video Standard apply when this "
-                        @"window is closed (the session restarts). ECS "
-                        @"Keyboard applies immediately. An external FujiNet "
+        labelWithString:@"ECS/Intellivoice/Video Standard and Gamepads apply "
+                        @"when this window is closed (the session "
+                        @"restarts). ECS Keyboard applies immediately. An external FujiNet "
                         @"is dialled at the address above: start it "
                         @"listening there (its [BOIP] port).\n\nWarning: the "
                         @"FujiNet CONFIG ROM has no ECS keyboard support "
                         @"yet, so while ECS Keyboard is on its menus can "
-                        @"only be driven by a gamepad or the keypad "
+                        @"only be driven by a gamepad or the Controllers "
                         @"window."];
     note.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
     note.textColor = NSColor.secondaryLabelColor;
@@ -732,8 +860,112 @@ static NSArray<NSString *> *restartSettingKeys(void)
         _settingsWindow.contentView = wrap;
         IntvSetHelpContext(_settingsWindow, @"prefs/Machine");
     }
+    [self fitSettings];
     [_settingsWindow center];
+    _padGeneration = intvsession_gamepad_generation(_session);
+    [self refreshPadList];
+    [self startSettingsTimer];
     [_settingsWindow makeKeyAndOrderFront:nil];
+}
+
+/* Automatic, then one item per side the session has: Left and Right, and with
+ * the ECS on, ECS Left and ECS Right. Filled again when ecs_on changes (a
+ * restart), as the Settings window outlives the session. */
+- (void)fillPadAssignPopups
+{
+    const int ecs = intvsession_ecs_on(_session) ? 1 : 0;
+    if (ecs == _padAssignEcs) return;
+    _padAssignEcs = ecs;
+    for (int row = 0; row < INTV_SETTINGS_PADS; row++) {
+        [_padAssign[row] removeAllItems];
+        [_padAssign[row] addItemWithTitle:@"Automatic"];
+        for (int side = 0; side < (ecs ? 4 : 2); side++)
+            [_padAssign[row] addItemWithTitle:[NSString stringWithUTF8String:intvsession_pad_side_name((intvsession_pad_side)side)]];
+    }
+}
+
+/* The Input group's gamepad rows: one per connected pad (up to four), its name
+ * and the side it drives, and the side it is set to. Rows with no pad are
+ * hidden; the first says so. */
+- (void)refreshPadList
+{
+    if (!_settingsWindow) return;
+    [self fillPadAssignPopups];
+    const int count = intvsession_gamepad_count(_session);
+    const int sides = _padAssignEcs ? 4 : 2;
+    _padGeneration = intvsession_gamepad_generation(_session);
+    for (int row = 0; row < INTV_SETTINGS_PADS; row++) {
+        const BOOL shown = row < count;
+        char name[128];
+        name[0] = '\0';
+        if (shown) intvsession_gamepad_name(_session, row, name, (int)sizeof name);
+        const int eff = shown ? intvsession_gamepad_effective_side(_session, row) : -1;
+        NSString *text;
+        if (!shown)
+            text = row == 0 ? @"(no gamepads connected)" : @"";
+        else if (eff >= 0)
+            text = [NSString stringWithFormat:@"%s  [%s]", name, intvsession_pad_side_name((intvsession_pad_side)eff)];
+        else
+            text = [NSString stringWithFormat:@"%s  [unused]", name];
+        _padName[row].stringValue = text;
+        _padAssign[row].hidden = !shown;
+        if (shown) {
+            const int assign = intvsession_gamepad_assignment(_session, row);
+            [_padAssign[row] selectItemAtIndex:(assign < 0 || assign >= sides ? 0 : assign + 1)];
+        }
+        if (_settingsGrid) [_settingsGrid rowAtIndex:_padRowBase + row].hidden = !shown && row > 0;
+    }
+    [self fitSettings];
+}
+
+/* The window follows its content when gamepad rows come and go. */
+- (void)fitSettings
+{
+    if (!_settingsWindow || !_settingsWindow.contentView) return;
+    const NSSize fit = _settingsWindow.contentView.fittingSize;
+    if (fit.width > 0 && fit.height > 0) [_settingsWindow setContentSize:fit];
+}
+
+- (void)padAssignChanged:(NSPopUpButton *)sender
+{
+    const int sel = (int)sender.indexOfSelectedItem;
+    intvsession_gamepad_assign(_session, (int)sender.tag, sel <= 0 ? -1 : sel - 1);
+    [self refreshPadList];
+    [IntvControllersWindow refresh];
+}
+
+/* Reset Controls: the default keys and gamepad buttons, every gamepad back on
+ * Automatic. */
+- (void)resetControls:(id)sender
+{
+    (void)sender;
+    intvsession_bindings_reset(_session);
+    for (int idx = 0, num = intvsession_gamepad_count(_session); idx < num; idx++)
+        intvsession_gamepad_assign(_session, idx, -1);
+    [self refreshPadList];
+    [IntvControllersWindow refresh];
+}
+
+- (void)openControllers:(id)sender
+{
+    (void)sender;
+    [IntvControllersWindow showWithSession:_session];
+}
+
+/* Gamepads coming and going, and what Auto resolves to, while the window is
+ * up. The timer goes with the window: reopening starts it again. */
+- (void)startSettingsTimer
+{
+    if (_settingsTimer) return;
+    __weak AppDelegate *weakSelf = self;
+    _settingsTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
+        (void)timer;
+        AppDelegate *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (intvsession_gamepad_generation(strongSelf->_session) != strongSelf->_padGeneration ||
+            (intvsession_ecs_on(strongSelf->_session) ? 1 : 0) != strongSelf->_padAssignEcs)
+            [strongSelf refreshPadList];
+    }];
 }
 
 /* Deferred restart-class apply -- collected while the Settings window is
@@ -741,8 +973,11 @@ static NSArray<NSString *> *restartSettingKeys(void)
  * frontends' own "apply on close" idiom). */
 - (void)windowWillClose:(NSNotification *)note
 {
-    if (note.object == _settingsWindow)
+    if (note.object == _settingsWindow) {
         [_settingsWindow makeFirstResponder:nil]; /* commit a field edit */
+        [_settingsTimer invalidate];
+        _settingsTimer = nil;
+    }
     if (note.object != _settingsWindow || !_sessionDirty)
         return;
     _sessionDirty = NO;
@@ -816,7 +1051,7 @@ static NSArray<NSString *> *restartSettingKeys(void)
      * default (core/src/bindings.c), not a fixed accelerator like Cmd+R
      * below. AppKit's -performKeyEquivalent: chain runs before a window's
      * own -keyDown:, so binding one here would fire Reset Game on plain
-     * Backspace forever, even after a keypad window Map-mode remap moved
+     * Backspace forever, even after a Controllers window Map-mode remap moved
      * that action to a different key. The mouse-clickable menu entry is
      * enough; the real trigger is IntvForwardKeyEvent's MAP_SYSACT dispatch
      * (IntvKeyForward.m), which honours whatever the user has actually
@@ -854,18 +1089,18 @@ static NSArray<NSString *> *restartSettingKeys(void)
     machineItem.submenu = machineMenu;
     [menubar addItem:machineItem];
 
-    /* View: Keypad, Fullscreen, Debugger -- matching the GNOME/KDE/Windows
+    /* View: Controllers, ECS Keyboard, Fullscreen, Debugger -- matching the GNOME/KDE/Windows
      * frontends' own View menu exactly (no Machine/Display/CPU groups). */
     NSMenuItem *viewItem = [[NSMenuItem alloc] init];
     NSMenu *view = [[NSMenu alloc] initWithTitle:@"View"];
-    NSMenuItem *keypad =
-        [self item:@"Keypad"
-             action:@selector(showKeypad:)
+    NSMenuItem *controllers =
+        [self item:@"Controllers (F9)"
+             action:@selector(showControllers:)
                 key:[NSString stringWithFormat:@"%C", (unichar)NSF9FunctionKey]];
-    keypad.keyEquivalentModifierMask = 0;
-    [view addItem:keypad];
+    controllers.keyEquivalentModifierMask = 0;
+    [view addItem:controllers];
     NSMenuItem *ecsKeyboard =
-        [self item:@"ECS Keyboard"
+        [self item:@"ECS Keyboard (F10)"
              action:@selector(showEcsKeyboard:)
                 key:[NSString stringWithFormat:@"%C",
                               (unichar)NSF10FunctionKey]];
@@ -887,14 +1122,14 @@ static NSArray<NSString *> *restartSettingKeys(void)
     [menubar addItem:viewItem];
 
     /* Window menu. AppKit appends the list of open windows (the main
-     * window, the debugger, the keypad, the FujiNet console log) to
+     * window, the debugger, the controllers, the FujiNet console log) to
      * whichever menu is handed to windowsMenu, and manages their check
      * marks -- that list is what "show or hide windows" means to a Mac
      * user. */
     NSMenuItem *windowItem = [[NSMenuItem alloc] init];
     NSMenu *windowMenu = [[NSMenu alloc] initWithTitle:@"Window"];
     /* Close lives here rather than in a File menu: there is no File menu,
-     * and the debugger / config / log / keypad windows need a keyboard
+     * and the debugger / config / log / controllers windows need a keyboard
      * close. */
     [windowMenu addItemWithTitle:@"Close"
                           action:@selector(performClose:)
@@ -971,6 +1206,23 @@ static NSArray<NSString *> *restartSettingKeys(void)
     _noRoms = [self buildNoRoms:((NSView *)_window.contentView).bounds];
     [_window.contentView addSubview:_noRoms];
 
+    /* The toast: a label over the top of the picture that fades. Hidden when
+     * faded, so it never takes a click. */
+    _toast = [NSTextField labelWithString:@""];
+    _toast.font = [NSFont boldSystemFontOfSize:13];
+    _toast.textColor = NSColor.whiteColor;
+    _toast.drawsBackground = YES;
+    _toast.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.7];
+    _toast.alignment = NSTextAlignmentCenter;
+    _toast.alphaValue = 0.0;
+    _toast.hidden = YES;
+    {
+        const NSRect bounds = ((NSView *)_window.contentView).bounds;
+        _toast.frame = NSMakeRect(0, bounds.size.height - 34, bounds.size.width, 26);
+    }
+    _toast.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    [_window.contentView addSubview:_toast];
+
     [_window center];
     [_window makeKeyAndOrderFront:nil];
     [_window makeFirstResponder:_display];
@@ -979,19 +1231,22 @@ static NSArray<NSString *> *restartSettingKeys(void)
 
     /* ~100ms: fast enough that a gamepad press feels immediate, cheap
      * enough to run for the app's whole lifetime. See -drainSysactions's
-     * own comment. */
+     * own comment. It also watches the pads coming and going. */
+    _toastGeneration = intvsession_gamepad_generation(_session);
+    __weak AppDelegate *weakSelf = self;
     _sysactTimer = [NSTimer scheduledTimerWithTimeInterval:0.1
                                                      repeats:YES
                                                        block:^(NSTimer *timer) {
                                                          (void)timer;
-                                                         [self drainSysactions];
+                                                         [weakSelf drainSysactions];
+                                                         [weakSelf checkGamepadEvents];
                                                        }];
 
     /* Developer affordance shared with the other frontends. */
     if (getenv("INTV_OPEN_DEBUGGER"))
         [DebuggerWindow showForSession:_session];
-    if (getenv("INTV_OPEN_KEYPAD"))
-        [KeypadWindow toggleForSession:_session];
+    if (getenv("INTV_OPEN_KEYPAD") || getenv("INTV_OPEN_CONTROLLERS"))
+        [IntvControllersWindow toggleWithSession:_session];
 }
 
 - (void)applicationWillTerminate:(NSNotification *)note

@@ -197,8 +197,14 @@ void IntvForwardKeyEvent(intvsession *session, NSEvent *event, int down)
      * event.isARepeat before calling here, so no extra repeat guard is
      * needed for the fire-once behaviour a sysaction wants. */
     if (m.kind == INTVSESSION_MAP_SYSACT) {
-        if (down)
-            intvsession_sysaction_fire(session, m.sysact);
+        if (down) {
+            /* Stop in debugger is queued so the app delegate's drain shows
+             * the debugger window after the stop, as for the panel buttons. */
+            if (m.sysact == INTVSESSION_SYSACT_DEBUG_STOP)
+                intvsession_sysaction_post(session, m.sysact);
+            else
+                intvsession_sysaction_fire(session, m.sysact);
+        }
         return;
     }
 
@@ -308,8 +314,10 @@ BOOL IntvModifierKeyState(NSEvent *event, int *down)
  * comment. */
 - (void)resignKeyWindow
 {
-    if (_session)
+    if (_session) {
         intvsession_ecs_keys_clear(_session);
+        intvsession_release_keyboard(_session);
+    }
     [super resignKeyWindow];
 }
 

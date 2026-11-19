@@ -23,7 +23,7 @@ add_executable(fujinet-go-intv-macos MACOSX_BUNDLE
   help/HelpWindow.m
   debugger/DebuggerWindow.m
   debugger/VideoTab.m
-  keypad/KeypadWindow.m
+  controllers/ControllersWindow.m
   ecskbd/EcsKeyboardWindow.m
   ${MACOS_ICON}
 )

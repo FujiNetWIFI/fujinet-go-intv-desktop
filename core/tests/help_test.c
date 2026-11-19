@@ -25,13 +25,14 @@ static const char *const platform_names[] = { "GNOME", "KDE", "Windows", "macOS"
 
 /* What the frontends' Help buttons and menus open. */
 static const char *const contexts[] = {
-    "main", "nobios", "keypad", "ecskbd", "fujilog", "prefs/Machine", "prefs/ROMs",
+    "main", "nobios", "controllers", "ecskbd", "fujilog", "prefs/Machine", "prefs/Input", "prefs/ROMs",
     "debugger/console", "debugger/disassembly", "debugger/basic", "debugger/memory", "debugger/breakpoints", "debugger/watches", "debugger/cart", "debugger/trace", "debugger/history", "debugger/video", "debugger/sound", "debugger/symbols", "debugger/fujinet",
 };
 
 /* The Preferences pages: what each one has, as the frontends label it. */
 static const char *const labels[] = {
     "ECS", "Intellivoice", "Video Standard", "Auto", "Off", "On", "NTSC", "PAL", "ECS Keyboard",
+    "Enable gamepads", "Gamepads", "Reset Controls", "Open Controllers", "Automatic",
     "Use external FujiNet", "Address:port", "Executive ROM (exec.bin)", "Graphics ROM (grom.bin)",
     "ECS ROM (ecs.bin)", "Imported", "Not imported", "Import", "Import a Folder",
 };
@@ -39,7 +40,7 @@ static const char *const labels[] = {
 /* The settings keys the pages write. */
 static const char *const settings_keys[] = {
     "ecs", "ivoice", "video_standard", "keyboard_mode", "fujinet_external", "fujinet_external_addr", "cart",
-    "sym_dir", "bindings",
+    "sym_dir", "bindings", "pad_assign", "enable_gamepad", "controllers_show_bindings",
 };
 
 /* The app's shortcuts, as a PC and as a Mac shows them. */

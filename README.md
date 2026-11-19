@@ -9,7 +9,7 @@ alongside `fujinet-go-adam-desktop`, `fujinet-go-apple2-desktop`,
 
 **Status: feature-complete locally, not yet released.** All four native
 frontends (GNOME/GTK4, KDE/Qt6, Windows, macOS), the debugger window, the
-clickable keypad window, and Linux/Windows packaging (DEB/RPM/TGZ, both
+skinned Controllers window (Intellivision II handsets) and ECS Keyboard window, and Linux/Windows packaging (DEB/RPM/TGZ, both
 flatpak manifests, NSIS installer) exist and have been built and run --
 GNOME/KDE/Windows verified directly (including via Wine for Windows), macOS
 written but not yet compiled on real hardware. See `TODO` for the full
@@ -21,7 +21,7 @@ machine), then cutting the `v0.1.0` release tag.
 ## Built-in Help
 
 **Help ▸ FujiNet Go Intv Help** (Ctrl+Shift+H, ⌘? on a Mac) opens a searchable
-Help, and the Help buttons in Preferences, the Keypad and ECS Keyboard windows,
+Help, and the Help buttons in Preferences, the Controllers and ECS Keyboard windows,
 the debugger and the console log open the topic for what they show. The text is
 [data/help/help.md](data/help/help.md), which GitHub shows as it is; the build
 embeds it and every frontend lays it out natively.
@@ -102,8 +102,8 @@ the rest of its debugger).
   (`core/debugger/`), and `core/tests/`.
 - `frontends/{gnome,kde,macos,windows}/` -- one native UI per platform, each
   wrapping the same `core/` library: fixed 4:3 display, a debugger window
-  (BACKTAB/MOB grid/GRAM-GROM sheet/palette), a clickable keypad window for
-  both hand controllers, and a Settings dialog for the three machine
+  (BACKTAB/MOB grid/GRAM-GROM sheet/palette), a skinned Controllers window for
+  the hand controllers (Intellivision II handsets) and an ECS Keyboard window, and a Settings dialog for the three machine
   options -- ECS (the Entertainment Computer System: a second controller
   pair, its own keyboard, and extra sound), Intellivoice (speech synthesis),
   and NTSC/PAL video standard. ECS and Intellivoice are tri-state

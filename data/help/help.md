@@ -18,7 +18,7 @@ load games from the network.
 3. **Or put a cartridge image on the SD folder.** **Import Cartridge to SD…**
    copies `.rom`, `.bin`, `.int`, `.itv`, `.cfg` or `.zip` files there, so
    CONFIG can boot them. See [Cartridges](#cartridges).
-4. **Play.** The keys, the gamepads and the Keypad window work both hand
+4. **Play.** The keys, the gamepads and the Controllers window work both hand
    controllers. See [Controllers and keys](#controllers-and-keys).
 5. **Change the machine.** [Preferences](#preferences) fits the ECS and the
    Intellivoice, picks NTSC or PAL, and sets up FujiNet.
@@ -27,7 +27,7 @@ load games from the network.
 
 The list on the left has a topic for each part of the app; the search box
 above it finds every section that has all the words you type. A **Help**
-button in Preferences, the Debugger, the Keypad and ECS Keyboard windows and the
+button in Preferences, the Debugger, the Controllers and ECS Keyboard windows and the
 FujiNet console log opens the topic for what it shows, and
 <kbd>Ctrl+Shift+H</kbd> does the same for the window you are in.
 
@@ -57,7 +57,7 @@ The console's picture fills the window. The menus have:
   [Cartridges](#cartridges).
 - **Reset Game** and **Reset to CONFIG**.
 - **FujiNet Configuration…** and **FujiNet Console Log…**.
-- **Keypad** (<kbd>F9</kbd>), **ECS Keyboard** (<kbd>F10</kbd>) and
+- **Controllers** (<kbd>F9</kbd>), **ECS Keyboard** (<kbd>F10</kbd>) and
   **Debugger** (<kbd>F12</kbd>).
 - **Preferences**, **Help** and **About**.
 
@@ -71,7 +71,7 @@ header bar).
 <!-- only: kde -->
 
 The menu bar has Machine, View, FujiNet, Settings and Help. Settings has
-Settings…, and <kbd>F11</kbd> toggles full screen.
+Settings….
 
 <!-- end -->
 
@@ -138,7 +138,7 @@ one's.
 | Console | Key |
 |---|---|
 | Reset Game | <kbd>Backspace</kbd> |
-| Reset to CONFIG | <kbd>Ctrl+R</kbd> |
+| Reset to CONFIG | <kbd>Escape</kbd>, and <kbd>Ctrl+R</kbd> on the menu |
 
 A key does one thing: giving a key to a new job takes it from the old one.
 
@@ -148,11 +148,11 @@ The app keeps these keys for itself:
 |---|---|
 | <kbd>Ctrl+R</kbd> | Reset to CONFIG |
 | <kbd>Ctrl+Shift+H</kbd> | Help |
-| <kbd>F9</kbd> | Keypad |
+| <kbd>F9</kbd> | Controllers |
 | <kbd>F10</kbd> | ECS Keyboard |
 | <kbd>F12</kbd> | Debugger |
 
-<!-- only: gnome kde windows -->
+<!-- only: gnome windows -->
 
 <kbd>F11</kbd> toggles full screen.
 
@@ -169,51 +169,73 @@ Key combinations with the Super (Windows) key are the desktop's.
 With the ECS fitted, Preferences ▸ Input ▸ **ECS Keyboard** routes the
 keyboard to the ECS keyboard instead of the hand controllers: the keys then type
 on the ECS. FujiNet's CONFIG has no ECS keyboard support yet, so while it is on,
-CONFIG's menus can only be driven by a gamepad or the Keypad window.
+CONFIG's menus can only be driven by a gamepad or the Controllers window.
 
 ## Gamepads
 
 Gamepads are picked up as they are plugged in, and can come and go at any
 time. A pad plays a hand controller, with its stick or D-pad on the disc and its
-buttons on the action buttons. Other buttons can be given jobs in the Keypad
-window.
+buttons on the action buttons. Other buttons can be given jobs in the Controllers
+window. A pad's choice of hand controller is remembered, and comes back when it
+is plugged in again. Gamepad trigger buttons can be given jobs too.
 
 ## Changing the controls
 
-The controls are changed in the Keypad window (<kbd>F9</kbd>): click **Map**,
-click a control (a key, an action button, a disc direction, or Reset Game or
-Reset to CONFIG), then press the keyboard key or the gamepad button to give it.
-The control's old key is taken from it. The map is kept in the settings, and only
-what differs from the defaults is written.
+The controls are changed in the Controllers window (<kbd>F9</kbd>): click
+**Map**, click a control (a key, an action button, a disc direction, or Reset
+Game, Reset to CONFIG or Stop in debugger), then press the keyboard key or the
+gamepad button to give it. The control's old key is taken from it. **Clear**
+takes the key and button off the control you pick, and **Defaults** puts every
+control back. **Show bindings** prints each control's key on the picture. The map
+is kept in the settings, and only what differs from the defaults is written.
+<kbd>F9</kbd>, <kbd>F10</kbd>, <kbd>F11</kbd> and <kbd>F12</kbd> belong to the app
+and cannot be given to a control.
 
-<!-- context: keypad -->
-# Keypad window
+There are 127 controls in all: for each of the four hand controllers (the two
+on the console and the ECS's two) 12 keypad keys, 3 action buttons and the 16
+disc positions, which is 124, and the three system controls: Reset Game, Reset
+to CONFIG and Stop in debugger. The controllers on the ECS only play when the
+ECS is fitted.
 
-The Keypad window (<kbd>F9</kbd>) shows both hand controllers side by side:
-the 3 × 4 keypad, the three action buttons and the 16-position disc of each, and
-a System row with Reset Game and Reset to CONFIG. It presses them with the
-mouse; on the disc, dragging while the button is down rolls the direction round
-as a thumb would, and the disc marks all 16 sectors and lights the one under the
-pointer.
+<!-- context: controllers -->
+# Controllers window
+
+The Controllers window (<kbd>F9</kbd>) draws the two hand controllers of an
+Intellivision II, with the console's reset button under them, and presses them
+with the mouse. It floats on its own at a fixed size. With the ECS fitted, the
+ECS's two hand controllers appear beside them (an ECS change needs a restart).
+Each controller shows its 3 × 4 keypad (the keys are outlined in red, as on the
+plastic), the 16-position disc, and the four side buttons: the two upper ones
+are the same Top button, so either presses it. The controls that are held light
+up in green, whoever holds them: the keyboard, a gamepad or the mouse.
 
 | With the mouse | Does |
 |---|---|
-| Press a control | Holds it for as long as the button is down |
-| Drag round the disc | Follows the pointer |
+| Press a key or a side button | Holds it for as long as the button is down |
+| Press and drag on the disc | Holds the direction under the pointer, one of 16 |
+| Press the console's RESET | Resets the game |
+
+Under the picture are buttons for **Reset to CONFIG** and **Stop in debugger**,
+which the console itself does not have. Each gamepad plugged in has a row to pick
+which hand controller it plays, and **Map**, **Clear**, **Defaults** and **Show bindings**
+change and show the controls (see
+[Changing the controls](#changing-the-controls)). The action buttons are crossed
+as jzIntv crosses them (see [Controllers and keys](#controllers-and-keys)).
 
 The console reads its controllers continuously, so a control is *held*, not
-pulsed, as the plastic one is. Keys typed in the Keypad window go to the console
-too. **Map** changes the controls (see
-[Changing the controls](#changing-the-controls)).
+pulsed, as the plastic one is. Keys typed in the Controllers window go to the
+console too. Switching to another window lets go of everything the mouse holds.
 
 <!-- context: ecskbd -->
 # ECS Keyboard window
 
-The ECS Keyboard window (<kbd>F10</kbd>) is an on-screen ECS keyboard: 48
-buttons covering every key of the ECS's own keyboard. It works whether or not
-Preferences ▸ **ECS Keyboard** is on, so opening it never changes that setting.
-**Shift** and **Ctrl** latch, because a mouse cannot hold two buttons to chord a
-shifted letter; the next key goes out with them held. It needs the ECS fitted.
+The ECS Keyboard window (<kbd>F10</kbd>) is an on-screen ECS keyboard drawn like
+the real one: 48 keys, with the shifted symbol above each, two Shift keys and a
+white Return. It works whether or not Preferences ▸ **ECS Keyboard** is on, so
+opening it never changes that setting. **Shift** and **Ctrl** latch, because a
+mouse cannot hold two buttons to chord a shifted letter: a latched key stays lit
+until you press it again, and the next key goes out with it held. Keys typed on
+the keyboard light their keys too. It needs the ECS fitted.
 
 # Machines
 
@@ -326,12 +348,6 @@ halves of this window.
 - **Intellivoice**: *Auto*, *Off* or *On* (setting `ivoice`).
 - **Video Standard**: *NTSC* or *PAL* (setting `video_standard`).
 
-## Input settings
-
-- **ECS Keyboard**: route the keyboard to the ECS keyboard instead of the hand
-  controllers (setting `keyboard_mode`). See
-  [The ECS keyboard](#the-ecs-keyboard).
-
 ## FujiNet settings
 
 - **Use external FujiNet**: skip the built-in FujiNet and dial another instance
@@ -354,8 +370,24 @@ The ROMs page lists the ROMs the console needs and whether each is imported:
 
 The settings file is `settings.ini` (see [Files and folders](#files-and-folders)).
 Each setting above names its key. The others are `cart` (the opened cartridge),
-`sym_dir` (where the debugger last loaded symbols from) and `bindings` (the
-controls that differ from the defaults).
+`sym_dir` (where the debugger last loaded symbols from), `controllers_show_bindings`
+and `bindings` (the controls that differ from the defaults).
+
+<!-- context: prefs/Input -->
+## Input settings
+
+- **ECS Keyboard**: route the keyboard to the ECS keyboard instead of the hand
+  controllers (setting `keyboard_mode`). See
+  [The ECS keyboard](#the-ecs-keyboard).
+- **Enable gamepads**: poll USB and Bluetooth gamepads (setting
+  `enable_gamepad`). A change applies when the app restarts.
+- **Gamepads** lists each one plugged in, and which hand controller it plays.
+  A new gamepad plays the left controller, the next the right one; choose *Left*,
+  *Right*, or with the ECS fitted *ECS Left* or *ECS Right*, or *Automatic*. The
+  choice is remembered for that gamepad (setting `pad_assign`) and comes back
+  when it is plugged in again.
+- **Reset Controls** puts every key and button back to its default.
+- **Open Controllers** shows the Controllers window.
 
 # Debugger
 
@@ -595,12 +627,12 @@ In the data folder:
 - **link down**: FujiNet is off, not started yet, or the external address is
   wrong. Check Preferences ▸ FujiNet.
 - **CONFIG will not take the keyboard**: ECS Keyboard is on, and CONFIG does not
-  read the ECS keyboard. Turn it off, or use a gamepad or the Keypad window.
+  read the ECS keyboard. Turn it off, or use a gamepad or the Controllers window.
 - **Keys don't reach the console**: a dialog or another window is in front, or
   the key is one the app keeps (see
   [Controllers and keys](#controllers-and-keys)).
 - **A game never sees the controller**: a control must be held, not tapped in an
-  instant. The Keypad window holds a control as long as the button is down.
+  instant. The Controllers window holds a control as long as the button is down.
 - **A port is taken**: another program is using 65503 or 64003. Close the other
   FujiNet, or point the app at it with **Use external FujiNet**.
 

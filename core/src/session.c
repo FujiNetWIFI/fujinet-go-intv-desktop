@@ -16,7 +16,9 @@
 #include "gamepad_sdl.h"
 #include "intv_audio.h"
 #include "intv_frame.h"
+#include "input_merge.h"
 #include "intv_host.h"
+#include "intvdebug.h"
 #include "session_internal.h"
 
 /* Both fixed at 48000 (config.h's DEFAULT_AUDIO_HZ on every desktop
@@ -37,6 +39,7 @@ intvsession *intvsession_new(const intvsession_paths *paths)
         return NULL;
     }
     settings_init(s);
+    pthread_mutex_init(&s->pad_event_mtx, NULL);
     /* Reloads the remappable-bindings table from this session's own
      * settings store -- process-global (like gamepad_sdl.c's own pad
      * table), but every intvsession_new should still see whatever this
@@ -54,6 +57,7 @@ void intvsession_free(intvsession *s)
         return;
     intvsession_stop(s);
     settings_free_all(s);
+    pthread_mutex_destroy(&s->pad_event_mtx);
     free(s);
 }
 
@@ -79,6 +83,17 @@ void intvsession_default_opts(intvsession *s, intvsession_start_opts *opts)
     opts->cart_path = intvsession_get_str(s, "cart", NULL);
     if (opts->cart_path && !opts->cart_path[0])
         opts->cart_path = NULL;
+    opts->enable_gamepad = intvsession_get_int(s, "enable_gamepad", 1);
+}
+
+int intvsession_ecs_on(intvsession *s)
+{
+    if (!s)
+        return 0;
+    if (s->ecs_started)
+        return s->ecs_on;
+    return intvsession_get_int(s, "ecs", INTVSESSION_HW_AUTO) ==
+           INTVSESSION_HW_ON;
 }
 
 const char *intvsession_cart_path(intvsession *s)
@@ -106,12 +121,14 @@ int intvsession_reset_to_config(intvsession *s)
 int intvsession_reset_game(intvsession *s)
 {
     (void)s;
-    /* gamepad_sdl.c's own last_disc[] cache has to be told first: it lives
-     * in the SDL-linked half of this port (jzintv_core itself stays
-     * SDL-free, see no_sdl_link_test), so this is the one place that can
-     * call both intv_gamepad_forget_disc and intv_host_reset -- see the
-     * former's own comment on why a stick/D-pad held across the reset
+    /* The reset zeroes the machine's pads, so every source's hold is let go
+     * with it (input_clear_all); gamepad_sdl.c's own last-sent cache has to be
+     * told too: it lives in the SDL-linked half of this port (jzintv_core
+     * itself stays SDL-free, see no_sdl_link_test), so this is the one place
+     * that can call both intv_gamepad_forget_disc and intv_host_reset -- see
+     * the former's own comment on why a stick/D-pad held across the reset
      * would otherwise leave the disc reading stuck centered. */
+    input_clear_all();
     intv_gamepad_forget_disc();
     intv_host_reset();
     return 0;
@@ -122,6 +139,18 @@ int intvsession_sysaction_fire(intvsession *s, intvsession_sysaction a)
     switch (a) {
     case INTVSESSION_SYSACT_RESET_GAME:   return intvsession_reset_game(s);
     case INTVSESSION_SYSACT_RESET_CONFIG: return intvsession_reset_to_config(s);
+    case INTVSESSION_SYSACT_DEBUG_STOP:
+    {
+        /* Engage the debugger and stop at the next instruction; a frontend's
+         * debugger window follows the stop serial. A no-op when no machine
+         * runs. */
+        intvdebug *dbg = intvdebug_get();
+        if (!intv_host_is_running() || !dbg)
+            return 0;
+        intvdebug_set_engaged(dbg, 1);
+        intvdebug_pause(dbg);
+        return 0;
+    }
     default:                             return -1;
     }
 }
@@ -243,6 +272,13 @@ int intvsession_start(intvsession *s, const intvsession_start_opts *opts)
     snprintf(s->boip_endpoint, sizeof(s->boip_endpoint), "%s:%d",
              s->boip_host, s->fujinet_port);
 
+    /* The machine is about to be built afresh, so nothing is held: the
+     * sources start empty. ECS on the Controllers window means ECS forced ON
+     * (Auto lets the cartridge decide, which the window cannot know). */
+    input_clear_all();
+    s->ecs_on = opts->ecs == INTVSESSION_HW_ON;
+    s->ecs_started = 1;
+
     intv_host_opts host_opts = {
         .rom_dir = s->roms_dir,
         .state_dir = s->data_dir,
@@ -262,7 +298,8 @@ int intvsession_start(intvsession *s, const intvsession_start_opts *opts)
      * neither is no audio device (session_set_error still records why, for
      * a frontend that wants to surface it, but silence over sound is far
      * less disruptive than refusing to boot). */
-    intv_gamepad_start();
+    if (opts->enable_gamepad)
+        intv_gamepad_start(s);
     audio_start(s);
     return 0;
 }
@@ -273,6 +310,7 @@ void intvsession_stop(intvsession *s)
     audio_stop(s);
     intv_host_stop();
     fujinet_stop(s);
+    input_clear_all();
     s->fujinet_external = 0;
 }
 
@@ -321,27 +359,19 @@ int intvsession_render_audio(intvsession *s, int16_t *dst, int max_samples)
     return n;
 }
 
-void intvsession_pad_key(intvsession *s, intvsession_pad_side side,
-                         intvsession_key key, int pressed)
-{
-    (void)s;
-    intv_host_pad_key((intv_pad_side)side, (intv_pad_key)key, pressed);
-}
-
-void intvsession_pad_disc(intvsession *s, intvsession_pad_side side,
-                          int direction)
-{
-    (void)s;
-    intv_host_pad_disc((intv_pad_side)side, direction);
-}
-
 void intvsession_ecs_key_set(intvsession *s, intvsession_ecs_key key,
                              int pressed)
 {
     (void)s;
     if (key < 0 || key >= INTVSESSION_ECS_KEY_NONE)
         return;
-    intv_host_ecs_key((intv_ecs_key)key, pressed);
+    input_ecs_set((int)key, pressed);
+}
+
+int intvsession_ecs_key_held(intvsession *s, intvsession_ecs_key key)
+{
+    (void)s;
+    return input_ecs_held((int)key);
 }
 
 void intvsession_ecs_keys_clear(intvsession *s)
@@ -351,7 +381,7 @@ void intvsession_ecs_keys_clear(intvsession *s)
      * ECS key nobody pressed. */
     if (s)
         memset(s->ecs_held, 0, sizeof(s->ecs_held));
-    intv_host_ecs_keys_clear();
+    input_ecs_clear();
 }
 
 /* See intvsession.h for the contract: why the release cannot simply
@@ -435,15 +465,28 @@ void intvsession_ecs_key_event(intvsession *s, uint32_t host_key,
     intvsession_ecs_key_set(s, key, 1);
 }
 
-void intvsession_pads_clear(intvsession *s)
+/* ---- gamepad hot-plug events ------------------------------------------------
+ * The pad thread reports a connect / disconnect here as text; a frontend that
+ * sees the generation change reads it back for a toast. */
+void session_gamepad_event(struct intvsession *s, const char *text)
 {
-    (void)s;
-    intv_host_pads_clear();
-    /* A gamepad holding a direction would otherwise stay released until it
-     * next CHANGES, since poll_sticks only writes the disc on a change --
-     * this is exactly what forget_disc exists for. Held gamepad *buttons*
-     * are edge-driven and do stay released until the next press; that is the
-     * same trade intvsession_ecs_keys_clear already makes, and a controller
-     * held down through a focus change is the rarer case than a key. */
-    intv_gamepad_forget_disc();
+    if (!s)
+        return;
+    pthread_mutex_lock(&s->pad_event_mtx);
+    snprintf(s->pad_event, sizeof s->pad_event, "%s", text ? text : "");
+    pthread_mutex_unlock(&s->pad_event_mtx);
+}
+
+int intvsession_gamepad_last_event(intvsession *s, char *dst, int dstsz)
+{
+    int len;
+    if (!dst || dstsz <= 0)
+        return 0;
+    dst[0] = '\0';
+    if (!s)
+        return 0;
+    pthread_mutex_lock(&s->pad_event_mtx);
+    len = snprintf(dst, (size_t)dstsz, "%s", s->pad_event);
+    pthread_mutex_unlock(&s->pad_event_mtx);
+    return len >= dstsz ? dstsz - 1 : len;
 }

@@ -52,6 +52,21 @@ struct intvsession {
 
     void *audio;   /* audio_sdl.c state */
 
+    /* ECS forced ON at the last start (the Controllers window's 4 handsets,
+     * pad sides 2 and 3); ecs_started says whether there was a start. */
+    int ecs_on;
+    int ecs_started;
+
+    /* ---- gamepad hot-plug (gamepad_sdl.c) --------------------------------
+     * The last connect / disconnect as toast text; the generation carries
+     * across a restart so a frontend's baseline never goes stale, and a
+     * restarted thread's first scan (which re-finds the same pads) is no
+     * hot-plug. */
+    pthread_mutex_t pad_event_mtx;
+    char pad_event[128];
+    unsigned pad_gen_base;
+    int pad_restarted;
+
     /* ---- ECS keyboard held keys (intvsession_ecs_key_event) -------------
      * Which ECS key each currently-held HOST key asserted, so the release
      * can clear that one rather than whatever the key resolves to at
@@ -89,6 +104,8 @@ int is_file(const char *path);
 int copy_file(const char *src, const char *dst);
 
 void session_set_error(struct intvsession *s, const char *fmt, ...);
+/* A gamepad connect / disconnect, as toast text (session.c). */
+void session_gamepad_event(struct intvsession *s, const char *text);
 
 /* ---- fujinet_runtime.c ---------------------------------------------- */
 int  fujinet_start(struct intvsession *s);

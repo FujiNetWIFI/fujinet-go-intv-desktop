@@ -18,21 +18,22 @@
 extern "C" {
 #endif
 
-/* Starts SDL's gamepad subsystem and the polling thread. Returns 0 on
- * success. Safe to call more than once (a no-op if already running). */
-int intv_gamepad_start(void);
+struct intvsession;
+
+/* Starts SDL's gamepad subsystem and the polling thread. `s` supplies the
+ * settings store (pad_assign), the hot-plug toast text and the ECS state (pad
+ * sides 2 and 3); NULL works without them (tests). Returns 0 on success. Safe
+ * to call more than once (a no-op if already running). */
+int intv_gamepad_start(struct intvsession *s);
 void intv_gamepad_stop(void);
 
-/* Clears every pad slot's per-side "last direction sent" cache (poll_sticks'
- * own last_disc[]) back to a value neither intv_disc_from_stick nor
- * intv_disc_from_dpad can ever return, so the very next poll re-asserts the
- * disc's state -- including centered -- even if the stick/D-pad hasn't
- * physically moved. Call after anything that resets the emulated disc out
- * from under poll_sticks' own bookkeeping (session.c's intvsession_reset_
- * game does, via intv_host_reset -- see that function): otherwise a stick or
- * D-pad still held at the moment of reset reads as "unchanged" on every
- * subsequent poll and the disc stays stuck centered in the machine until
- * the player physically releases and re-presses it. */
+/* Resets every pad slot's "last disc position sent" cache to "none", so the
+ * very next poll re-asserts a stick or D-pad still held. Call right after
+ * input_clear_all (session.c's intvsession_reset_game does, around
+ * intv_host_reset): otherwise a stick or D-pad still held at the moment of
+ * reset reads as "unchanged" on every subsequent poll and the disc stays
+ * stuck centered in the machine until the player physically releases and
+ * re-presses it. */
 void intv_gamepad_forget_disc(void);
 
 /* Pure functions -- see gamepad_sdl.c for the full contract of each;

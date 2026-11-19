@@ -300,6 +300,9 @@ add_library(intv_session STATIC
   src/bindings.c
   src/hid_keys.c
   src/disc_geom.c
+  src/input.c
+  src/controls.c
+  src/pad_assign.c
   src/gamepad_sdl.c
   src/audio_sdl.c
   src/fujinet_runtime.c
@@ -427,6 +430,22 @@ target_link_libraries(gamepad_test intv_session)
 
 add_executable(disc_test tests/disc_test.c)
 target_link_libraries(disc_test intv_session)
+
+# The Controllers window's layout and hit tests, the input source layer, the
+# remembered pad table and the SDL virtual-joystick pad test. input_test reads
+# the machine's pad_t directly and needs the private input_merge.h.
+add_executable(controls_test tests/controls_test.c)
+target_link_libraries(controls_test intv_session)
+if(NOT WIN32)
+  target_link_libraries(controls_test m)
+endif()
+add_executable(input_test tests/input_test.c)
+target_link_libraries(input_test intv_session)
+target_include_directories(input_test PRIVATE src)
+add_executable(pad_assign_test tests/pad_assign_test.c src/pad_assign.c)
+target_include_directories(pad_assign_test PRIVATE src)
+add_executable(gamepad_map_test tests/gamepad_map_test.c)
+target_link_libraries(gamepad_map_test intv_session SDL3::SDL3)
 target_include_directories(gamepad_test PRIVATE src)
 
 add_executable(fujibus_smoke tests/fujibus_smoke.c)
@@ -532,6 +551,12 @@ add_test(NAME audio COMMAND audio_test)
 add_test(NAME audio_ring COMMAND audio_ring_test)
 add_test(NAME gamepad COMMAND gamepad_test)
 add_test(NAME disc COMMAND disc_test)
+add_test(NAME controls COMMAND controls_test)
+add_test(NAME input COMMAND input_test)
+add_test(NAME pad_assign COMMAND pad_assign_test)
+add_test(NAME gamepad_map COMMAND gamepad_map_test)
+set_tests_properties(gamepad_map PROPERTIES SKIP_RETURN_CODE 77
+                     ENVIRONMENT "SDL_AUDIODRIVER=dummy" TIMEOUT 300)
 add_test(NAME fujibus_smoke COMMAND fujibus_smoke)
 add_test(NAME hostport COMMAND hostport_test)
 add_test(NAME exe_dir_lib COMMAND exe_dir_lib_test)

@@ -123,6 +123,35 @@ int main(void)
               intv_pad_for_port(bindings, 2, INTVSESSION_PAD_LEFT) == 0);
     }
 
+    {
+        /* Pad A explicitly Left, pad B automatic: B takes Right, the free side. */
+        int bindings[2] = {INTVSESSION_PAD_LEFT, -1};
+        check("explicit left: pad 0 drives left",
+              intv_pad_for_port(bindings, 2, INTVSESSION_PAD_LEFT) == 0);
+        check("explicit left: the automatic pad drives right",
+              intv_pad_for_port(bindings, 2, INTVSESSION_PAD_RIGHT) == 1);
+    }
+    {
+        /* ECS on: A explicit Left, B and C automatic fill Right then ECS-left. */
+        int bindings[3] = {INTVSESSION_PAD_LEFT, -1, -1};
+        check("explicit left + 2 auto: right is pad 1",
+              intv_pad_for_port(bindings, 3, INTVSESSION_PAD_RIGHT) == 1);
+        check("explicit left + 2 auto: ECS-left is pad 2",
+              intv_pad_for_port(bindings, 3, INTVSESSION_PAD_ECS_LEFT) == 2);
+        check("explicit left + 2 auto: ECS-right is free",
+              intv_pad_for_port(bindings, 3, INTVSESSION_PAD_ECS_RIGHT) == -1);
+    }
+    {
+        /* A explicit ECS-left: the automatic pads still fill Left, Right. */
+        int bindings[3] = {INTVSESSION_PAD_ECS_LEFT, -1, -1};
+        check("explicit ECS-left: first auto drives left",
+              intv_pad_for_port(bindings, 3, INTVSESSION_PAD_LEFT) == 1);
+        check("explicit ECS-left: second auto drives right",
+              intv_pad_for_port(bindings, 3, INTVSESSION_PAD_RIGHT) == 2);
+        check("explicit ECS-left: pad 0 drives ECS-left",
+              intv_pad_for_port(bindings, 3, INTVSESSION_PAD_ECS_LEFT) == 0);
+    }
+
     /* ---- pad_button_from_sdl ----
      * Raw values below are SDL3's own SDL_GamepadButton numbering
      * (SDL_GAMEPAD_BUTTON_SOUTH=0, EAST=1, ... DPAD_RIGHT=14) -- written as
@@ -158,12 +187,12 @@ int main(void)
     check("an out-of-range value has no SDL button",
           sdl_button_from_pad((intvsession_pad_button)99) == -1);
     {
-        /* Every named button round-trips through both tables -- the two
+        /* Every named SDL button round-trips through both tables -- the two
          * are hand-written in opposite directions specifically so a typo
          * in one doesn't silently mirror into the other; this is what
          * actually catches that. */
         int b, ok = 1;
-        for (b = 0; b < INTVSESSION_PAD_BTN_COUNT; b++) {
+        for (b = 0; b < INTVSESSION_PAD_BTN_LEFT_TRIGGER; b++) {
             int sdl = sdl_button_from_pad((intvsession_pad_button)b);
             if (sdl < 0 || pad_button_from_sdl((uint8_t)sdl) != (intvsession_pad_button)b)
                 ok = 0;
@@ -174,12 +203,12 @@ int main(void)
     }
 
     /* ---- SDL subsystem lifecycle, no hardware required ---- */
-    check("gamepad subsystem starts", intv_gamepad_start() == 0);
+    check("gamepad subsystem starts", intv_gamepad_start(NULL) == 0);
     check("no pads on a CI machine with none attached",
           intvsession_gamepad_count(NULL) == 0);
     intv_gamepad_stop();
     /* Starting and stopping again should be equally clean. */
-    check("restart is clean", intv_gamepad_start() == 0);
+    check("restart is clean", intv_gamepad_start(NULL) == 0);
     intv_gamepad_stop();
 
     if (failed) {

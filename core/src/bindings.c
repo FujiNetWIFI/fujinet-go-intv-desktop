@@ -316,6 +316,16 @@ static void pack_locked(char *buf, size_t bufsz)
     }
 }
 
+/* F9 (the Controllers window), F10 (the ECS keyboard window), F11 (full
+ * screen) and F12 (the debugger) belong to the frontends: no binding can take
+ * them. They reach the core as HID-band keysyms (usage 0x42..0x45, Keyboard
+ * F9..F12). */
+int intvsession_key_reserved(uint32_t keysym)
+{
+    return keysym >= INTVSESSION_KEYSYM_HID_BASE + 0x42u &&
+           keysym <= INTVSESSION_KEYSYM_HID_BASE + 0x45u;
+}
+
 static void apply_persisted_locked(struct intvsession *s)
 {
     char buf[PACKED_BUF_SIZE];
@@ -336,8 +346,12 @@ static void apply_persisted_locked(struct intvsession *s)
             continue;
         if (side < 0 || side >= NUM_SIDES || slot < 0 || slot >= NUM_SLOTS)
             continue;
-        if (kind == 'k')
+        if (kind == 'k') {
+            /* a stored F9-F12 is dropped: the slot keeps its default */
+            if (intvsession_key_reserved((uint32_t)val))
+                continue;
             s_table[side][slot].keysym = norm_keysym((uint32_t)val);
+        }
         else if (kind == 'p')
             s_table[side][slot].button = (intvsession_pad_button)val;
     }
@@ -559,6 +573,7 @@ const char *intvsession_sysaction_name(intvsession_sysaction a)
     switch (a) {
     case INTVSESSION_SYSACT_RESET_GAME:   return "Reset Game";
     case INTVSESSION_SYSACT_RESET_CONFIG: return "Reset to CONFIG";
+    case INTVSESSION_SYSACT_DEBUG_STOP:   return "Stop in debugger";
     default:                             return "?";
     }
 }
@@ -584,6 +599,8 @@ const char *intvsession_pad_button_name(intvsession_pad_button button)
     case INTVSESSION_PAD_BTN_DPAD_DOWN:      return "D-Pad Down";
     case INTVSESSION_PAD_BTN_DPAD_LEFT:      return "D-Pad Left";
     case INTVSESSION_PAD_BTN_DPAD_RIGHT:     return "D-Pad Right";
+    case INTVSESSION_PAD_BTN_LEFT_TRIGGER:   return "Left Trigger";
+    case INTVSESSION_PAD_BTN_RIGHT_TRIGGER:  return "Right Trigger";
     default:                                break;
     }
 
@@ -768,6 +785,8 @@ void intvsession_target_set_key(intvsession *s, intvsession_key_mapping target,
     /* norm_keysym: stored, scanned and compared canonically -- see that
      * function's own comment. */
     keysym = norm_keysym(keysym);
+    if (intvsession_key_reserved(keysym))
+        return;
 
     pthread_mutex_lock(&s_mtx);
     cur = resolve_keysym_locked(keysym);
@@ -875,4 +894,37 @@ void intvsession_bindings_reset(intvsession *s)
     reset_to_defaults_locked();
     pthread_mutex_unlock(&s_mtx);
     intvsession_set_str(s, "bindings", "");
+}
+
+/* Unbinds both slots of a target. */
+void intvsession_binding_clear(intvsession *s, intvsession_key_mapping target)
+{
+    int slot;
+    if (target.side < 0 || target.side >= NUM_SIDES)
+        return;
+    slot = slot_for_target(target);
+    if (slot < 0)
+        return;
+    pthread_mutex_lock(&s_mtx);
+    s_table[target.side][slot].keysym = 0;
+    s_table[target.side][slot].button = INTVSESSION_PAD_BTN_NONE;
+    persist_locked_then(s); /* unlocks s_mtx */
+}
+
+/* ---- the target list ------------------------------------------------------ */
+
+int intvsession_target_count(void)
+{
+    return INTVSESSION_TARGET_COUNT;
+}
+
+intvsession_key_mapping intvsession_target_from_index(int idx)
+{
+    const int per_side = INTVSESSION_KEY_COUNT + INTVSESSION_DISC_POSITIONS;
+    if (idx < 0 || idx >= INTVSESSION_TARGET_COUNT)
+        return none_mapping();
+    if (idx >= NUM_SIDES * per_side)
+        return intvsession_target_sysaction(
+            (intvsession_sysaction)(idx - NUM_SIDES * per_side));
+    return target_for_slot(idx / per_side, idx % per_side);
 }

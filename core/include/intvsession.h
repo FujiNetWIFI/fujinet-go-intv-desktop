@@ -34,6 +34,45 @@ extern "C" {
 #define INTVSESSION_ACCENT_INK_RGB 0xFFFFFF
 #define INTVSESSION_ACCENT_LIGHT_RGB 0x7BC653
 
+/* ---- the Controllers window's colours (DESIGN-intv.md; photo-sampled or
+ * inferred, +/- 10%). One definition for the four toolkits. 0xRRGGBB. ------ */
+/* the Intellivision II handset */
+#define INTVSESSION_HANDSET_RGB      0xCFCBB8 /* body plastic */
+#define INTVSESSION_BEVEL_RGB        0xE4E1D2 /* bevel highlight */
+#define INTVSESSION_SHADE_RGB        0xA39F8E /* shadow edge */
+#define INTVSESSION_CABLE_RGB        0x0E0E0E
+#define INTVSESSION_KEYPAD_RGB       0x1A1816 /* black keypad plate */
+#define INTVSESSION_KEYFACE_RGB      0x141312 /* a keypad key's face */
+#define INTVSESSION_KEYRED_RGB       0xE04A32 /* a keypad key's red outline */
+#define INTVSESSION_LEGEND_RGB       0xF2F0EA /* white legends */
+#define INTVSESSION_CARD_EDGE_RGB    0xB3AE9B /* the overlay card's edge line */
+#define INTVSESSION_DISC_RGB         0x1C1D1B /* the disc's black pad */
+#define INTVSESSION_DISC_RING_RGB    0x2A2B29 /* the faint lathe ring on it */
+#define INTVSESSION_RING_RGB         0xD8D3BC /* the cream ring around it */
+#define INTVSESSION_TAB_RGB          0xBDB9A6 /* a side button */
+#define INTVSESSION_TAB_EDGE_RGB     0x8F8B7A
+#define INTVSESSION_TAB_LEGEND_RGB   0x6E6A5A
+/* the console strip */
+#define INTVSESSION_CONSOLE_RGB      0xC9C5B5
+#define INTVSESSION_BAND_RGB         0x0A0B0D /* the black label band */
+#define INTVSESSION_MATTEL_RED_RGB   0xC8362A
+#define INTVSESSION_BLOCK_RGB        0x34373A /* the ON/OFF + RESET block */
+#define INTVSESSION_BLOCK_LEGEND_RGB 0x8A8D90 /* its dim legends */
+#define INTVSESSION_LED_RGB          0x7A1A14
+#define INTVSESSION_GRILLE_RGB       0xA29F92
+/* the ECS keyboard */
+#define INTVSESSION_ECS_CASE_RGB     0xD2CCB6
+#define INTVSESSION_ECS_PLATE_RGB    0xC4BEA8 /* the inset key plate */
+#define INTVSESSION_ECS_RIDGE_RGB    0xB9B39E /* the ventilation ridges */
+#define INTVSESSION_ECS_LABEL_RGB    0x3A2F36 /* the label plate */
+#define INTVSESSION_ECS_KEY_RGB      0x1B1D22
+#define INTVSESSION_ECS_RTN_RGB      0xECEAE2 /* the white RTN cap */
+#define INTVSESSION_ECS_RTN_INK_RGB  0x111111
+#define INTVSESSION_ECS_PINSTRIPE_RGB 0xC8362A
+/* a held part: ring 0.18 u and a 40% fill in this; on a black key the solid
+ * fill with the legend turned black */
+#define INTVSESSION_HELD_RGB         INTVSESSION_ACCENT_LIGHT_RGB
+
 /* Fixed geometry -- unlike the CoCo's, the Intellivision's STIC output does
  * not vary at runtime. See core/jzintv/intv_frame.h. */
 #define INTVSESSION_FB_WIDTH  160
@@ -92,7 +131,8 @@ enum {
 };
 
 /* Read by intvsession_start; filled from the settings store (keys "ecs",
- * "ivoice", "video_standard", "fujinet_external", "fujinet_external_addr") by intvsession_default_opts so every frontend
+ * "ivoice", "video_standard", "fujinet_external", "fujinet_external_addr", "enable_gamepad") by
+ * intvsession_default_opts so every frontend
  * builds the same options the same way -- see that function's own comment
  * for the exact keys and defaults. */
 typedef struct {
@@ -111,6 +151,10 @@ typedef struct {
                             * (see that function) -- callers that persist a
                             * "last loaded cartridge" do so themselves and
                             * set this field explicitly. */
+    int enable_gamepad; /* 1: start the SDL gamepad thread. Read from the
+                         * settings key "enable_gamepad" (default 1) by
+                         * intvsession_default_opts; a hand-built struct
+                         * must set it. A change needs a restart. */
 } intvsession_start_opts;
 
 /* Fills *opts from the settings store: ecs/ivoice default to
@@ -237,11 +281,63 @@ typedef enum {
                           * every mappable button. */
 } intvsession_key;
 
+/* ---- input sources ----------------------------------------------------------
+ * Every way of holding a controller input is a SOURCE of its own, and the
+ * machine sees their merge, under a leaf mutex. So letting go of one source
+ * (a key release, the window's mouse, an unplugged pad) can only ever release
+ * what that source itself held: a key release no longer drops a direction a
+ * pad is holding. Sources: the host keyboard, the Controllers window's
+ * pointer, and for each connected pad (by its stable owner number) its
+ * buttons / D-pad / hat and its analog stick separately.
+ *
+ * Keys (the 12 keypad keys and 3 action buttons) merge as a plain OR. The disc
+ * is ONE position, so its sources are ranked instead: the pointer wins over a
+ * pad's buttons / D-pad / hat (a disc-bound button), which wins over a pad's
+ * stick, which wins over the keyboard; among equals the source that set its
+ * position last wins, and a source that lets go falls back to the next one
+ * still holding a position. The merged value reaches the machine only when it
+ * changes.
+ *
+ * Held state is read from this table, NEVER from the decoded pad byte: on real
+ * hardware a keypad press also grounds disc and button lines, so lighting
+ * parts from the machine's side would show phantom presses. */
+
+/* The KEYBOARD source (the original API; frontends call these from their key
+ * handlers). direction: 0-15 (0 = East, counter-clockwise), or -1 to centre.
+ * The keyboard holds one disc position: the last write wins. */
 void intvsession_pad_key(intvsession *s, intvsession_pad_side side,
                          intvsession_key key, int pressed);
-/* direction: 0-15 clock position (0 = East, clockwise), or -1 to center. */
 void intvsession_pad_disc(intvsession *s, intvsession_pad_side side,
                           int direction);
+
+/* The Controllers window's POINTER source: one press-and-drag gesture holds at
+ * most one key / action button and / or one disc position, on one side.
+ * `key` is an intvsession_key or -1 for none; `disc` is 0-15 or -1 for none.
+ * A call replaces whatever the pointer held before, on any side, so dragging
+ * from one handset to another needs no release in between; (side, -1, -1)
+ * lets go of everything the pointer holds. */
+void intvsession_pointer_set(intvsession *s, intvsession_pad_side side,
+                             int key, int disc);
+
+/* Letting go. release_all is for focus loss and for entering Map mode: the
+ * KEYBOARD's and the POINTER's holds on every side. The pads' holds stay (each
+ * pad knows when it lets go). release_pointer / release_keyboard are the two
+ * halves; clear_held is release_all by another name. intvsession_pads_clear
+ * (the old focus-loss call) is also release_all now. */
+void intvsession_release_all(intvsession *s);
+void intvsession_release_pointer(intvsession *s);
+void intvsession_release_keyboard(intvsession *s);
+void intvsession_clear_held(intvsession *s);
+
+/* What a side holds right now, every source merged. buttons_held: a bitmask,
+ * bit (1 << intvsession_key) for each of the 15 keys. disc_held: the winning
+ * disc position 0-15, or -1 when no source holds one. target_held: 1 if a
+ * Map target is held (MAP_KEY: that key on that side; MAP_DISC: that disc
+ * position is the merged one; MAP_SYSACT / MAP_NONE: 0, a system action is a
+ * click, not a hold). Light a part when its held bit is set, a disc sector
+ * when disc_held == its position. */
+unsigned intvsession_buttons_held(intvsession *s, intvsession_pad_side side);
+int      intvsession_disc_held(intvsession *s, intvsession_pad_side side);
 
 /* ---- disc geometry, shared by every frontend's clickable disc widget ----
  * Pure, no session needed (same shape as intvsession_key_from_keysym below).
@@ -372,12 +468,23 @@ void intvsession_ecs_keys_clear(intvsession *s);
 void intvsession_ecs_key_event(intvsession *s, uint32_t host_key,
                                uint32_t keysym, uint32_t ch, int down);
 
-/* The hand-controller equivalent: releases every keypad/action key and both
- * discs on all four sides. A frontend should call BOTH on losing keyboard
- * focus -- the WM_KEYUP/key-release for whatever was held goes to whoever
- * took focus, so without this a held key stays down forever. (A gamepad
- * holding a direction is re-asserted on its next poll; a gamepad button held
- * across the focus change is released until its next press.) */
+/* 1 while the ECS key is down in the emulated matrix (set by
+ * intvsession_ecs_key_set / _ecs_key_event, cleared by _ecs_keys_clear). A
+ * latched SHIFT or CTL stays 1 until it is clicked again or cleared. Light a
+ * key cap from this; both SHIFT caps of the ECS layout share
+ * INTVSESSION_ECS_KEY_SHIFT, so both light. Shifted symbols (past
+ * PHYSICAL_COUNT) report their own entry. 0 for an out-of-range key. */
+int intvsession_ecs_key_held(intvsession *s, intvsession_ecs_key key);
+
+/* 1 when the session was (or, before the first start, will be) started with
+ * ECS forced ON: the Controllers window then draws 4 handsets, and pads can
+ * be assigned to sides 2 and 3. A change to the "ecs" setting takes effect at
+ * the next intvsession_start. Pass the same value to
+ * intvsession_controls_layout. */
+int intvsession_ecs_on(intvsession *s);
+
+/* Old focus-loss call, kept for the frontends: now exactly
+ * intvsession_release_all (keyboard + pointer; the pads' holds stay). */
 void intvsession_pads_clear(intvsession *s);
 
 /* ---- audio ------------------------------------------------------------
@@ -394,8 +501,8 @@ int intvsession_render_audio(intvsession *s, int16_t *dst, int max_samples);
  * A pure function (no session state, no threading) shared by every frontend,
  * the same way cocosession's coco_key_from_event is: a frontend translates
  * its toolkit's key event to one of the symbols below, looks up the mapping,
- * and calls intvsession_pad_key/intvsession_pad_disc with the result. F10,
- * F11 and F12 are reserved for the frontends (movie/screenshot/debugger in
+ * and calls intvsession_pad_key/intvsession_pad_disc with the result. F9
+ * (Controllers window), F10 (ECS keyboard window), F11 and F12 are reserved for the frontends (movie/screenshot/debugger in
  * upstream jzIntv's own default bindings -- see src/cfg/mapping.c's
  * cfg_key_bind table) and are deliberately NOT in this table.
  *
@@ -513,6 +620,10 @@ uint32_t intvsession_keysym_from_hid(uint32_t usage);
 typedef enum {
     INTVSESSION_SYSACT_RESET_GAME = 0,   /* intvsession_reset_game */
     INTVSESSION_SYSACT_RESET_CONFIG,     /* intvsession_reset_to_config */
+    INTVSESSION_SYSACT_DEBUG_STOP,       /* engage the debugger and pause the
+                                          * machine at the next instruction
+                                          * (appended: persisted slot numbers
+                                          * never shift) */
     INTVSESSION_SYSACT_COUNT
 } intvsession_sysaction;
 
@@ -617,6 +728,11 @@ typedef enum {
     INTVSESSION_PAD_BTN_LEFT_SHOULDER, INTVSESSION_PAD_BTN_RIGHT_SHOULDER,
     INTVSESSION_PAD_BTN_DPAD_UP, INTVSESSION_PAD_BTN_DPAD_DOWN,
     INTVSESSION_PAD_BTN_DPAD_LEFT, INTVSESSION_PAD_BTN_DPAD_RIGHT,
+    /* The analog triggers as buttons (down at 0.5 of the travel). They are
+     * axes in SDL, so they have no SDL_GamepadButton: pad_button_from_sdl /
+     * sdl_button_from_pad do not know them. Appended, so persisted button
+     * numbers never shift. */
+    INTVSESSION_PAD_BTN_LEFT_TRIGGER, INTVSESSION_PAD_BTN_RIGHT_TRIGGER,
     INTVSESSION_PAD_BTN_COUNT,
 
     /* ---- raw joystick bands ----------------------------------------------
@@ -689,6 +805,31 @@ void intvsession_target_set_button(intvsession *s, intvsession_key_mapping targe
  * upstream default and persists that. */
 void intvsession_bindings_reset(intvsession *s);
 
+/* Unbinds both the keyboard key and the gamepad button of a target (the
+ * Controllers window's Clear). Persists. A bad target is ignored. */
+void intvsession_binding_clear(intvsession *s, intvsession_key_mapping target);
+
+/* 1 for a keysym the frontends keep for themselves and no binding can take:
+ * F9 (the Controllers window), F10 (the ECS keyboard window), F11 (full
+ * screen) and F12 (the debugger), as the HID-band keysyms
+ * (INTVSESSION_KEYSYM_HID_BASE + usage 0x42..0x45). set_key ignores one; a
+ * stored one is dropped on load. */
+int intvsession_key_reserved(uint32_t keysym);
+
+/* Every Map target: 4 sides x (15 keys + 16 disc positions) + the system
+ * actions = 127 ("127 in all"). The index order is side-major (keys, then
+ * disc positions), the system actions last. Persisted as "side.slot"
+ * strings whose slot numbers only ever grow by appending. */
+#define INTVSESSION_TARGET_COUNT \
+    (4 * (INTVSESSION_KEY_COUNT + INTVSESSION_DISC_POSITIONS) + \
+     INTVSESSION_SYSACT_COUNT)
+int intvsession_target_count(void);
+/* The idx-th target (0 .. count - 1), MAP_NONE out of range. */
+intvsession_key_mapping intvsession_target_from_index(int idx);
+
+/* 1 if the target is held right now (see intvsession_buttons_held). */
+int intvsession_target_held(intvsession *s, intvsession_key_mapping target);
+
 /* Same contract as intvsession_key_from_keysym, but honouring the bindings
  * table: returns keysym's current target, MAP_KEY or MAP_DISC, wherever it
  * has been remapped to (including when keysym's *default* target has been
@@ -720,7 +861,7 @@ const char *intvsession_pad_side_name(intvsession_pad_side side); /* "Left" */
 /* "East", "ENE", "Northeast", ... one of the 16 compass/half-step names for
  * a disc clock position (0-15); "?" out of range. */
 const char *intvsession_disc_dir_name(int direction);
-/* "Reset Game" / "Reset to CONFIG"; "?" out of range. */
+/* "Reset Game" / "Reset to CONFIG" / "Stop in debugger"; "?" out of range. */
 const char *intvsession_sysaction_name(intvsession_sysaction a);
 
 /* Names a target itself, e.g. "Left 5", "Left disc East", "Right disc ENE",
@@ -819,13 +960,130 @@ const char *intvsession_fujinet_webui_url(const intvsession *s);
  * returns the number of bytes written (excluding the NUL). */
 int         intvsession_fujinet_copy_log(intvsession *s, char *dst, int max);
 
+/* ---- the on-screen controllers ---------------------------------------------
+ * One layout for every toolkit (DESIGN-intv.md), in layout units "u" from the
+ * top-left, +y down: two Intellivision II handsets, four when ecs_on (sides 2
+ * and 3 as "ECS 1" / "ECS 2"), over the console strip. Each handset slot is
+ * 11 u wide with a 1 u gap, so the extent is 23 x 27.3 u (47 x 27.3 with ECS);
+ * the HEIGHT is the same either way, so the window never changes height. Keep
+ * the scale >= 17 px/u. The table is static, valid for the process, in PAINT
+ * ORDER (later entries are drawn over earlier ones).
+ *
+ * Per handset (body 10 x 20 u): CAPTION "Player 1" (in a 2 u row above),
+ * BODY "Cable", BODY "Handset", BODY "Keypad" (the black plate), BODY "Card"
+ * (the overlay card's edge line), 12 KEY (1 2 3 / 4 5 6 / 7 8 9 / clear 0
+ * enter), BODY "Ring" (the cream ring), DISC, and four ACTION tabs: the upper
+ * two (label "T", one each side) are BOTH ACTION_TOP, the lower left ("L") is
+ * ACTION_LOWER_LEFT and the lower right ("R") is ACTION_LOWER_RIGHT; they
+ * protrude 0.4 u beyond the body. Then the console strip: BODY "Console",
+ * BODY "Band" + CAPTIONs "INTELLIVISION II" and "MATTEL ELECTRONICS",
+ * BODY "RedLine", BODY "Grille", BODY "Block", BODY "OnOff" (dimmed, no
+ * target), BUTTON "RESET" (= Reset Game), BODY "Led". Draw each BODY by its
+ * `label`; the colours are the INTVSESSION_*_RGB defines.
+ *
+ * How to drive and light each kind:
+ *  - KEY, ACTION (rounded rectangles, radius 0.4 / 0.3 u): press and release
+ *    with intvsession_pointer_set(side, target, -1) / (side, -1, -1); lit
+ *    while (intvsession_buttons_held(side) >> target) & 1. A KEY lights solid
+ *    with the legend turned black; an ACTION tab by its ring.
+ *  - DISC (round, hit radius 2.8 u = w / 2 about the centre, with the shared
+ *    22% dead centre): press and drag; intvsession_controls_disc_dir(c, x, y)
+ *    gives the sector 0-15 (or -1 in the centre) to feed
+ *    intvsession_pointer_set(side, -1, dir). Light the wedge of
+ *    intvsession_disc_held(side) from 0.22 to 1.0 of the radius.
+ *  - BUTTON: a click fires the system action in `target`
+ *    (intvsession_sysaction_fire); a momentary flash on press is the
+ *    frontend's. "Reset to CONFIG" and "Stop in debugger" are not drawn
+ *    here: put them as plain buttons below the picture.
+ *  - CAPTION: text; `label`. BODY: drawn only.
+ * The action buttons are crossed by design (the right-hand modifier keys
+ * drive the LEFT controller): say so in the window's caption row. */
+typedef enum {
+    INTVSESSION_CTL_CAPTION = 0,
+    INTVSESSION_CTL_BODY,
+    INTVSESSION_CTL_KEY,    /* a keypad key; target = intvsession_key */
+    INTVSESSION_CTL_ACTION, /* a side tab; target = an ACTION_* intvsession_key */
+    INTVSESSION_CTL_DISC,   /* the disc; target -1 */
+    INTVSESSION_CTL_BUTTON  /* the console RESET; target = intvsession_sysaction */
+} intvsession_control_kind;
+
+typedef struct {
+    int kind;            /* intvsession_control_kind */
+    const char *label;   /* "5", "clear", "T", "RESET", "Handset", "Player 1" */
+    const char *legend;  /* a hint ("top button"), or NULL */
+    int side;            /* intvsession_pad_side 0-3, -1 for the console */
+    int target;          /* see the kinds; -1 for the rest */
+    float x, y, w, h;
+} intvsession_control;
+
+/* The layout (static; *n its entry count, *width / *height its extent in u;
+ * any out pointer may be NULL). Use intvsession_ecs_on(s) for ecs_on. */
+const intvsession_control *intvsession_controls_layout(int ecs_on, int *n,
+                                                       float *width,
+                                                       float *height);
+/* The topmost pressable part (KEY, ACTION, DISC, BUTTON) under a point in
+ * layout units, as an index into the layout, or -1. The disc is a circle. */
+int intvsession_controls_hit(int ecs_on, float x, float y);
+/* The Map target a control drives: MAP_KEY for KEY / ACTION (with its side),
+ * MAP_SYSACT for BUTTON, MAP_NONE for the rest (the disc's target is its
+ * sector: intvsession_target_disc(side, dir)). */
+intvsession_key_mapping intvsession_control_target(const intvsession_control *ctl);
+/* The sector 0-15 of a point on a DISC control, or -1 in its dead centre or
+ * for any other kind. */
+int intvsession_controls_disc_dir(const intvsession_control *ctl, float x,
+                                  float y);
+
+/* ---- the ECS keyboard (the F10 window) -------------------------------------
+ * 48 physical keys in the order of the real keyboard (DESIGN-intv.md section
+ * 4), plus a second SHIFT cap: both map to INTVSESSION_ECS_KEY_SHIFT. The
+ * extent is 29.5 x 15.8 u; the SPACE bar is about 6 key pitches. In paint
+ * order: the BODY pieces first, then the caps. Keys fire with
+ * intvsession_ecs_key_set(key, down); a latching cap (flag LATCH: SHIFT and
+ * CTL) flips its key on each click and stays lit until clicked again or
+ * intvsession_ecs_keys_clear. Light a cap while
+ * intvsession_ecs_key_held(key). `label` is the cap's main legend; `shifted`
+ * the small legend above it (NULL if none). */
+#define INTVSESSION_ECSCAP_LATCH 1 /* SHIFT, CTL */
+#define INTVSESSION_ECSCAP_WHITE 2 /* RTN: a white cap with a black legend */
+typedef enum {
+    INTVSESSION_ECS_BODY = 0, /* case art by `label`: "Case", "Plate", "Label"
+                               * (its `shifted` holds the two white lines,
+                               * "INTELLIVISION|COMPUTER KEYBOARD"), "Mattel"
+                               * (the red script, text in `shifted`), "Vents",
+                               * "Pinstripe", "Cable" */
+    INTVSESSION_ECS_KEYCAP    /* a key; `key` valid */
+} intvsession_ecs_cap_kind;
+
+typedef struct {
+    int kind;            /* intvsession_ecs_cap_kind */
+    const char *label;
+    const char *shifted;
+    int key;             /* intvsession_ecs_key, -1 for a BODY */
+    int flags;           /* INTVSESSION_ECSCAP_* */
+    float x, y, w, h;
+} intvsession_ecs_cap;
+
+const intvsession_ecs_cap *intvsession_ecs_layout(int *n, float *width,
+                                                  float *height);
+/* The topmost key cap under a point, as an index into the layout, or -1. */
+int intvsession_ecs_hit(float x, float y);
+
 /* ---- gamepads (SDL, hotplug; started/stopped with the session) ----------
- * Left stick drives the disc; SOUTH/EAST/WEST face buttons drive the three
- * action buttons. No keypad digit mapping (see core/src/gamepad_sdl.c for
- * why). Automatic side assignment: the first connected pad drives the left
- * controller, the second the right, until intvsession_gamepad_assign pins
- * one explicitly (side: 0/INTVSESSION_PAD_LEFT, 1/INTVSESSION_PAD_RIGHT, or
- * -1 to restore automatic assignment). */
+ * Left stick / D-pad / hat drive the disc; SOUTH/EAST/WEST face buttons drive
+ * the three action buttons; every button, trigger, raw button and hat is
+ * bindable (Map). No keypad digit mapping by default (see core/src/
+ * gamepad_sdl.c for why). Automatic side assignment: the first connected pad
+ * drives the left controller, the second the right (the third and fourth the
+ * ECS pair when ECS is on), until intvsession_gamepad_assign pins one
+ * explicitly: side 0/INTVSESSION_PAD_LEFT, 1/RIGHT, 2/ECS_LEFT, 3/ECS_RIGHT
+ * (the last two only when intvsession_ecs_on), or -1 for automatic; anything
+ * else is -1. An explicit assignment is remembered (settings key
+ * "pad_assign", SDL GUID + name -> side): the pad gets it back when it
+ * reconnects and on the next run. Assigning -1 forgets it. The thread does
+ * not run at all with start opt enable_gamepad = 0.
+ *
+ * Every pad is its own pair of input sources (buttons, stick): a pad that is
+ * unplugged, or moved to another side, lets go of exactly what it held. */
 int  intvsession_gamepad_count(intvsession *s);
 /* Name of connected pad idx into dst; returns the name's length (0 if idx
  * is out of range). */
@@ -842,6 +1100,15 @@ int  intvsession_gamepad_assignment(intvsession *s, int idx);
  * the one a user needs to see: "Automatic" alone does not answer "is my
  * adapter the left controller or the right one?". */
 int  intvsession_gamepad_effective_side(intvsession *s, int idx);
+
+/* Bumped on every connect / disconnect (a restarted session carries the
+ * count on, and re-finding the same pads is no event), so a frontend can
+ * refresh its pad rows cheaply: remember the value, compare on a timer. */
+unsigned intvsession_gamepad_generation(intvsession *s);
+/* The last hot-plug event as text ("Connected: 8BitDo SN30 Pro (Left)",
+ * "Disconnected: ..."), for a toast when the generation changes; returns its
+ * length, 0 if none yet. */
+int  intvsession_gamepad_last_event(intvsession *s, char *dst, int dstsz);
 
 /* ---- paths ----------------------------------------------------------------
  * Directory paths (valid for the session's lifetime). */

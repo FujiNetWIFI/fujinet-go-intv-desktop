@@ -860,6 +860,158 @@ int main(void)
               all_back);
     }
 
+    /* ---- Clear, the reserved F-keys, the appended slots ------------------ */
+    if (s) {
+        char stolen[128];
+        char name[64];
+        int idx, distinct = 1, seen_sysact = 0;
+        const char *packed;
+        intvsession_binding b;
+        const uint32_t hid_f9 = INTVSESSION_KEYSYM_HID_BASE + 0x42;
+        const uint32_t hid_f12 = INTVSESSION_KEYSYM_HID_BASE + 0x45;
+
+        intvsession_bindings_reset(s);
+
+        /* Clear unbinds both halves and persists */
+        intvsession_target_set_key(s, intvsession_target_key(INTVSESSION_PAD_LEFT, INTVSESSION_KEY_5),
+                                   'X', NULL, 0);
+        intvsession_target_set_button(s, intvsession_target_key(INTVSESSION_PAD_LEFT, INTVSESSION_KEY_5),
+                                      INTVSESSION_PAD_BTN_NORTH, NULL, 0);
+        intvsession_binding_clear(s, intvsession_target_key(INTVSESSION_PAD_LEFT, INTVSESSION_KEY_5));
+        b = intvsession_target_binding_get(s, intvsession_target_key(INTVSESSION_PAD_LEFT, INTVSESSION_KEY_5));
+        check("binding_clear unbinds the key and the button", b.keysym == 0 && b.button == INTVSESSION_PAD_BTN_NONE);
+        intvsession_binding_clear(s, intvsession_target_key(INTVSESSION_PAD_LEFT, INTVSESSION_ACTION_TOP));
+        b = intvsession_target_binding_get(s, intvsession_target_key(INTVSESSION_PAD_LEFT, INTVSESSION_ACTION_TOP));
+        check("binding_clear also clears a default binding", b.keysym == 0 && b.button == INTVSESSION_PAD_BTN_NONE);
+        check("and the cleared key drives nothing now",
+              intvsession_key_from_keysym_bound(s, INTVSESSION_KEYSYM_RSHIFT).kind == INTVSESSION_MAP_NONE);
+        intvsession_binding_clear(s, intvsession_target_key((intvsession_pad_side)9, INTVSESSION_KEY_5));
+        intvsession_binding_clear(s, intvsession_target_sysaction((intvsession_sysaction)99));
+        intvsession_free(s);
+        s = open_session(config_dir, data_dir);
+        b = intvsession_target_binding_get(s, intvsession_target_key(INTVSESSION_PAD_LEFT, INTVSESSION_ACTION_TOP));
+        check("a cleared default stays cleared after a reopen", b.keysym == 0 && b.button == INTVSESSION_PAD_BTN_NONE);
+        intvsession_bindings_reset(s);
+
+        /* F9..F12 are the frontends': refused, and dropped on load */
+        check("F9 and F12 are reserved, F8 and F13 are not",
+              intvsession_key_reserved(hid_f9) && intvsession_key_reserved(hid_f9 + 1) &&
+              intvsession_key_reserved(hid_f9 + 2) && intvsession_key_reserved(hid_f12) &&
+              !intvsession_key_reserved(hid_f9 - 1) && !intvsession_key_reserved(hid_f12 + 1) &&
+              !intvsession_key_reserved('A') && !intvsession_key_reserved(0));
+        for (idx = 0; idx < 4; idx++) {
+            intvsession_key_mapping tgt = intvsession_target_key(INTVSESSION_PAD_LEFT, INTVSESSION_KEY_6);
+            stolen[0] = 'x';
+            intvsession_target_set_key(s, tgt, hid_f9 + (uint32_t)idx, stolen, sizeof stolen);
+            b = intvsession_target_binding_get(s, tgt);
+            if (b.keysym == hid_f9 + (uint32_t)idx || stolen[0] != '\0')
+                distinct = 0;
+        }
+        check("set_key refuses F9, F10, F11 and F12 and leaves the target alone", distinct);
+        intvsession_set_str(s, "bindings", "0.6.k:65602;0.7.k:65603;0.8.k:65604;0.9.k:65605;0.4.k:88");
+        intvsession_free(s);
+        s = open_session(config_dir, data_dir);
+        b = intvsession_target_binding_get(s, intvsession_target_key(INTVSESSION_PAD_LEFT, INTVSESSION_KEY_6));
+        check("a stored F9 is dropped on load (the default stays)", b.keysym == INTVSESSION_KEYSYM_KP_6);
+        b = intvsession_target_binding_get(s, intvsession_target_key(INTVSESSION_PAD_LEFT, INTVSESSION_KEY_9));
+        /* (the left 9 sits on the numpad's 3, as in jzIntv's own map) */
+        check("a stored F12 is dropped on load too", b.keysym == INTVSESSION_KEYSYM_KP_3);
+        b = intvsession_target_binding_get(s, intvsession_target_key(INTVSESSION_PAD_LEFT, INTVSESSION_KEY_4));
+        check("and a normal entry beside them still loads", b.keysym == 'X');
+        intvsession_bindings_reset(s);
+
+        /* ---- a 'bindings' string written by the old layout decodes unchanged:
+         * slot numbers are side.slot with keys 0-14, disc 15-30, then the
+         * system actions 31, 32 -- and Stop in debugger is APPENDED at 33 ---- */
+        intvsession_set_str(s, "bindings",
+            "0.5.k:88;1.20.p:70;0.31.k:90;0.32.p:12;3.14.k:81;2.15.p:200;1.0.k:77");
+        intvsession_free(s);
+        s = open_session(config_dir, data_dir);
+        check("old string: Left 5 key", intvsession_target_binding_get(s,
+              intvsession_target_key(INTVSESSION_PAD_LEFT, INTVSESSION_KEY_5)).keysym == 'X');
+        check("old string: Right disc slot 20 (position 5) button", intvsession_target_binding_get(s,
+              intvsession_target_disc(INTVSESSION_PAD_RIGHT, 5)).button == (intvsession_pad_button)70);
+        check("old string: Reset Game key (slot 31)", intvsession_target_binding_get(s,
+              intvsession_target_sysaction(INTVSESSION_SYSACT_RESET_GAME)).keysym == 'Z');
+        check("old string: Reset to CONFIG button (slot 32)", intvsession_target_binding_get(s,
+              intvsession_target_sysaction(INTVSESSION_SYSACT_RESET_CONFIG)).button == (intvsession_pad_button)12);
+        check("old string: ECS Right action buttons (slot 14)", intvsession_target_binding_get(s,
+              intvsession_target_key(INTVSESSION_PAD_ECS_RIGHT, INTVSESSION_ACTION_LOWER_RIGHT)).keysym == 'Q');
+        check("old string: ECS Left disc position 0 (slot 15)", intvsession_target_binding_get(s,
+              intvsession_target_disc(INTVSESSION_PAD_ECS_LEFT, 0)).button == (intvsession_pad_button)200);
+        check("old string: Right 0 key", intvsession_target_binding_get(s,
+              intvsession_target_key(INTVSESSION_PAD_RIGHT, INTVSESSION_KEY_0)).keysym == 'M');
+        check("the new Stop in debugger target starts unbound", intvsession_target_binding_get(s,
+              intvsession_target_sysaction(INTVSESSION_SYSACT_DEBUG_STOP)).keysym == 0);
+        intvsession_bindings_reset(s);
+
+        /* new writes land in the same slots: keys 0-14, disc 15-30, sysact 31, 32, 33 */
+        intvsession_target_set_key(s, intvsession_target_key(INTVSESSION_PAD_LEFT, INTVSESSION_KEY_5), 'X', NULL, 0);
+        intvsession_target_set_button(s, intvsession_target_disc(INTVSESSION_PAD_RIGHT, 3),
+                                      INTVSESSION_PAD_BTN_RIGHT_TRIGGER, NULL, 0);
+        intvsession_target_set_key(s, intvsession_target_sysaction(INTVSESSION_SYSACT_RESET_CONFIG), 'C', NULL, 0);
+        intvsession_target_set_key(s, intvsession_target_sysaction(INTVSESSION_SYSACT_DEBUG_STOP), 'D', NULL, 0);
+        intvsession_target_set_button(s, intvsession_target_sysaction(INTVSESSION_SYSACT_DEBUG_STOP),
+                                      INTVSESSION_PAD_BTN_LEFT_TRIGGER, NULL, 0);
+        packed = intvsession_get_str(s, "bindings", "");
+        check("slot 5 of side 0 is the key", strstr(packed, "0.5.k:88") != NULL);
+        check("slot 18 of side 1 is disc position 3 (a trigger button)", strstr(packed, "1.18.p:16") != NULL);
+        check("slot 32 is Reset to CONFIG", strstr(packed, "0.32.k:67") != NULL);
+        check("slot 33 is Stop in debugger, appended", strstr(packed, "0.33.k:68") != NULL &&
+              strstr(packed, "0.33.p:15") != NULL);
+        intvsession_free(s);
+        s = open_session(config_dir, data_dir);
+        check("and the trigger buttons and the new sysaction survive a reopen",
+              intvsession_target_binding_get(s, intvsession_target_sysaction(INTVSESSION_SYSACT_DEBUG_STOP)).button ==
+                  INTVSESSION_PAD_BTN_LEFT_TRIGGER &&
+              bindings_target_from_button(INTVSESSION_PAD_LEFT, INTVSESSION_PAD_BTN_RIGHT_TRIGGER).kind == INTVSESSION_MAP_NONE &&
+              bindings_target_from_button(INTVSESSION_PAD_RIGHT, INTVSESSION_PAD_BTN_RIGHT_TRIGGER).kind ==
+                  INTVSESSION_MAP_DISC);
+        check("a Stop-in-debugger button resolves from any side", bindings_target_from_button(
+              INTVSESSION_PAD_ECS_RIGHT, INTVSESSION_PAD_BTN_LEFT_TRIGGER).kind == INTVSESSION_MAP_SYSACT);
+        intvsession_bindings_reset(s);
+
+        /* names */
+        intvsession_target_name(intvsession_target_sysaction(INTVSESSION_SYSACT_DEBUG_STOP), name, sizeof name);
+        check("target_name(Stop in debugger)", strcmp(name, "Stop in debugger") == 0);
+        check("sysaction_name(DEBUG_STOP)", strcmp(intvsession_sysaction_name(INTVSESSION_SYSACT_DEBUG_STOP),
+                                                   "Stop in debugger") == 0);
+        check("trigger button names", strcmp(intvsession_pad_button_name(INTVSESSION_PAD_BTN_LEFT_TRIGGER), "Left Trigger") == 0 &&
+              strcmp(intvsession_pad_button_name(INTVSESSION_PAD_BTN_RIGHT_TRIGGER), "Right Trigger") == 0);
+        check("the triggers are appended after the D-pad (persisted numbers never shift)",
+              INTVSESSION_PAD_BTN_DPAD_RIGHT == 14 && INTVSESSION_PAD_BTN_LEFT_TRIGGER == 15 &&
+              INTVSESSION_PAD_BTN_RIGHT_TRIGGER == 16 && INTVSESSION_PAD_BTN_COUNT == 17 &&
+              INTVSESSION_PAD_BTN_RAW_BASE == 64 && INTVSESSION_PAD_HAT_BASE == 192);
+        check("system actions: Reset Game 0, Reset to CONFIG 1, Stop in debugger 2",
+              INTVSESSION_SYSACT_RESET_GAME == 0 && INTVSESSION_SYSACT_RESET_CONFIG == 1 &&
+              INTVSESSION_SYSACT_DEBUG_STOP == 2 && INTVSESSION_SYSACT_COUNT == 3);
+
+        /* the target list: 127 in all, every one distinct */
+        check("127 targets in all", intvsession_target_count() == 127 && INTVSESSION_TARGET_COUNT == 127);
+        for (idx = 0; idx < intvsession_target_count(); idx++) {
+            const intvsession_key_mapping first = intvsession_target_from_index(idx);
+            int other;
+            if (first.kind == INTVSESSION_MAP_NONE)
+                distinct = 0;
+            if (first.kind == INTVSESSION_MAP_SYSACT)
+                seen_sysact++;
+            for (other = idx + 1; other < intvsession_target_count(); other++) {
+                const intvsession_key_mapping second = intvsession_target_from_index(other);
+                if (first.kind == second.kind && first.side == second.side && first.key == second.key &&
+                    first.direction == second.direction && first.sysact == second.sysact)
+                    distinct = 0;
+            }
+        }
+        check("every index names a distinct target, three of them system actions", distinct && seen_sysact == 3);
+        check("out-of-range indexes are MAP_NONE", intvsession_target_from_index(-1).kind == INTVSESSION_MAP_NONE &&
+              intvsession_target_from_index(127).kind == INTVSESSION_MAP_NONE);
+        check("the list starts with Left 0 and ends with Stop in debugger",
+              intvsession_target_from_index(0).kind == INTVSESSION_MAP_KEY &&
+              intvsession_target_from_index(0).side == INTVSESSION_PAD_LEFT &&
+              intvsession_target_from_index(126).kind == INTVSESSION_MAP_SYSACT &&
+              intvsession_target_from_index(126).sysact == INTVSESSION_SYSACT_DEBUG_STOP);
+    }
+
     intvsession_free(s);
 
     if (failed) {
